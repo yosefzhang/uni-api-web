@@ -636,7 +636,7 @@ services:
       - ./uniapi_db:/home/data
 
   uniapi-frontend:
-    image: ghcr.io/melosbot/uni-api-status:latest
+    image: ghcr.io/melosbot/uni-api-web:latest
     container_name: uni-api-frontend
     restart: unless-stopped
     ports:

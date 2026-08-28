@@ -593,7 +593,7 @@ CONFIG_URL 就是可以自动下载远程的配置文件。比如你在某个平
 
 `uni-api` 默认启动时读取一次 `api.yaml`。如果你希望“在前端修改 api.yaml 后，uni-api 立即生效”，最小修改的做法是：
 
-- `api.yaml` 同时挂载给后端 `uni-api` 和前端（`uni-api-status`）
+- `api.yaml` 同时挂载给后端 `uni-api` 和前端（`webui`）
 - 额外加一个 `config-watcher` 监听 `api.yaml` 变更，并自动 `docker restart uni-api`
 
 下面是一个可直接使用的 `docker-compose.yml` 示例（把 `./api.yaml` 放在同目录）：
@@ -613,7 +613,7 @@ services:
       - ./uniapi_db:/home/data
 
   uniapi-frontend:
-    image: ghcr.io/melosbot/uni-api-status:latest
+    image: ghcr.io/melosbot/uni-api-web:latest
     container_name: uni-api-frontend
     restart: unless-stopped
     ports:

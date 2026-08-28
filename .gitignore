@@ -4,6 +4,7 @@ api.json
 __pycache__
 .vscode
 node_modules
+.pnpm-store
 .wrangler
 .pytest_cache
 rust/**/target/

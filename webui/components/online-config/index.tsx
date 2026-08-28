@@ -23,7 +23,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import yaml from "js-yaml"
+import * as yaml from "js-yaml"
 import { ProviderDialog, type ProviderItem } from "./provider-form"
 import { ApiKeyDialog, type ApiKeyItem } from "./api-key-form"
 import { modelToRows } from "./fields"

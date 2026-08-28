@@ -2,7 +2,7 @@
 // routes) into the Rust front process.  Every handler keeps the original
 // request/response contract so the exported static UI works unchanged.
 //
-// Upstream-merge note: this file and the `status-web/` directory are additive
+// Upstream-merge note: this file and the `webui/` directory are additive
 // only.  main.rs hooks in via `status::maybe_merge`, which no-ops when the
 // bundled UI is absent so the binary behaves exactly like upstream.
 
@@ -826,7 +826,7 @@ async fn provider_test_real(State(state): State<StatusState>, Json(body): Json<V
 }
 
 // ---------------------------------------------------------------------------
-// static UI (exported Next.js site from status-web/out, installed to
+// static UI (exported Next.js site from webui/out, installed to
 // UNI_API_STATUS_UI, default ./status)
 // ---------------------------------------------------------------------------
 

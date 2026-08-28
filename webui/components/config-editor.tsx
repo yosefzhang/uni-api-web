@@ -13,7 +13,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert" // Added Alert
 import { Save, Download, Upload, Loader2, CheckCircle, XCircle, Info } from "lucide-react" // Added more icons
-import yaml from "js-yaml" // Import js-yaml
+import * as yaml from "js-yaml" // Import js-yaml
 
 interface ConfigEditorProps {
   apiKey: string

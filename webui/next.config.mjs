@@ -1,9 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Static export: the site is served by the Rust `status` module inside the
+  // Dev mode: API routes are handled by Next.js route handlers.
+  // Production: static export served by the Rust `status` module inside the
   // uni-api process (see rust/uni-api-native/src/bin/uni-api-front/status.rs).
-  output: 'export',
-  // API requests are relative to the same origin, no rewrites needed.
+  ...(process.env.NODE_ENV === 'production' ? { output: 'export' } : {}),
   trailingSlash: false,
   eslint: {
     ignoreDuringBuilds: true,
