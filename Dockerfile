@@ -37,7 +37,7 @@ FROM node:22-bookworm-slim AS status-builder
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 RUN corepack enable && corepack prepare pnpm@10.15.0 --activate
 WORKDIR /build
-COPY status-web/package.json status-web/pnpm-lock.yaml ./
+COPY webui/package.json webui/pnpm-lock.yaml ./
 RUN pnpm fetch
 COPY webui ./
 RUN pnpm install --offline --frozen-lockfile && \
