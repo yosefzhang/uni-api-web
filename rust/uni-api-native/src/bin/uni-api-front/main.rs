@@ -14,6 +14,7 @@ mod resources;
 mod responses;
 mod responses_item_ids;
 mod responses_native;
+mod status;
 
 use std::future::IntoFuture;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -69,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .fallback(any(proxy::handler))
         .with_state(state);
+    let app = status::maybe_merge(app);
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), public_port);
     let listener = tokio::net::TcpListener::bind(address).await?;
     if python_mode {

@@ -33,6 +33,16 @@ COPY pyproject.toml uv.lock ./
 RUN uv export --frozen --no-dev --no-emit-project --output-file /tmp/requirements.txt && \
     uv pip install --system --no-cache -r /tmp/requirements.txt
 
+FROM node:22-bookworm-slim AS status-builder
+RUN corepack enable && corepack prepare pnpm@10.15.0 --activate
+WORKDIR /build
+COPY status-web/package.json status-web/pnpm-lock.yaml ./
+RUN pnpm fetch
+COPY status-web ./
+RUN pnpm install --offline --frozen-lockfile && \
+    pnpm exec next build && \
+    cp -r out /tmp/status-out
+
 FROM python:3.11-slim-bullseye AS legacy-runtime
 ARG SOURCE_COMMIT=unknown
 ENV SOURCE_COMMIT=${SOURCE_COMMIT} \
@@ -58,4 +68,5 @@ RUN apt-get update && \
 EXPOSE 8000
 WORKDIR /home
 COPY --from=native-builder /tmp/uni-api-front /usr/local/bin/uni-api-front
+COPY --from=status-builder /tmp/status-out /home/status
 ENTRYPOINT ["/usr/local/bin/uni-api-front"]

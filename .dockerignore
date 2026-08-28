@@ -47,3 +47,6 @@ rust/**
 !rust/uni-api-native/src/
 !rust/uni-api-native/src/**
 rust/uni-api-native/target/
+status-web/out
+status-web/.next
+status-web/node_modules
