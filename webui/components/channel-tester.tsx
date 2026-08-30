@@ -56,6 +56,19 @@ interface TestResult {
     status: number
     body: string
   }
+  upstream?: {
+    request: {
+      method: string
+      url: string
+      headers: Record<string, string>
+      body: unknown
+    }
+    response: {
+      status: number
+      headers?: Record<string, string>
+      body: unknown
+    }
+  }
 }
 
 interface BaseUrlOption {
@@ -465,24 +478,54 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
                       </CollapsibleTrigger>
                       <CollapsibleContent>
                         <div className="px-3 pb-3">
-                          <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
-                            {r.request && (
-                              <div className="space-y-1">
-                                <div className="text-xs font-medium">发送的请求</div>
+                          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
+                            <div className="space-y-1">
+                              <div className="text-xs font-medium">发送的请求</div>
+                              {r.request ? (
                                 <div className="rounded-md border bg-muted/50 p-3 text-xs font-mono overflow-auto max-h-96">
                                   <div className="mb-2 break-all">{r.request.method} {r.request.url}</div>
                                   <pre className="whitespace-pre-wrap break-all">{JSON.stringify({ headers: r.request.headers, body: r.request.body }, null, 2)}</pre>
                                 </div>
-                              </div>
-                            )}
-                            {r.response && (
-                              <div className="space-y-1">
-                                <div className="text-xs font-medium">返回内容 (HTTP {r.response.status})</div>
+                              ) : (
+                                <div className="text-xs text-muted-foreground">(无)</div>
+                              )}
+                            </div>
+
+                            <div className="space-y-1">
+                              <div className="text-xs font-medium">uniapi 转发请求</div>
+                              {r.upstream?.request ? (
                                 <div className="rounded-md border bg-muted/50 p-3 text-xs font-mono overflow-auto max-h-96">
+                                  <div className="mb-2 break-all">{r.upstream.request.method} {r.upstream.request.url}</div>
+                                  <pre className="whitespace-pre-wrap break-all">{JSON.stringify({ headers: r.upstream.request.headers, body: r.upstream.request.body }, null, 2)}</pre>
+                                </div>
+                              ) : (
+                                <div className="text-xs text-muted-foreground">(无)</div>
+                              )}
+                            </div>
+
+                            <div className="space-y-1">
+                              <div className="text-xs font-medium">渠道响应</div>
+                              {r.upstream?.response ? (
+                                <div className="rounded-md border bg-muted/50 p-3 text-xs font-mono overflow-auto max-h-96">
+                                  <div className="mb-2 break-all">HTTP {r.upstream.response.status}</div>
+                                  <pre className="whitespace-pre-wrap break-all">{JSON.stringify({ headers: r.upstream.response.headers, body: r.upstream.response.body }, null, 2)}</pre>
+                                </div>
+                              ) : (
+                                <div className="text-xs text-muted-foreground">(无)</div>
+                              )}
+                            </div>
+
+                            <div className="space-y-1">
+                              <div className="text-xs font-medium">uniapi 返回内容</div>
+                              {r.response ? (
+                                <div className="rounded-md border bg-muted/50 p-3 text-xs font-mono overflow-auto max-h-96">
+                                  <div className="mb-2 break-all">HTTP {r.response.status}</div>
                                   <pre className="whitespace-pre-wrap break-all">{prettyJson(r.response.body)}</pre>
                                 </div>
-                              </div>
-                            )}
+                              ) : (
+                                <div className="text-xs text-muted-foreground">(无)</div>
+                              )}
+                            </div>
                           </div>
                         </div>
                       </CollapsibleContent>

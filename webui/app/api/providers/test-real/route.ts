@@ -24,6 +24,15 @@ function channelKey(api: any): string {
 
 const UNI_API_BASE_URL = process.env.UNI_API_BASE_URL || 'http://localhost:8000/v1';
 
+function decodeHeader(value: string | null): unknown {
+  if (!value) return null;
+  try {
+    return JSON.parse(Buffer.from(value, 'base64').toString('utf-8'));
+  } catch {
+    return null;
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -67,21 +76,27 @@ export async function POST(request: NextRequest) {
     try {
       const res = await fetch(url, {
         method: 'POST',
-        headers,
+        headers: { ...headers, 'x-uni-api-debug': '1' },
         body: JSON.stringify(requestBody),
         signal: AbortSignal.timeout(60000),
       });
       const status = res.status;
+      const upstreamRequest = decodeHeader(res.headers.get('x-uni-api-upstream-request'));
+      const upstreamResponse = decodeHeader(res.headers.get('x-uni-api-upstream-response'));
       const text = await res.text();
       const elapsed = (Date.now() - started) / 1000;
       const success = status >= 200 && status < 300;
-      return NextResponse.json({
+      const payload: any = {
         success,
         message: success ? '测试成功' : `HTTP ${status}`,
         responseTime: elapsed,
         request: requestInfo,
         response: { status, body: text },
-      });
+      };
+      if (upstreamRequest && upstreamResponse) {
+        payload.upstream = { request: upstreamRequest, response: upstreamResponse };
+      }
+      return NextResponse.json(payload);
     } catch (e: any) {
       const elapsed = (Date.now() - started) / 1000;
       const message = e.name === 'TimeoutError' ? '请求超时(60s)' : `网络错误: ${e.message}`;

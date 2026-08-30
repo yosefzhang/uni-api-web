@@ -43,6 +43,13 @@ const DEFAULT_IMAGE_MAX_BYTES: usize = 12 * 1024 * 1024;
 const DEFAULT_UPSTREAM_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const UPSTREAM_ERROR_MAX_BYTES: usize = 1024 * 1024;
 
+// 真实测试调试回传：当下游请求携带 `x-uni-api-debug: 1` 时，把 uni-api
+// 发往上游渠道的原始请求与上游渠道返回的原始响应 base64 编码后放入下游
+// 响应头，供管理侧真实测试页面展示。仅对 chat/completions 生效。
+const UPSTREAM_DEBUG_HEADER: &str = "x-uni-api-debug";
+const UPSTREAM_REQUEST_HEADER: &str = "x-uni-api-upstream-request";
+const UPSTREAM_RESPONSE_HEADER: &str = "x-uni-api-upstream-response";
+
 const PUBLIC_JSON_ROUTES: &[&str] = &[
     "/v1/chat/completions",
     "/v1/messages",
@@ -2661,6 +2668,58 @@ struct AttemptFailure {
     response: Option<Response<Body>>,
 }
 
+fn upstream_debug_enabled(headers: &HeaderMap) -> bool {
+    headers
+        .get(UPSTREAM_DEBUG_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn headers_to_debug_json(headers: &HeaderMap) -> Value {
+    let mut map = Map::new();
+    for (name, value) in headers {
+        map.insert(
+            name.as_str().to_owned(),
+            json!(value.to_str().unwrap_or_default()),
+        );
+    }
+    Value::Object(map)
+}
+
+fn upstream_request_debug_value(prepared: &PreparedAttempt) -> Value {
+    let body = match &prepared.body {
+        AttemptBody::Json(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        AttemptBody::Empty => String::new(),
+        AttemptBody::Replay(..) => "<replay-body>".to_owned(),
+        AttemptBody::MultipartRewrite { .. } => "<multipart-rewrite-body>".to_owned(),
+        AttemptBody::DashscopeTranscription { .. } => "<dashscope-transcription-body>".to_owned(),
+    };
+    json!({
+        "method": prepared.method.as_str(),
+        "url": prepared.url,
+        "headers": headers_to_debug_json(&prepared.headers),
+        "body": body,
+    })
+}
+
+fn attach_upstream_debug(
+    headers: &mut HeaderMap,
+    request_debug: Option<&str>,
+    response_debug: Option<&str>,
+) {
+    if let Some(value) = request_debug {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            headers.insert(HeaderName::from_static(UPSTREAM_REQUEST_HEADER), value);
+        }
+    }
+    if let Some(value) = response_debug {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            headers.insert(HeaderName::from_static(UPSTREAM_RESPONSE_HEADER), value);
+        }
+    }
+}
+
 async fn send_attempt(
     state: &AppState,
     provider: &Provider,
@@ -2670,6 +2729,9 @@ async fn send_attempt(
     precommit_comment_sent: bool,
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
+    let debug_enabled = upstream_debug_enabled(incoming_headers);
+    let upstream_request_debug = debug_enabled
+        .then(|| BASE64.encode(upstream_request_debug_value(&prepared).to_string()));
     let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
     let http1_only = provider.engine.eq_ignore_ascii_case("codex");
     let timeouts = state
@@ -2851,12 +2913,27 @@ async fn send_attempt(
             .await
             .unwrap_or_else(|error| Bytes::from(format!("read upstream error response: {error}")));
         let detail = String::from_utf8_lossy(&body).into_owned();
+        let upstream_response_debug = debug_enabled.then(|| {
+            BASE64.encode(
+                json!({
+                    "status": status.as_u16(),
+                    "headers": headers_to_debug_json(&headers),
+                    "body": &detail,
+                })
+                .to_string(),
+            )
+        });
         let mut output = Response::new(Body::from(body));
         *output.status_mut() = status;
         *output.headers_mut() = headers;
         output
             .headers_mut()
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        attach_upstream_debug(
+            output.headers_mut(),
+            upstream_request_debug.as_deref(),
+            upstream_response_debug.as_deref(),
+        );
         return Err(AttemptFailure {
             status,
             detail: truncate_detail(&detail),
@@ -2960,6 +3037,16 @@ async fn send_attempt(
                 upstream_url: prepared.url.clone(),
                 response: None,
             })?;
+        let upstream_response_debug = debug_enabled.then(|| {
+            BASE64.encode(
+                json!({
+                    "status": status.as_u16(),
+                    "headers": headers_to_debug_json(&headers),
+                    "body": String::from_utf8_lossy(&body),
+                })
+                .to_string(),
+            )
+        });
         let usage = serde_json::from_slice::<Value>(&body)
             .ok()
             .map(|value| usage(&value))
@@ -2970,6 +3057,11 @@ async fn send_attempt(
         output
             .headers_mut()
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+        attach_upstream_debug(
+            output.headers_mut(),
+            upstream_request_debug.as_deref(),
+            upstream_response_debug.as_deref(),
+        );
         return Ok(AttemptSuccess {
             response: output,
             status,
@@ -2978,6 +3070,7 @@ async fn send_attempt(
             upstream_url: prepared.url,
         });
     }
+    let upstream_headers = filtered_response_headers(response.headers());
     let upstream = if prepared.adapter == ResponseAdapter::Search {
         let bytes = read_limited_upstream_body(response, upstream_response_max_bytes())
             .await
@@ -3005,6 +3098,16 @@ async fn send_attempt(
             response: None,
         })?
     };
+    let upstream_response_debug = debug_enabled.then(|| {
+        BASE64.encode(
+            json!({
+                "status": status.as_u16(),
+                "headers": headers_to_debug_json(&upstream_headers),
+                "body": &upstream,
+            })
+            .to_string(),
+        )
+    });
     let normalized = match prepared.adapter {
         ResponseAdapter::Search => normalize_search_response(&prepared.url, &upstream),
         ResponseAdapter::ResponsesToChat => responses_to_chat(&upstream, &prepared.original_model),
@@ -3052,6 +3155,11 @@ async fn send_attempt(
     output
         .headers_mut()
         .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+    attach_upstream_debug(
+        output.headers_mut(),
+        upstream_request_debug.as_deref(),
+        upstream_response_debug.as_deref(),
+    );
     Ok(AttemptSuccess {
         response: output,
         status: StatusCode::OK,

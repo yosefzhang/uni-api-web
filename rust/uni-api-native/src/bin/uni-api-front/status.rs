@@ -14,6 +14,8 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use serde_json::{json, Map, Value};
 
 #[derive(Clone)]
@@ -191,6 +193,11 @@ fn body_key<'a>(body: &'a Value, name: &str) -> Option<&'a str> {
     body.get(name)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
+}
+
+fn decode_upstream_debug(value: &str) -> Option<Value> {
+    let bytes = BASE64.decode(value).ok()?;
+    serde_json::from_slice::<Value>(&bytes).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -784,7 +791,8 @@ async fn provider_test_real(State(state): State<StatusState>, Json(body): Json<V
         .http
         .post(&url)
         .timeout(Duration::from_secs(60))
-        .header(header::CONTENT_TYPE, "application/json");
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-uni-api-debug", "1");
     if endpoint == "messages" {
         request = request.header("x-api-key", &channel_api).header("anthropic-version", "2023-06-01");
         headers.insert("x-api-key".into(), json!(channel_api.clone()));
@@ -798,16 +806,31 @@ async fn provider_test_real(State(state): State<StatusState>, Json(body): Json<V
     match request.json(&request_body).send().await {
         Ok(response) => {
             let status = response.status().as_u16();
+            let upstream_request = response
+                .headers()
+                .get("x-uni-api-upstream-request")
+                .and_then(|value| value.to_str().ok())
+                .and_then(decode_upstream_debug);
+            let upstream_response = response
+                .headers()
+                .get("x-uni-api-upstream-response")
+                .and_then(|value| value.to_str().ok())
+                .and_then(decode_upstream_debug);
             let text = response.text().await.unwrap_or_default();
             let elapsed = started.elapsed().as_secs_f64();
-            Json(json!({
+            let mut result = json!({
                 "success": (200..300).contains(&status),
                 "message": if (200..300).contains(&status) { "测试成功".to_owned() } else { format!("HTTP {status}") },
                 "responseTime": elapsed,
                 "request": request_info,
                 "response": { "status": status, "body": text },
-            }))
-            .into_response()
+            });
+            if let (Some(request), Some(response)) = (upstream_request, upstream_response) {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("upstream".into(), json!({ "request": request, "response": response }));
+                }
+            }
+            Json(result).into_response()
         }
         Err(error) => {
             let elapsed = started.elapsed().as_secs_f64();

@@ -4019,6 +4019,18 @@ async def process_request(
     _add_trace_headers(headers, current_info)
     _mark_current_info_stage(current_info, "provider_key_selected")
 
+    debug_enabled = _upstream_debug_enabled(http_request)
+    upstream_request_debug = (
+        _encode_upstream_debug({
+            "method": "POST",
+            "url": url,
+            "headers": _debug_header_pairs(headers),
+            "body": payload,
+        })
+        if debug_enabled
+        else None
+    )
+
     # print("proxy", proxy)
 
     try:
@@ -4119,6 +4131,21 @@ async def process_request(
                 json_data = await collect_openai_chat_completion_from_streaming_sse(wrapped_generator, model=original_model)
                 _mark_first_byte_observed(current_info)
                 response = StarletteStreamingResponse(iter([json_data]), media_type="application/json", headers=upstream_response_headers)
+                if debug_enabled:
+                    _attach_upstream_debug(
+                        response,
+                        _encode_upstream_debug({
+                            "method": "POST",
+                            "url": url,
+                            "headers": _debug_header_pairs(headers),
+                            "body": payload,
+                        }),
+                        _encode_upstream_debug({
+                            "status": 200,
+                            "headers": upstream_response_headers,
+                            "body": json_data,
+                        }),
+                    )
                 setattr(
                     response,
                     "_uni_api_response_attempt_terminal_outcome",
@@ -4171,6 +4198,16 @@ async def process_request(
                     decoded_element = await run_json_cpu(json.loads, first_element)
                     encoded_element = await run_json_cpu(json.dumps, decoded_element)
                     response = StarletteStreamingResponse(iter([encoded_element]), media_type="application/json", headers=upstream_response_headers)
+                    if debug_enabled:
+                        _attach_upstream_debug(
+                            response,
+                            upstream_request_debug,
+                            _encode_upstream_debug({
+                                "status": 200,
+                                "headers": upstream_response_headers,
+                                "body": first_element,
+                            }),
+                        )
                     setattr(
                         response,
                         "_uni_api_response_attempt_terminal_outcome",
@@ -5192,6 +5229,37 @@ def _log_dropped_upstream_response_header(name: str, reason: str) -> None:
         trace_logger.debug("dropped upstream response header name=%s reason=%s", safe_name, reason)
         return
     trace_logger.warning("dropped upstream response header name=%s reason=%s", safe_name, reason)
+
+
+# 真实测试调试回传：当下游请求携带 `x-uni-api-debug: 1` 时，把 uni-api
+# 发往上游渠道的原始请求与上游渠道返回的原始响应 base64 编码后放入下游
+# 响应头，供管理侧真实测试页面展示。与 Rust 端（generic_api.rs）保持一致。
+UPSTREAM_DEBUG_HEADER = "x-uni-api-debug"
+UPSTREAM_REQUEST_HEADER = "x-uni-api-upstream-request"
+UPSTREAM_RESPONSE_HEADER = "x-uni-api-upstream-response"
+
+
+def _upstream_debug_enabled(http_request: Optional[Request]) -> bool:
+    if http_request is None:
+        return False
+    value = http_request.headers.get(UPSTREAM_DEBUG_HEADER, "")
+    return value in ("1", "true", "True")
+
+
+def _encode_upstream_debug(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, default=str)
+    return base64.b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _attach_upstream_debug(
+    response: Any,
+    request_debug: Optional[str],
+    response_debug: Optional[str],
+) -> None:
+    if request_debug:
+        response.headers[UPSTREAM_REQUEST_HEADER] = request_debug
+    if response_debug:
+        response.headers[UPSTREAM_RESPONSE_HEADER] = response_debug
 
 
 def _copy_upstream_response_headers(headers: Any) -> dict[str, str]:
@@ -7517,6 +7585,14 @@ class ResponsesRequestExecution:
         self._record_upstream_attempt_start(attempt)
         self._log_attempt(attempt, headers, payload)
 
+        if _upstream_debug_enabled(self.http_request):
+            attempt.state["_debug_upstream_request"] = _encode_upstream_debug({
+                "method": "POST",
+                "url": upstream_url,
+                "headers": _debug_header_pairs(headers),
+                "body": payload,
+            })
+
         async with app.state.client_manager.get_client(upstream_url, proxy, http2=False if engine == "codex" else None) as client:
             if self.request_data.stream:
                 return await self._execute_stream_attempt(client, attempt, headers, json_payload)
@@ -8321,6 +8397,14 @@ class ResponsesRequestExecution:
 
         attempt.state["stream_upstream_status_code"] = upstream_resp.status_code
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
+        if attempt.state.get("_debug_upstream_request"):
+            upstream_response_headers = dict(response_headers)
+            response_headers[UPSTREAM_REQUEST_HEADER] = attempt.state["_debug_upstream_request"]
+            response_headers[UPSTREAM_RESPONSE_HEADER] = _encode_upstream_debug({
+                "status": upstream_resp.status_code,
+                "headers": upstream_response_headers,
+                "body": "<streaming>",
+            })
         await self._release_request_retry_payload()
         return StarletteStreamingResponse(
             self._proxy_responses_stream(
@@ -9529,6 +9613,14 @@ class ResponsesRequestExecution:
         self._record_upstream_attempt_result(attempt, status_code=upstream_resp.status_code, success=True)
         self._mark_success(attempt.state["channel_id"], attempt.provider_api_key_raw)
         response_headers = _copy_upstream_response_headers(upstream_resp.headers)
+        if attempt.state.get("_debug_upstream_request"):
+            upstream_response_headers = dict(response_headers)
+            response_headers[UPSTREAM_REQUEST_HEADER] = attempt.state["_debug_upstream_request"]
+            response_headers[UPSTREAM_RESPONSE_HEADER] = _encode_upstream_debug({
+                "status": upstream_resp.status_code,
+                "headers": upstream_response_headers,
+                "body": response_content.decode("utf-8", errors="replace") if isinstance(response_content, bytes) else str(response_content),
+            })
         return Response(
             status_code=upstream_resp.status_code,
             content=response_content,
