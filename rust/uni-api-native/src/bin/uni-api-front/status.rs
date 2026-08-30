@@ -482,7 +482,10 @@ async fn filters(State(state): State<StatusState>, Query(params): Query<Map<Stri
     let column_list = |rows: Vec<Map<String, Value>>, column: &str| -> Vec<Value> {
         rows.into_iter()
             .filter_map(|row| row.get(column).cloned())
-            .filter(|value| !value.is_null())
+            .filter(|value| {
+                !value.is_null()
+                    && value.as_str().map_or(true, |s| !s.is_empty())
+            })
             .collect()
     };
     let models = match run_sqlite(
