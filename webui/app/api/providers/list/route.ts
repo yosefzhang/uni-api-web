@@ -27,7 +27,8 @@ export async function GET(request: NextRequest) {
         supported,
       };
     });
-    return NextResponse.json({ providers, uniApiBaseUrl: '/v1' });
+    const uniApiOrigin = process.env.UNI_API_BASE_URL || `${request.nextUrl.protocol}//${request.nextUrl.hostname}:8000/v1`;
+    return NextResponse.json({ providers, uniApiBaseUrl: uniApiOrigin });
   } catch (e: any) {
     return NextResponse.json(e.body || { error: e.message }, { status: e.status || 500 });
   }

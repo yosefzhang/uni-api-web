@@ -173,10 +173,10 @@ export function ProviderDialog({
               id="base_url"
               label="base_url"
               required
-              description="后端服务的 API 地址，必填。支持 /v1/chat/completions、/v1/messages、/responses 等端点"
+              description="提供商的 API Base URL，如果是responses类型，URL需要包含 /responses，必填"
               value={item.base_url || ""}
               onChange={(v) => update({ base_url: v })}
-              placeholder="https://api.xxx.com/v1/chat/completions"
+              placeholder="https://api.xxx.com/v1"
               mono
             />
             <StringListField

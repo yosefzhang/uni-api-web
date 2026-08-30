@@ -299,7 +299,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
           <CardContent className="p-4 space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-end gap-3">
               {/* 测试 Base URL：可下拉选择，也可直接输入自定义地址 */}
-              <div className="w-full sm:w-72 space-y-1">
+              <div className="w-full sm:w-[27rem] space-y-1">
                 <Label className="text-xs">测试 Base URL</Label>
                 <Popover open={baseOpen} onOpenChange={setBaseOpen}>
                   <PopoverTrigger asChild>
