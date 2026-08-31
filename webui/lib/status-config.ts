@@ -5,7 +5,7 @@ import { load as yamlLoad, dump as yamlDump } from 'js-yaml';
 const API_YAML_PATH = process.env.API_YAML_PATH || path.join(process.cwd(), '..', 'api.yaml');
 const MODEL_CONTEXT_PATH =
   process.env.MODEL_CONTEXT_PATH ||
-  path.join(process.cwd(), '..', 'uni_api', 'api', 'model_context_windows.json');
+  path.join(process.cwd(), '..', 'data', 'model_extern_config.json');
 
 export interface ApiKeyEntry {
   api: string;
@@ -57,7 +57,11 @@ export function readModelContext(): Record<string, any> {
     const content = fs.readFileSync(MODEL_CONTEXT_PATH, 'utf-8');
     return JSON.parse(content);
   } catch (e: any) {
-    if (e?.code === 'ENOENT') return {};
+    if (e?.code === 'ENOENT') {
+      fs.mkdirSync(path.dirname(MODEL_CONTEXT_PATH), { recursive: true });
+      fs.writeFileSync(MODEL_CONTEXT_PATH, '{}\n', 'utf-8');
+      return {};
+    }
     throw e;
   }
 }

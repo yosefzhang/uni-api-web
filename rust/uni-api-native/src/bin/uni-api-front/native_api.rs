@@ -14,10 +14,18 @@ const MODEL_CREATED: u64 = 1_720_524_448_858;
 
 fn model_caps_map() -> HashMap<String, Value> {
     let path = std::env::var("UNI_API_MODEL_CONTEXT_PATH")
-        .unwrap_or_else(|_| "uni_api/api/model_context_windows.json".to_owned());
-    let content = std::fs::read_to_string(&path).unwrap_or_else(|_| {
-        include_str!("../../../../../uni_api/api/model_context_windows.json").to_owned()
-    });
+        .unwrap_or_else(|_| "data/model_extern_config.json".to_owned());
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => {
+            let default = "{}";
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&path, default);
+            default.to_owned()
+        }
+    };
     serde_json::from_str(&content).unwrap_or_default()
 }
 

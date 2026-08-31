@@ -71,7 +71,7 @@ pub fn maybe_merge(app: Router) -> Router {
         PathBuf::from(std::env::var("DB_PATH").unwrap_or_else(|_| "./data/stats.db".into()));
     let model_context_path = PathBuf::from(
         std::env::var("UNI_API_MODEL_CONTEXT_PATH")
-            .unwrap_or_else(|_| "uni_api/api/model_context_windows.json".to_owned()),
+            .unwrap_or_else(|_| "data/model_extern_config.json".to_owned()),
     );
     let state = StatusState {
         config_path: config_path.canonicalize().unwrap_or(config_path),
@@ -411,7 +411,7 @@ async fn save_config(State(state): State<StatusState>, Json(body): Json<Value>) 
 }
 
 // ---------------------------------------------------------------------------
-// model context windows (model_context_windows.json)
+// model extern config (data/model_extern_config.json)
 // ---------------------------------------------------------------------------
 
 async fn load_model_context(
@@ -424,9 +424,14 @@ async fn load_model_context(
     let content = match std::fs::read_to_string(&state.model_context_path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Json(json!({ "data": {} })).into_response()
+            let default = "{}";
+            if let Some(parent) = state.model_context_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&state.model_context_path, default);
+            default.to_owned()
         }
-        Err(error) => return internal_error("read model_context_windows.json", &error),
+        Err(error) => return internal_error("read model_extern_config.json", &error),
     };
     let data = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
     Json(json!({ "data": data })).into_response()
@@ -447,10 +452,15 @@ async fn save_model_context(State(state): State<StatusState>, Json(body): Json<V
     }
     let pretty = match serde_json::to_string_pretty(&data) {
         Ok(pretty) => format!("{pretty}\n"),
-        Err(error) => return internal_error("serialize model_context_windows.json", &error),
+        Err(error) => return internal_error("serialize model_extern_config.json", &error),
     };
+    if let Some(parent) = state.model_context_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return internal_error("create data dir for model_extern_config.json", &error);
+        }
+    }
     if let Err(error) = std::fs::write(&state.model_context_path, pretty) {
-        return internal_error("write model_context_windows.json", &error);
+        return internal_error("write model_extern_config.json", &error);
     }
     Json(json!({ "success": true })).into_response()
 }

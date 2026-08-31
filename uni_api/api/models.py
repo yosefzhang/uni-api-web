@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -61,9 +62,19 @@ _CODEX_BLOCKED_MODEL_TOKENS = (
     "whisper",
 )
 
-_MODEL_CAPS: dict[str, dict[str, Any]] = json.loads(
-    Path(__file__).with_name("model_context_windows.json").read_text(encoding="utf-8")
-)
+def _load_model_extern_config() -> dict[str, dict[str, Any]]:
+    runtime_path = Path(
+        os.environ.get("UNI_API_MODEL_CONTEXT_PATH", "data/model_extern_config.json")
+    )
+    try:
+        return json.loads(runtime_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_path.write_text("{}\n", encoding="utf-8")
+        return {}
+
+
+_MODEL_CAPS: dict[str, dict[str, Any]] = _load_model_extern_config()
 _MODEL_CAPS_PREFIXES = sorted(_MODEL_CAPS, key=len, reverse=True)
 
 
