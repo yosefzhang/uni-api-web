@@ -2730,8 +2730,8 @@ async fn send_attempt(
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
     let debug_enabled = upstream_debug_enabled(incoming_headers);
-    let upstream_request_debug = debug_enabled
-        .then(|| BASE64.encode(upstream_request_debug_value(&prepared).to_string()));
+    let upstream_request_debug =
+        debug_enabled.then(|| BASE64.encode(upstream_request_debug_value(&prepared).to_string()));
     let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
     let http1_only = provider.engine.eq_ignore_ascii_case("codex");
     let timeouts = state

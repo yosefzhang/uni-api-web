@@ -34,15 +34,17 @@ pub struct StatusState {
 /// default; disabled with `UNI_API_STATUS=0` or when the exported UI folder
 /// (`UNI_API_STATUS_UI`, default `./status`) is missing.
 pub fn maybe_merge(app: Router) -> Router {
-    if std::env::var("UNI_API_STATUS").map(|value| value == "0").unwrap_or(false) {
+    if std::env::var("UNI_API_STATUS")
+        .map(|value| value == "0")
+        .unwrap_or(false)
+    {
         return app;
     }
     let config_path = PathBuf::from(
         std::env::var("UNI_API_CONFIG_PATH").unwrap_or_else(|_| "api.yaml".to_owned()),
     );
-    let ui_root = PathBuf::from(
-        std::env::var("UNI_API_STATUS_UI").unwrap_or_else(|_| "./status".to_owned()),
-    );
+    let ui_root =
+        PathBuf::from(std::env::var("UNI_API_STATUS_UI").unwrap_or_else(|_| "./status".to_owned()));
     if !ui_root.is_dir() {
         return app;
     }
@@ -64,9 +66,8 @@ pub fn maybe_merge(app: Router) -> Router {
             json!({"kind": "log", "event": "status_stats_backend_unsupported", "backend": stats_backend})
         );
     }
-    let stats_db = PathBuf::from(
-        std::env::var("DB_PATH").unwrap_or_else(|_| "./data/stats.db".into()),
-    );
+    let stats_db =
+        PathBuf::from(std::env::var("DB_PATH").unwrap_or_else(|_| "./data/stats.db".into()));
     let state = StatusState {
         config_path: config_path.canonicalize().unwrap_or(config_path),
         ui_root: ui_root.canonicalize().unwrap_or(ui_root),
@@ -168,7 +169,10 @@ fn require_key(
     let (_, config) = read_config(state)?;
     match find_key(&config, api_key) {
         Some(entry) => Ok((entry.clone(), config)),
-        None => Err(json_error(StatusCode::FORBIDDEN, json!({ "error": "Unauthorized" }))),
+        None => Err(json_error(
+            StatusCode::FORBIDDEN,
+            json!({ "error": "Unauthorized" }),
+        )),
     }
 }
 
@@ -181,7 +185,10 @@ fn require_admin(
         let (content, _) = read_config(state)?;
         Ok((content, config))
     } else {
-        Err(json_error(StatusCode::FORBIDDEN, json!({ "error": "Unauthorized" })))
+        Err(json_error(
+            StatusCode::FORBIDDEN,
+            json!({ "error": "Unauthorized" }),
+        ))
     }
 }
 
@@ -220,11 +227,16 @@ fn query_rows_blocking(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
     )
     .map_err(|error| error.to_string())?;
-    let mut statement = connection.prepare(&sql).map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| error.to_string())?;
     let column_names: Vec<String> = (0..statement.column_count())
         .map(|index| statement.column_name(index).unwrap_or_default().to_owned())
         .collect();
-    let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+    let refs: Vec<&dyn rusqlite::ToSql> = args
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
     let mut rows = statement
         .query(rusqlite::params_from_iter(refs))
         .map_err(|error| error.to_string())?;
@@ -337,7 +349,9 @@ async fn available_keys(State(state): State<StatusState>, Json(body): Json<Value
                 "role": item.get("role").and_then(Value::as_str).unwrap_or("user"),
             });
             if let Some(name) = item.get("name").filter(|value| !value.is_null()) {
-                key.as_object_mut().unwrap().insert("name".into(), name.clone());
+                key.as_object_mut()
+                    .unwrap()
+                    .insert("name".into(), name.clone());
             }
             key
         })
@@ -362,7 +376,10 @@ async fn load_config(
 
 async fn save_config(State(state): State<StatusState>, Json(body): Json<Value>) -> Response {
     let api_key = body_key(&body, "apiKey").map(str::to_owned);
-    let config = body.get("config").and_then(Value::as_str).unwrap_or_default();
+    let config = body
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if api_key.is_none() || config.is_empty() {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -394,7 +411,11 @@ async fn stats_overview(
     Query(params): Query<Map<String, Value>>,
 ) -> Response {
     let api_key = match require_key(&state, &params) {
-        Ok((entry, _)) => entry.get("api").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        Ok((entry, _)) => entry
+            .get("api")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         Err(response) => return response,
     };
     let rows = match run_sqlite(
@@ -461,7 +482,11 @@ async fn stats_models(
     Query(params): Query<Map<String, Value>>,
 ) -> Response {
     let api_key = match require_key(&state, &params) {
-        Ok((entry, _)) => entry.get("api").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        Ok((entry, _)) => entry
+            .get("api")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         Err(response) => return response,
     };
     run_ranking(&state, "model", api_key).await
@@ -472,7 +497,11 @@ async fn stats_channels(
     Query(params): Query<Map<String, Value>>,
 ) -> Response {
     let api_key = match require_key(&state, &params) {
-        Ok((entry, _)) => entry.get("api").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        Ok((entry, _)) => entry
+            .get("api")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         Err(response) => return response,
     };
     run_ranking(&state, "provider", api_key).await
@@ -481,18 +510,22 @@ async fn stats_channels(
 const DISTINCT_SQL: &str = "SELECT DISTINCT {column} FROM request_stats \
      WHERE api_key = $1 AND endpoint = '/v1/chat/completions' ORDER BY {column}";
 
-async fn filters(State(state): State<StatusState>, Query(params): Query<Map<String, Value>>) -> Response {
+async fn filters(
+    State(state): State<StatusState>,
+    Query(params): Query<Map<String, Value>>,
+) -> Response {
     let api_key = match require_key(&state, &params) {
-        Ok((entry, _)) => entry.get("api").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        Ok((entry, _)) => entry
+            .get("api")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         Err(response) => return response,
     };
     let column_list = |rows: Vec<Map<String, Value>>, column: &str| -> Vec<Value> {
         rows.into_iter()
             .filter_map(|row| row.get(column).cloned())
-            .filter(|value| {
-                !value.is_null()
-                    && value.as_str().map_or(true, |s| !s.is_empty())
-            })
+            .filter(|value| !value.is_null() && value.as_str().map_or(true, |s| !s.is_empty()))
             .collect()
     };
     let models = match run_sqlite(
@@ -518,12 +551,19 @@ async fn filters(State(state): State<StatusState>, Query(params): Query<Map<Stri
     Json(json!({ "models": models, "providers": providers })).into_response()
 }
 
-async fn logs(State(state): State<StatusState>, Query(params): Query<Map<String, Value>>) -> Response {
+async fn logs(
+    State(state): State<StatusState>,
+    Query(params): Query<Map<String, Value>>,
+) -> Response {
     let entry = match require_key(&state, &params) {
         Ok((entry, _)) => entry,
         Err(response) => return response,
     };
-    let api_key = entry.get("api").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let api_key = entry
+        .get("api")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     let get = |name: &str| {
         params
             .get(name)
@@ -531,8 +571,14 @@ async fn logs(State(state): State<StatusState>, Query(params): Query<Map<String,
             .map(str::to_owned)
             .filter(|value| !value.is_empty())
     };
-    let page: i64 = get("page").and_then(|value| value.parse().ok()).unwrap_or(1).max(1);
-    let limit: i64 = get("limit").and_then(|value| value.parse().ok()).unwrap_or(30).clamp(1, 100);
+    let page: i64 = get("page")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let limit: i64 = get("limit")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30)
+        .clamp(1, 100);
 
     let mut where_clauses = vec!["r.api_key = $1".to_owned(), "r.endpoint = $2".to_owned()];
     let mut args: Vec<SqlValue> = vec![text_arg(&api_key), text_arg("/v1/chat/completions")];
@@ -607,9 +653,19 @@ async fn providers_list(
         Err(response) => return response,
     };
     let mut providers = Vec::new();
-    for provider in config.get("providers").and_then(Value::as_array).into_iter().flatten() {
+    for provider in config
+        .get("providers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let mut models = Vec::new();
-        for entry in provider.get("model").and_then(Value::as_array).into_iter().flatten() {
+        for entry in provider
+            .get("model")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             match entry {
                 Value::String(name) => models.push(json!({ "original": name, "display": name })),
                 Value::Object(mapping) => {
@@ -620,7 +676,10 @@ async fn providers_list(
                 _ => {}
             }
         }
-        let base_url = provider.get("base_url").and_then(Value::as_str).unwrap_or_default();
+        let base_url = provider
+            .get("base_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let supported = base_url.contains("/chat/completions")
             || base_url.contains("/v1/messages")
             || base_url.contains("/responses");
@@ -642,7 +701,12 @@ async fn providers_list(
 /// that a base_url ending in "/v1" keeps that segment on purpose.
 fn base_url_to_models_url(base_url: &str) -> String {
     let mut root = base_url.trim_end_matches('/').to_owned();
-    for suffix in ["/chat/completions", "/completions", "/responses", "/messages"] {
+    for suffix in [
+        "/chat/completions",
+        "/completions",
+        "/responses",
+        "/messages",
+    ] {
         if root.ends_with(suffix) {
             root.truncate(root.len() - suffix.len());
             break;
@@ -658,7 +722,11 @@ fn channel_key(api: &Value) -> String {
             .first()
             .map(|item| match item {
                 Value::String(key) => key.clone(),
-                other => other.get("api").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                other => other
+                    .get("api")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
             })
             .unwrap_or_default(),
         _ => String::new(),
@@ -683,7 +751,9 @@ async fn provider_models(State(state): State<StatusState>, Json(body): Json<Valu
     let url = base_url_to_models_url(&base_url);
     let mut request = state.http.get(&url).timeout(Duration::from_secs(30));
     if base_url.contains("/v1/messages") {
-        request = request.header("x-api-key", &channel_api).header("anthropic-version", "2023-06-01");
+        request = request
+            .header("x-api-key", &channel_api)
+            .header("anthropic-version", "2023-06-01");
     } else {
         request = request.bearer_auth(&channel_api);
     }
@@ -703,15 +773,15 @@ async fn provider_models(State(state): State<StatusState>, Json(body): Json<Valu
                 .into_response();
             }
             match response.json::<Value>().await {
-                Ok(data) => Json(json!({ "success": true, "models": extract_model_ids(&data) })).into_response(),
+                Ok(data) => Json(json!({ "success": true, "models": extract_model_ids(&data) }))
+                    .into_response(),
                 Err(error) => {
                     Json(json!({ "success": false, "message": error.to_string() })).into_response()
                 }
             }
         }
-        Err(error) => {
-            Json(json!({ "success": false, "message": format!("网络错误: {error}") })).into_response()
-        }
+        Err(error) => Json(json!({ "success": false, "message": format!("网络错误: {error}") }))
+            .into_response(),
     }
 }
 
@@ -719,7 +789,11 @@ fn extract_model_ids(data: &Value) -> Vec<Value> {
     let candidates = [
         data.get("data").cloned(),
         data.get("models").cloned(),
-        if data.is_array() { Some(data.clone()) } else { None },
+        if data.is_array() {
+            Some(data.clone())
+        } else {
+            None
+        },
     ];
     for candidate in candidates.into_iter().flatten() {
         if let Some(items) = candidate.as_array() {
@@ -738,7 +812,13 @@ fn extract_model_ids(data: &Value) -> Vec<Value> {
 /// Strip a known endpoint suffix (mirrors resolveBaseRoot in the TS route).
 fn normalize_base_root(base_url: &str) -> String {
     let mut root = base_url.trim_end_matches('/').to_owned();
-    for suffix in ["/chat/completions", "/v1/messages", "/completions", "/responses", "/messages"] {
+    for suffix in [
+        "/chat/completions",
+        "/v1/messages",
+        "/completions",
+        "/responses",
+        "/messages",
+    ] {
         if root.ends_with(suffix) {
             root.truncate(root.len() - suffix.len());
             break;
@@ -794,14 +874,20 @@ async fn provider_test_real(State(state): State<StatusState>, Json(body): Json<V
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-uni-api-debug", "1");
     if endpoint == "messages" {
-        request = request.header("x-api-key", &channel_api).header("anthropic-version", "2023-06-01");
+        request = request
+            .header("x-api-key", &channel_api)
+            .header("anthropic-version", "2023-06-01");
         headers.insert("x-api-key".into(), json!(channel_api.clone()));
         headers.insert("anthropic-version".into(), json!("2023-06-01"));
     } else {
         request = request.bearer_auth(&channel_api);
-        headers.insert("Authorization".into(), json!(format!("Bearer {channel_api}")));
+        headers.insert(
+            "Authorization".into(),
+            json!(format!("Bearer {channel_api}")),
+        );
     }
-    let request_info = json!({ "method": "POST", "url": url, "headers": headers, "body": request_body });
+    let request_info =
+        json!({ "method": "POST", "url": url, "headers": headers, "body": request_body });
     let started = Instant::now();
     match request.json(&request_body).send().await {
         Ok(response) => {
@@ -827,7 +913,10 @@ async fn provider_test_real(State(state): State<StatusState>, Json(body): Json<V
             });
             if let (Some(request), Some(response)) = (upstream_request, upstream_response) {
                 if let Some(object) = result.as_object_mut() {
-                    object.insert("upstream".into(), json!({ "request": request, "response": response }));
+                    object.insert(
+                        "upstream".into(),
+                        json!({ "request": request, "response": response }),
+                    );
                 }
             }
             Json(result).into_response()
@@ -875,7 +964,10 @@ const MIME: &[(&str, &str)] = &[
 ];
 
 fn mime_for(path: &Path) -> &'static str {
-    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
     MIME.iter()
         .find(|(name, _)| *name == extension)
         .map(|(_, value)| *value)
@@ -892,7 +984,8 @@ fn serve_file(root: &Path, relative: &str, immutable: bool) -> Response {
             let mut headers = HeaderMap::new();
             headers.insert(
                 header::CONTENT_TYPE,
-                HeaderValue::from_str(mime_for(&candidate)).unwrap_or(HeaderValue::from_static("application/octet-stream")),
+                HeaderValue::from_str(mime_for(&candidate))
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
             );
             headers.insert(
                 header::CACHE_CONTROL,
