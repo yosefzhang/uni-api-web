@@ -49,7 +49,9 @@ fn model_caps_for_in(map: &HashMap<String, Value>, model: &str) -> Option<Value>
 }
 
 fn cap_get(caps: Option<&Value>, key: &str) -> Value {
-    caps.and_then(|c| c.get(key)).cloned().unwrap_or(Value::Null)
+    caps.and_then(|c| c.get(key))
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 pub async fn handle(
