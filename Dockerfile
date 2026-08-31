@@ -19,6 +19,7 @@ FROM native-dependencies AS native-builder
 WORKDIR /workspace
 COPY README.md pyproject.toml ./
 COPY uni_api/api/codex_models_pro_0_144_0.json ./uni_api/api/codex_models_pro_0_144_0.json
+COPY uni_api/api/model_context_windows.json ./uni_api/api/model_context_windows.json
 COPY static ./static
 WORKDIR /workspace/rust/uni-api-native
 COPY rust/uni-api-native ./

@@ -61,6 +61,29 @@ _CODEX_BLOCKED_MODEL_TOKENS = (
     "whisper",
 )
 
+_MODEL_CAPS: dict[str, dict[str, Any]] = json.loads(
+    Path(__file__).with_name("model_context_windows.json").read_text(encoding="utf-8")
+)
+_MODEL_CAPS_PREFIXES = sorted(_MODEL_CAPS, key=len, reverse=True)
+
+
+def model_caps_for(model_id: str) -> dict[str, Any] | None:
+    if model_id in _MODEL_CAPS:
+        return _MODEL_CAPS[model_id]
+    for prefix in _MODEL_CAPS_PREFIXES:
+        if model_id.startswith(prefix) and model_id[len(prefix):len(prefix) + 1] == "-":
+            return _MODEL_CAPS[prefix]
+    return None
+
+
+def _attach_model_caps(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for model in models:
+        caps = model_caps_for(str(model.get("id", ""))) or {}
+        model["context_window"] = caps.get("context_window")
+        model["max_output_tokens"] = caps.get("max_output_tokens")
+        model["supports_vision"] = caps.get("supports_vision")
+    return models
+
 
 def get_all_models(config: dict[str, Any]) -> list[dict[str, Any]]:
     all_models: list[dict[str, Any]] = []
@@ -80,7 +103,7 @@ def get_all_models(config: dict[str, Any]) -> list[dict[str, Any]]:
                     }
                 )
 
-    return all_models
+    return _attach_model_caps(all_models)
 
 
 def post_all_models(api_index: int, config: dict[str, Any], api_list: list[str], models_list: dict[str, list[str]]) -> list[dict[str, Any]]:
@@ -167,7 +190,7 @@ def post_all_models(api_index: int, config: dict[str, Any], api_list: list[str],
                     }
                 )
 
-    return all_models
+    return _attach_model_caps(all_models)
 
 
 def list_models_payload(

@@ -12,6 +12,40 @@ use crate::proxy::{json_error, AppState};
 
 const MODEL_CREATED: u64 = 1_720_524_448_858;
 
+fn model_caps_map() -> &'static HashMap<String, Value> {
+    static MAP: OnceLock<HashMap<String, Value>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        serde_json::from_str(include_str!(
+            "../../../../../uni_api/api/model_context_windows.json"
+        ))
+        .unwrap_or_default()
+    })
+}
+
+fn model_caps_for(model: &str) -> Option<&'static Value> {
+    let map = model_caps_map();
+    if let Some(caps) = map.get(model) {
+        return Some(caps);
+    }
+    let mut best: Option<(usize, &'static Value)> = None;
+    for (key, caps) in map.iter() {
+        if model.len() <= key.len() || !model.starts_with(key) {
+            continue;
+        }
+        if model.as_bytes().get(key.len()) != Some(&b'-') {
+            continue;
+        }
+        if best.map_or(true, |(len, _)| key.len() > len) {
+            best = Some((key.len(), caps));
+        }
+    }
+    best.map(|(_, caps)| caps)
+}
+
+fn cap_get(caps: Option<&Value>, key: &str) -> Value {
+    caps.and_then(|c| c.get(key)).cloned().unwrap_or(Value::Null)
+}
+
 pub async fn handle(
     state: &AppState,
     method: &Method,
@@ -245,12 +279,18 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
         StatusCode::OK,
         json!({
             "object": "list",
-            "data": models.into_iter().map(|model| json!({
-                "id": model,
-                "object": "model",
-                "created": MODEL_CREATED,
-                "owned_by": "uni-api",
-            })).collect::<Vec<_>>(),
+            "data": models.into_iter().map(|model| {
+                let caps = model_caps_for(&model);
+                json!({
+                    "id": model,
+                    "object": "model",
+                    "created": MODEL_CREATED,
+                    "owned_by": "uni-api",
+                    "context_window": cap_get(caps, "context_window"),
+                    "max_output_tokens": cap_get(caps, "max_output_tokens"),
+                    "supports_vision": cap_get(caps, "supports_vision"),
+                })
+            }).collect::<Vec<_>>(),
         }),
     )
 }
