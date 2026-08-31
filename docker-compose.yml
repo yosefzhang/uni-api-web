@@ -12,4 +12,4 @@ services:
     volumes:
       - ./api.yaml:/home/api.yaml
       - ./data:/home/data
-      - ./uni_api/api/model_context_windows.json:/home/uni_api/api/model_context_windows.json
+      - ./model_context_windows.json:/home/uni_api/api/model_context_windows.json
