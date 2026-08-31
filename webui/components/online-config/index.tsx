@@ -263,7 +263,7 @@ export function OnlineConfig({ apiKey }: OnlineConfigProps) {
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
-      toast({ title: "保存成功", description: "api.yaml 已写入磁盘，请按需重启 uni-api 让新配置生效。" })
+      toast({ title: "保存成功", description: "api.yaml 已保存，uni-api 将自动热重载并在约 2 秒内生效，无需重启。" })
     } catch (e: any) {
       toast({ title: "保存失败", description: e.message || "未知错误", variant: "destructive" })
     } finally {

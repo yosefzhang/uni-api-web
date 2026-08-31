@@ -395,7 +395,7 @@ export function ConfigEditor({ apiKey }: ConfigEditorProps) {
                 <AlertDescription className="text-xs space-y-1"> {/* Smaller text and spacing */}
                   <li>请确保 YAML 语法正确。格式错误将导致无法保存。</li>
                   <li>保存前建议先使用【下载】按钮备份当前配置。</li>
-                  <li>配置修改并保存后，服务将自动重启以应用新配置。</li>
+                  <li>配置修改并保存后，uni-api 将自动热重载并在约 2 秒内生效，无需重启。</li>
                 </AlertDescription>
               </Alert>
             </CardContent>
