@@ -27,28 +27,24 @@ on:
       - .gitmodules
   workflow_dispatch:
 
-# A version-bump push carries [skip ci], so only one release workflow can update
-# main at a time. The prepare job explicitly checks out the latest main head.
 concurrency:
-  group: docker-release-${{ github.ref }}
+  group: docker-build-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
+  packages: write
 
 env:
-  DOCKERHUB_IMAGE: yym68686/uni-api
   GHCR_IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   prepare:
     name: Prepare release version
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
     outputs:
-      release_sha: ${{ steps.release.outputs.release_sha }}
-      version: ${{ steps.release.outputs.version }}
+      release_sha: ${{ steps.prepare.outputs.release_sha }}
+      version: ${{ steps.prepare.outputs.version }}
 
     steps:
       - name: Checkout repository
@@ -56,52 +52,12 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
-          token: ${{ secrets.PACK_TOKEN }}
 
-      - name: Bump version and publish release commit
-        id: release
+      - name: Extract version and release sha
+        id: prepare
         run: |
-          # Serialize releases against the current remote head. A queued run may
-          # have been dispatched before the preceding version bump was pushed.
-          git fetch origin main
-          git rebase origin/main
-          git submodule update --init --recursive
-
           VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
-          IFS='.' read -ra VERSION_PARTS <<< "$VERSION"
-          PATCH=$((VERSION_PARTS[2] + 1))
-          NEW_VERSION="${VERSION_PARTS[0]}.${VERSION_PARTS[1]}.$PATCH"
-          sed -i "s/^version = .*/version = \"$NEW_VERSION\"/" pyproject.toml
-          NEW_VERSION="$NEW_VERSION" python - <<'PY'
-          from pathlib import Path
-          import os
-
-          lock_path = Path("uv.lock")
-          lines = lock_path.read_text().splitlines()
-          in_uni_api_package = False
-          for index, line in enumerate(lines):
-              if line == "[[package]]":
-                  in_uni_api_package = False
-                  continue
-              if line == 'name = "uni-api"':
-                  in_uni_api_package = True
-                  continue
-              if in_uni_api_package and line.startswith("version = "):
-                  lines[index] = f'version = "{os.environ["NEW_VERSION"]}"'
-                  break
-          else:
-              raise SystemExit("uni-api package version not found in uv.lock")
-
-          lock_path.write_text("\n".join(lines) + "\n")
-          PY
-
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add pyproject.toml uv.lock
-          git commit -m "📖 Bump version to $NEW_VERSION [skip ci]"
-          git push origin HEAD:main
-
-          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
@@ -128,23 +84,16 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.release_sha }}
           submodules: recursive
-          token: ${{ secrets.PACK_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.PACK_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push platform image by digest
         id: build
@@ -156,7 +105,6 @@ jobs:
           build-args: |
             SOURCE_COMMIT=${{ needs.prepare.outputs.release_sha }}
           tags: |
-            ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.GHCR_IMAGE }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=uni-api-${{ matrix.platform_pair }}
@@ -198,43 +146,27 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.PACK_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish manifests to both registries
+      - name: Publish manifests
         working-directory: /tmp/digests
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           SOURCES=()
           for digest_file in *; do
-            SOURCES+=("${DOCKERHUB_IMAGE}@sha256:${digest_file}")
-          done
-
-          docker buildx imagetools create \
-            --tag "${DOCKERHUB_IMAGE}:latest" \
-            --tag "${DOCKERHUB_IMAGE}:${VERSION}" \
-            "${SOURCES[@]}"
-
-          GHCR_SOURCES=()
-          for digest_file in *; do
-            GHCR_SOURCES+=("${GHCR_IMAGE}@sha256:${digest_file}")
+            SOURCES+=("${GHCR_IMAGE}@sha256:${digest_file}")
           done
 
           docker buildx imagetools create \
             --tag "${GHCR_IMAGE}:latest" \
             --tag "${GHCR_IMAGE}:${VERSION}" \
-            "${GHCR_SOURCES[@]}"
+            "${SOURCES[@]}"
 
       - name: Verify published platforms
         env:
@@ -249,7 +181,5 @@ jobs:
             diff -u <(printf '%s\n' linux/amd64 linux/arm64) <(printf '%s\n' "$platforms")
           }
 
-          verify_platforms "${DOCKERHUB_IMAGE}:${VERSION}"
-          verify_platforms "${DOCKERHUB_IMAGE}:latest"
           verify_platforms "${GHCR_IMAGE}:${VERSION}"
           verify_platforms "${GHCR_IMAGE}:latest"
