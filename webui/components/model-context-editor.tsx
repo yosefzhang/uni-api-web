@@ -31,7 +31,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { Plus, Pencil, Trash2, RefreshCw, Save, Search, ChevronsUpDown } from "lucide-react"
+import { Plus, Pencil, Trash2, RefreshCw, Search, ChevronsUpDown } from "lucide-react"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import {
   Command,
@@ -211,6 +211,7 @@ export function ModelContextEditor({ apiKey }: ModelContextEditorProps) {
     for (const m of models) next[m] = cap
     setCaps(next)
     setDialogOpen(false)
+    void persist(next)
   }
 
   const handleDelete = (model: string) => {
@@ -219,15 +220,16 @@ export function ModelContextEditor({ apiKey }: ModelContextEditorProps) {
       if (k !== model) next[k] = v
     }
     setCaps(next)
+    void persist(next)
   }
 
-  const persist = async () => {
+  const persist = async (payload?: ModelCapsMap) => {
     setSaving(true)
     try {
       const res = await fetch("/api/model-context/save", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiKey, data: caps }),
+        body: JSON.stringify({ apiKey, data: payload ?? caps }),
       })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
@@ -241,7 +243,7 @@ export function ModelContextEditor({ apiKey }: ModelContextEditorProps) {
 
   const reload = async () => {
     await load()
-    toast({ title: "已重新加载", description: "已撤销未保存的本地修改。" })
+    toast({ title: "已重新加载", description: "已从 data/model_extern_config.json 重新读取配置。" })
   }
 
   if (loading) {
@@ -272,10 +274,6 @@ export function ModelContextEditor({ apiKey }: ModelContextEditorProps) {
           <Button variant="outline" size="sm" onClick={reload} disabled={saving}>
             <RefreshCw className="w-4 h-4 mr-2" />
             重新加载
-          </Button>
-          <Button size="sm" onClick={persist} disabled={saving}>
-            <Save className="w-4 h-4 mr-2" />
-            {saving ? "保存中…" : "保存"}
           </Button>
         </div>
       </div>
@@ -366,7 +364,7 @@ export function ModelContextEditor({ apiKey }: ModelContextEditorProps) {
                 <Input id="mc-model" value={editingModel} disabled className="font-mono text-xs" />
               ) : (
                 <>
-                  <Popover open={modelPopoverOpen} onOpenChange={setModelPopoverOpen}>
+                  <Popover open={modelPopoverOpen} onOpenChange={setModelPopoverOpen} modal={true}>
                     <PopoverTrigger asChild>
                       <Button
                         variant="outline"
@@ -385,7 +383,7 @@ export function ModelContextEditor({ apiKey }: ModelContextEditorProps) {
                     >
                       <Command>
                         <CommandInput placeholder="搜索模型…" />
-                        <CommandList>
+                        <CommandList className="max-h-[300px] overflow-y-auto">
                           <CommandEmpty>{modelsLoading ? "加载中…" : "未找到模型"}</CommandEmpty>
                           <CommandGroup>
                             {availableModels.map((model) => {

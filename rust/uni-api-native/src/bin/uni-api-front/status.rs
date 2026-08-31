@@ -704,9 +704,33 @@ async fn logs(
 // provider routes
 // ---------------------------------------------------------------------------
 
+/// Public-facing base URL of the uni-api gateway itself (e.g.
+/// `http://localhost:9210/v1`).  Prefers the `UNI_API_BASE_URL` env var, then
+/// falls back to the request's scheme + Host so the browser-visible URL matches
+/// what the frontend actually reached.  Used only for display; requests are
+/// still resolved against `internal_base` where needed.
+fn public_base_url(headers: &HeaderMap) -> String {
+    if let Ok(value) = std::env::var("UNI_API_BASE_URL") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http");
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("localhost:8000");
+    format!("{scheme}://{host}/v1")
+}
+
 async fn providers_list(
     State(state): State<StatusState>,
     Query(params): Query<Map<String, Value>>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(response) = require_key(&state, &params) {
         return response;
@@ -754,9 +778,8 @@ async fn providers_list(
             "supported": supported,
         }));
     }
-    // Same-origin relative path: the browser (and test-real below) reach the
-    // gateway through this very process, no host/port assumption needed.
-    Json(json!({ "providers": providers, "uniApiBaseUrl": "/v1" })).into_response()
+    Json(json!({ "providers": providers, "uniApiBaseUrl": public_base_url(&headers) }))
+        .into_response()
 }
 
 /// Strip a known endpoint suffix from a channel base_url, then append the
@@ -890,7 +913,11 @@ fn normalize_base_root(base_url: &str) -> String {
     root
 }
 
-async fn provider_test_real(State(state): State<StatusState>, Json(body): Json<Value>) -> Response {
+async fn provider_test_real(
+    State(state): State<StatusState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     let api_key = body_key(&body, "apiKey").unwrap_or_default().to_owned();
     let api = body.get("api").cloned().unwrap_or(Value::Null);
     let model = body_key(&body, "model").unwrap_or_default().to_owned();
@@ -912,10 +939,14 @@ async fn provider_test_real(State(state): State<StatusState>, Json(body): Json<V
         _ => "chat/completions".to_owned(),
     };
     let base_url = body_key(&body, "baseUrl").unwrap_or_default().to_owned();
-    let root = if base_url.is_empty() {
+    let public_url = public_base_url(&headers);
+    let root = if base_url.is_empty()
+        || base_url.trim_end_matches('/') == public_url.trim_end_matches('/')
+    {
+        // uni-api 网关自身：走内部地址，避免依赖容器的外部端口映射。
         format!("{}/v1", state.internal_base)
     } else if base_url.starts_with('/') {
-        // Same-origin relative option coming from the exported UI ("/v1").
+        // 历史遗留的相对路径选项（"/v1"）。
         format!("{}{}", state.internal_base, normalize_base_root(&base_url))
     } else {
         normalize_base_root(&base_url)
