@@ -15,6 +15,7 @@ uni_api/_uni_api_native*.so
 !uni_api/
 !uni_api/api/
 !uni_api/api/codex_models_pro_0_144_0.json
+!uni_api/api/model_context_windows.json
 !webui/package.json
 !webui/pnpm-lock.yaml
 !webui/tsconfig.json

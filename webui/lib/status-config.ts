@@ -3,6 +3,9 @@ import path from 'path';
 import { load as yamlLoad, dump as yamlDump } from 'js-yaml';
 
 const API_YAML_PATH = process.env.API_YAML_PATH || path.join(process.cwd(), '..', 'api.yaml');
+const MODEL_CONTEXT_PATH =
+  process.env.MODEL_CONTEXT_PATH ||
+  path.join(process.cwd(), '..', 'uni_api', 'api', 'model_context_windows.json');
 
 export interface ApiKeyEntry {
   api: string;
@@ -49,4 +52,19 @@ export function writeConfig(content: string): void {
   fs.writeFileSync(API_YAML_PATH, content, 'utf-8');
 }
 
-export { API_YAML_PATH };
+export function readModelContext(): Record<string, any> {
+  try {
+    const content = fs.readFileSync(MODEL_CONTEXT_PATH, 'utf-8');
+    return JSON.parse(content);
+  } catch (e: any) {
+    if (e?.code === 'ENOENT') return {};
+    throw e;
+  }
+}
+
+export function writeModelContext(data: Record<string, any>): void {
+  fs.mkdirSync(path.dirname(MODEL_CONTEXT_PATH), { recursive: true });
+  fs.writeFileSync(MODEL_CONTEXT_PATH, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+}
+
+export { API_YAML_PATH, MODEL_CONTEXT_PATH };

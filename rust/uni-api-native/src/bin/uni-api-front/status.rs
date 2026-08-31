@@ -28,6 +28,7 @@ pub struct StatusState {
     pub http: reqwest::Client,
     pub stats_db: PathBuf,
     pub stats_enabled: bool,
+    pub model_context_path: PathBuf,
 }
 
 /// Merge the status surface into the public router when enabled.  Enabled by
@@ -68,6 +69,10 @@ pub fn maybe_merge(app: Router) -> Router {
     }
     let stats_db =
         PathBuf::from(std::env::var("DB_PATH").unwrap_or_else(|_| "./data/stats.db".into()));
+    let model_context_path = PathBuf::from(
+        std::env::var("UNI_API_MODEL_CONTEXT_PATH")
+            .unwrap_or_else(|_| "uni_api/api/model_context_windows.json".to_owned()),
+    );
     let state = StatusState {
         config_path: config_path.canonicalize().unwrap_or(config_path),
         ui_root: ui_root.canonicalize().unwrap_or(ui_root),
@@ -78,6 +83,7 @@ pub fn maybe_merge(app: Router) -> Router {
             .unwrap_or_default(),
         stats_db,
         stats_enabled: stats_backend == "sqlite" && !database_disabled,
+        model_context_path,
     };
     let status = router(state);
     app.merge(status)
@@ -89,6 +95,8 @@ fn router(state: StatusState) -> Router {
         .route("/api/auth/available-keys", post(available_keys))
         .route("/api/config/load", get(load_config))
         .route("/api/config/save", post(save_config))
+        .route("/api/model-context/load", get(load_model_context))
+        .route("/api/model-context/save", post(save_model_context))
         .route("/api/filters", get(filters))
         .route("/api/logs", get(logs))
         .route("/api/stats/overview", get(stats_overview))
@@ -398,6 +406,51 @@ async fn save_config(State(state): State<StatusState>, Json(body): Json<Value>) 
     }
     if let Err(error) = std::fs::write(&state.config_path, config) {
         return internal_error("write api.yaml", &error);
+    }
+    Json(json!({ "success": true })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// model context windows (model_context_windows.json)
+// ---------------------------------------------------------------------------
+
+async fn load_model_context(
+    State(state): State<StatusState>,
+    Query(params): Query<Map<String, Value>>,
+) -> Response {
+    if let Err(response) = require_admin(&state, &params) {
+        return response;
+    }
+    let content = match std::fs::read_to_string(&state.model_context_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Json(json!({ "data": {} })).into_response()
+        }
+        Err(error) => return internal_error("read model_context_windows.json", &error),
+    };
+    let data = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
+    Json(json!({ "data": data })).into_response()
+}
+
+async fn save_model_context(State(state): State<StatusState>, Json(body): Json<Value>) -> Response {
+    let api_key = body_key(&body, "apiKey").map(str::to_owned);
+    let data = body.get("data").cloned().unwrap_or(Value::Null);
+    if api_key.is_none() || !data.is_object() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "API Key and a JSON object data are required" }),
+        );
+    }
+    let params = Map::from_iter([("apiKey".into(), json!(api_key.unwrap()))]);
+    if let Err(response) = require_admin(&state, &params) {
+        return response;
+    }
+    let pretty = match serde_json::to_string_pretty(&data) {
+        Ok(pretty) => format!("{pretty}\n"),
+        Err(error) => return internal_error("serialize model_context_windows.json", &error),
+    };
+    if let Err(error) = std::fs::write(&state.model_context_path, pretty) {
+        return internal_error("write model_context_windows.json", &error);
     }
     Json(json!({ "success": true })).into_response()
 }

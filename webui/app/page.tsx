@@ -7,11 +7,12 @@ import { useState, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { Settings, BarChart3, FileEdit, Menu, Zap, SlidersHorizontal } from "lucide-react"
+import { Settings, BarChart3, FileEdit, Menu, Zap, SlidersHorizontal, Database } from "lucide-react"
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet"
 import { ApiKeyModal } from "@/components/api-key-modal"
 import { ConfigEditor } from "@/components/config-editor"
 import { OnlineConfig } from "@/components/online-config"
+import { ModelContextEditor } from "@/components/model-context-editor"
 import { StatsViewer } from "@/components/stats-viewer"
 import { useToast } from "@/hooks/use-toast"
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card"
@@ -19,7 +20,7 @@ import { Separator } from "@/components/ui/separator"
 import { ChannelTester } from "@/components/channel-tester"
 
 export default function HomePage() {
-  const [currentPage, setCurrentPage] = useState<"stats" | "config" | "online-config" | "test">("stats")
+  const [currentPage, setCurrentPage] = useState<"stats" | "config" | "online-config" | "model-context" | "test">("stats")
   const [showApiKeyModal, setShowApiKeyModal] = useState(false)
   const [apiKey, setApiKey] = useState<string>("")
   const [userRole, setUserRole] = useState<string>("")
@@ -296,6 +297,18 @@ export default function HomePage() {
                 </Button>
               )}
 
+              {/* Model Context Config Button (Admin Only) */}
+              {canAccessConfig && (
+                <Button
+                  variant={currentPage === "model-context" ? "secondary" : "ghost"}
+                  onClick={() => setCurrentPage("model-context")}
+                  size="sm"
+                >
+                  <Database className="w-4 h-4 mr-2" />
+                  模型能力配置
+                </Button>
+              )}
+
               {/* Settings Button */}
               <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setShowApiKeyModal(true)}>
                 <Settings className="w-4 h-4" />
@@ -364,6 +377,16 @@ export default function HomePage() {
                             在线配置
                           </Button>
                         )}
+                        {canAccessConfig && (
+                          <Button
+                            variant={currentPage === "model-context" ? "secondary" : "ghost"}
+                            onClick={() => { setCurrentPage("model-context"); setMobileMenuOpen(false); }}
+                            className="w-full justify-start"
+                          >
+                            <Database className="w-4 h-4 mr-2" />
+                            模型能力配置
+                          </Button>
+                        )}
                       </div>
 
                        {/* Statistics Submenu */}
@@ -409,6 +432,16 @@ export default function HomePage() {
               <Zap className="mx-auto h-10 w-10 text-yellow-500 mb-3"/>
               <p className="font-medium text-yellow-700 dark:text-yellow-400">访问受限</p>
               <p className="text-sm text-muted-foreground mt-1">您需要管理员权限才能访问此在线配置功能。</p>
+            </CardContent>
+          </Card>
+        )}
+        {currentPage === "model-context" && canAccessConfig && <ModelContextEditor apiKey={apiKey} />}
+        {currentPage === "model-context" && !canAccessConfig && (
+          <Card className="border-dashed border-yellow-500 bg-yellow-50 dark:bg-yellow-900/20">
+            <CardContent className="p-6 text-center">
+              <Zap className="mx-auto h-10 w-10 text-yellow-500 mb-3"/>
+              <p className="font-medium text-yellow-700 dark:text-yellow-400">访问受限</p>
+              <p className="text-sm text-muted-foreground mt-1">您需要管理员权限才能访问此模型能力配置功能。</p>
             </CardContent>
           </Card>
         )}

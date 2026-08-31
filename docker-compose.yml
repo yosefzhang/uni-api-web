@@ -6,8 +6,10 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
+      - UNI_API_MODEL_CONTEXT_PATH=/home/uni_api/api/model_context_windows.json
     ports:
       - "9210:8000"
     volumes:
       - ./api.yaml:/home/api.yaml
       - ./data:/home/data
+      - ./uni_api/api/model_context_windows.json:/home/uni_api/api/model_context_windows.json

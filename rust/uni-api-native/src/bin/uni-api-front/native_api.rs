@@ -12,22 +12,20 @@ use crate::proxy::{json_error, AppState};
 
 const MODEL_CREATED: u64 = 1_720_524_448_858;
 
-fn model_caps_map() -> &'static HashMap<String, Value> {
-    static MAP: OnceLock<HashMap<String, Value>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        serde_json::from_str(include_str!(
-            "../../../../../uni_api/api/model_context_windows.json"
-        ))
-        .unwrap_or_default()
-    })
+fn model_caps_map() -> HashMap<String, Value> {
+    let path = std::env::var("UNI_API_MODEL_CONTEXT_PATH")
+        .unwrap_or_else(|_| "uni_api/api/model_context_windows.json".to_owned());
+    let content = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        include_str!("../../../../../uni_api/api/model_context_windows.json").to_owned()
+    });
+    serde_json::from_str(&content).unwrap_or_default()
 }
 
-fn model_caps_for(model: &str) -> Option<&'static Value> {
-    let map = model_caps_map();
+fn model_caps_for_in(map: &HashMap<String, Value>, model: &str) -> Option<Value> {
     if let Some(caps) = map.get(model) {
-        return Some(caps);
+        return Some(caps.clone());
     }
-    let mut best: Option<(usize, &'static Value)> = None;
+    let mut best: Option<(usize, &Value)> = None;
     for (key, caps) in map.iter() {
         if model.len() <= key.len() || !model.starts_with(key) {
             continue;
@@ -39,7 +37,7 @@ fn model_caps_for(model: &str) -> Option<&'static Value> {
             best = Some((key.len(), caps));
         }
     }
-    best.map(|(_, caps)| caps)
+    best.map(|(_, caps)| caps.clone())
 }
 
 fn cap_get(caps: Option<&Value>, key: &str) -> Value {
@@ -275,22 +273,27 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
         );
         return response;
     }
+    let caps_map = model_caps_map();
+    let data: Vec<Value> = models
+        .into_iter()
+        .map(|model| {
+            let caps = model_caps_for_in(&caps_map, &model);
+            json!({
+                "id": model,
+                "object": "model",
+                "created": MODEL_CREATED,
+                "owned_by": "uni-api",
+                "context_window": cap_get(caps.as_ref(), "context_window"),
+                "max_output_tokens": cap_get(caps.as_ref(), "max_output_tokens"),
+                "supports_vision": cap_get(caps.as_ref(), "supports_vision"),
+            })
+        })
+        .collect();
     json_response(
         StatusCode::OK,
         json!({
             "object": "list",
-            "data": models.into_iter().map(|model| {
-                let caps = model_caps_for(&model);
-                json!({
-                    "id": model,
-                    "object": "model",
-                    "created": MODEL_CREATED,
-                    "owned_by": "uni-api",
-                    "context_window": cap_get(caps, "context_window"),
-                    "max_output_tokens": cap_get(caps, "max_output_tokens"),
-                    "supports_vision": cap_get(caps, "supports_vision"),
-                })
-            }).collect::<Vec<_>>(),
+            "data": data,
         }),
     )
 }

@@ -72,4 +72,5 @@ EXPOSE 8000
 WORKDIR /home
 COPY --from=native-builder /tmp/uni-api-front /usr/local/bin/uni-api-front
 COPY --from=status-builder /tmp/status-out /home/status
+COPY uni_api/api/model_context_windows.json /home/uni_api/api/model_context_windows.json
 ENTRYPOINT ["/usr/local/bin/uni-api-front"]
