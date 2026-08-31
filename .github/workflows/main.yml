@@ -16,6 +16,8 @@ on:
       - uni_api/**
       - uni_api
       - static/**
+      - webui/**
+      - webui
       - Dockerfile
       - .dockerignore
       - rust/**
@@ -56,7 +58,7 @@ jobs:
       - name: Extract version and release sha
         id: prepare
         run: |
-          VERSION=$(grep "^version = " pyproject.toml | awk -F'"' '{print $2}')
+          VERSION=$(grep '"version"' webui/package.json | head -n 1 | awk -F'"' '{print $4}')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 

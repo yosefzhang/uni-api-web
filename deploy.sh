@@ -46,6 +46,16 @@ is_running() {
   port_listening "$1"
 }
 
+# 读取后端版本号（来自 pyproject.toml）
+backend_version() {
+  grep '^version = ' "$PROJECT_ROOT/pyproject.toml" 2>/dev/null | head -n 1 | awk -F'"' '{print $2}'
+}
+
+# 读取前端版本号（来自 webui/package.json）
+frontend_version() {
+  grep '"version"' "$WEBUI_DIR/package.json" 2>/dev/null | head -n 1 | awk -F'"' '{print $4}'
+}
+
 stop_service() {
   local name="$1" port="$2" pidfile="$3"
   local killed_any=false
@@ -156,8 +166,8 @@ case "${1:-}" in
     start_backend
     start_frontend
     echo ""
-    echo "前端: http://localhost:$FRONTEND_PORT"
-    echo "后端: http://localhost:$BACKEND_PORT"
+    echo "前端: http://localhost:$FRONTEND_PORT (v$(frontend_version))"
+    echo "后端: http://localhost:$BACKEND_PORT (v$(backend_version))"
     echo "日志: $PROJECT_ROOT/.run/{backend,frontend}.log"
     ;;
   stop)
@@ -171,14 +181,15 @@ case "${1:-}" in
     start_backend
     start_frontend
     echo ""
-    echo "前端: http://localhost:$FRONTEND_PORT"
-    echo "后端: http://localhost:$BACKEND_PORT"
+    echo "前端: http://localhost:$FRONTEND_PORT (v$(frontend_version))"
+    echo "后端: http://localhost:$BACKEND_PORT (v$(backend_version))"
     echo "日志: $PROJECT_ROOT/.run/{backend,frontend}.log"
     ;;
   status)
     echo "服务状态:"
     show_status "后端" "$BACKEND_PORT" "$BACKEND_PIDFILE"
     show_status "前端" "$FRONTEND_PORT" "$FRONTEND_PIDFILE"
+    echo "版本: 后端 v$(backend_version) · 前端 v$(frontend_version)"
     ;;
   *)
     echo "用法: $0 {dev|stop|restart|status}"

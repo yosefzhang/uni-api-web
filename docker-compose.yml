@@ -1,11 +1,13 @@
 services:
-  uni-api:
-    container_name: uni-api
-    image: yym68686/uni-api:latest
+  uni-api-web:
+    container_name: uni-api-web
+    image: ghcr.io/yosefzhang/uni-api-web:latest
+    network_mode: bridge
+    restart: unless-stopped
     environment:
-      - CONFIG_URL=http://file_url/api.yaml
+      - TZ=Asia/Shanghai
     ports:
-      - 8001:8000
+      - "9210:8000"
     volumes:
       - ./api.yaml:/home/api.yaml
-      - ./uniapi_db:/home/data
+      - ./data:/home/data

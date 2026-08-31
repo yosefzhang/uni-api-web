@@ -40,6 +40,7 @@ WORKDIR /build
 COPY webui/package.json webui/pnpm-lock.yaml ./
 RUN pnpm fetch
 COPY webui ./
+COPY pyproject.toml ../
 RUN pnpm install --offline --frozen-lockfile && \
     pnpm exec next build && \
     cp -r out /tmp/status-out

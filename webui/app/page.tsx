@@ -166,7 +166,12 @@ export default function HomePage() {
           <div className="hidden md:flex items-center justify-between">
             {/* Left Section */}
             <div className="flex items-center space-x-6">
-              <h1 className="text-xl font-semibold tracking-tight text-gray-900 dark:text-gray-100">UniAPI 管理面板</h1>
+              <div className="flex flex-col">
+                <h1 className="text-xl font-semibold tracking-tight text-gray-900 dark:text-gray-100">Uni-API-Web</h1>
+                <span className="text-xs text-muted-foreground">
+                  uni-api v{process.env.NEXT_PUBLIC_UNI_API_VERSION || "…"} · web v{process.env.NEXT_PUBLIC_UNI_API_WEB_VERSION || "…"}
+                </span>
+              </div>
               {/* Role and Viewing Key Info (Moved inside the left section div) */}
               <div className="flex items-center space-x-2 border-l pl-4 dark:border-gray-600">
                 {getRoleBadge(userRole)}
@@ -302,7 +307,7 @@ export default function HomePage() {
           {/* Mobile Header */}
           <div className="md:hidden">
             <div className="flex items-center justify-between">
-              <h1 className="text-lg font-semibold">UniAPI</h1> {/* 简化标题 */}
+              <h1 className="text-lg font-semibold">Uni-API-Web</h1> {/* 简化标题 */}
               <div className="flex items-center space-x-1">
                 {/* Mobile Role and Viewing Key */}
                 <div className="flex items-center space-x-1 mr-1 text-xs"> {/* Smaller text */}
