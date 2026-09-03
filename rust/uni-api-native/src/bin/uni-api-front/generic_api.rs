@@ -1718,12 +1718,24 @@ async fn normalize_image_url(
         }
         bytes.extend_from_slice(&chunk);
     }
-    let media_type = detect_image_media_type(&bytes).ok_or_else(|| {
-        (
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Unsupported image media type".into(),
-        )
-    })?;
+    let media_type = match inspect_image_media_type(&bytes) {
+        ImageMediaTypeInspection::Supported(media_type) => media_type,
+        ImageMediaTypeInspection::AnimatedGif => {
+            return Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Animated GIF image input is not supported".into(),
+            ));
+        }
+        ImageMediaTypeInspection::InvalidGif => {
+            return Err((StatusCode::BAD_REQUEST, "Invalid GIF image input".into()));
+        }
+        ImageMediaTypeInspection::Unsupported => {
+            return Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Unsupported image media type".into(),
+            ));
+        }
+    };
     Ok(format!(
         "data:{media_type};base64,{}",
         BASE64.encode(&bytes)
@@ -1753,7 +1765,10 @@ async fn validate_image_data_url(
     } else {
         declared.as_str()
     };
-    if !matches!(declared, "image/jpeg" | "image/png" | "image/webp") {
+    if !matches!(
+        declared,
+        "image/gif" | "image/jpeg" | "image/png" | "image/webp"
+    ) {
         return Err((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "Unsupported image media type".into(),
@@ -1781,12 +1796,24 @@ async fn validate_image_data_url(
     let decoded = BASE64
         .decode(padded.as_bytes())
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid image base64".into()))?;
-    let detected = detect_image_media_type(&decoded).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Image bytes do not match the declared media type".into(),
-        )
-    })?;
+    let detected = match inspect_image_media_type(&decoded) {
+        ImageMediaTypeInspection::Supported(media_type) => media_type,
+        ImageMediaTypeInspection::AnimatedGif => {
+            return Err((
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Animated GIF image input is not supported".into(),
+            ));
+        }
+        ImageMediaTypeInspection::InvalidGif => {
+            return Err((StatusCode::BAD_REQUEST, "Invalid GIF image input".into()));
+        }
+        ImageMediaTypeInspection::Unsupported => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Image bytes do not match the declared media type".into(),
+            ));
+        }
+    };
     if detected != declared {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1804,17 +1831,99 @@ fn image_max_bytes() -> usize {
         .unwrap_or(DEFAULT_IMAGE_MAX_BYTES)
 }
 
-fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+#[derive(Debug, PartialEq, Eq)]
+enum ImageMediaTypeInspection {
+    Supported(&'static str),
+    AnimatedGif,
+    InvalidGif,
+    Unsupported,
+}
+
+fn inspect_image_media_type(bytes: &[u8]) -> ImageMediaTypeInspection {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Some("image/png");
+        return ImageMediaTypeInspection::Supported("image/png");
     }
     if bytes.starts_with(b"\xff\xd8\xff") {
-        return Some("image/jpeg");
+        return ImageMediaTypeInspection::Supported("image/jpeg");
     }
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        return Some("image/webp");
+        return ImageMediaTypeInspection::Supported("image/webp");
     }
-    None
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return match gif_frame_count(bytes) {
+            Some(1) => ImageMediaTypeInspection::Supported("image/gif"),
+            Some(frames) if frames > 1 => ImageMediaTypeInspection::AnimatedGif,
+            _ => ImageMediaTypeInspection::InvalidGif,
+        };
+    }
+    ImageMediaTypeInspection::Unsupported
+}
+
+fn gif_frame_count(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 13 || (!bytes.starts_with(b"GIF87a") && !bytes.starts_with(b"GIF89a")) {
+        return None;
+    }
+    let mut cursor = 13usize;
+    let logical_screen_packed = bytes[10];
+    if logical_screen_packed & 0x80 != 0 {
+        let table_bytes = 3usize.checked_mul(1usize << ((logical_screen_packed & 0x07) + 1))?;
+        cursor = cursor.checked_add(table_bytes)?;
+        if cursor > bytes.len() {
+            return None;
+        }
+    }
+
+    let mut frames = 0usize;
+    loop {
+        let introducer = *bytes.get(cursor)?;
+        cursor += 1;
+        match introducer {
+            0x3B => return Some(frames),
+            0x21 => {
+                bytes.get(cursor)?;
+                cursor += 1;
+                skip_gif_subblocks(bytes, &mut cursor)?;
+            }
+            0x2C => {
+                let descriptor_end = cursor.checked_add(9)?;
+                let descriptor = bytes.get(cursor..descriptor_end)?;
+                cursor = descriptor_end;
+                let image_packed = descriptor[8];
+                if image_packed & 0x80 != 0 {
+                    let table_bytes = 3usize.checked_mul(1usize << ((image_packed & 0x07) + 1))?;
+                    cursor = cursor.checked_add(table_bytes)?;
+                    if cursor > bytes.len() {
+                        return None;
+                    }
+                }
+                let lzw_code_size = *bytes.get(cursor)?;
+                if !(2..=12).contains(&lzw_code_size) {
+                    return None;
+                }
+                cursor += 1;
+                skip_gif_subblocks(bytes, &mut cursor)?;
+                frames += 1;
+                if frames > 1 {
+                    return Some(frames);
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn skip_gif_subblocks(bytes: &[u8], cursor: &mut usize) -> Option<()> {
+    loop {
+        let block_size = *bytes.get(*cursor)? as usize;
+        *cursor += 1;
+        if block_size == 0 {
+            return Some(());
+        }
+        *cursor = cursor.checked_add(block_size)?;
+        if *cursor > bytes.len() {
+            return None;
+        }
+    }
 }
 
 async fn prepare_input(
@@ -6088,6 +6197,39 @@ fn unix_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SINGLE_FRAME_GIF_BASE64: &str =
+        "R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABCAQQEAA7";
+    const ANIMATED_GIF_BASE64: &str =
+        "R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABCAQQEAAh+QQACgAAACwAAAAAAgACAIEAAP8AAAAAAAAAAAAIBgABCAQQEAA7";
+
+    #[test]
+    fn image_inspection_accepts_single_frame_gif() {
+        let bytes = BASE64.decode(SINGLE_FRAME_GIF_BASE64).unwrap();
+        assert_eq!(
+            inspect_image_media_type(&bytes),
+            ImageMediaTypeInspection::Supported("image/gif")
+        );
+    }
+
+    #[test]
+    fn image_inspection_rejects_animated_gif() {
+        let bytes = BASE64.decode(ANIMATED_GIF_BASE64).unwrap();
+        assert_eq!(
+            inspect_image_media_type(&bytes),
+            ImageMediaTypeInspection::AnimatedGif
+        );
+    }
+
+    #[test]
+    fn image_inspection_rejects_truncated_gif() {
+        let mut bytes = BASE64.decode(SINGLE_FRAME_GIF_BASE64).unwrap();
+        bytes.pop();
+        assert_eq!(
+            inspect_image_media_type(&bytes),
+            ImageMediaTypeInspection::InvalidGif
+        );
+    }
 
     #[test]
     fn hedging_applies_only_to_nonstream_chat_completions() {

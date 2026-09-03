@@ -26,10 +26,37 @@ from uni_api.providers.normalization import (
 
 
 _FORMER_FIXED_IMAGE_LIMIT_BYTES = 8 * 1024 * 1024
+_SINGLE_FRAME_GIF = base64.b64decode(
+    "R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABCAQQEAA7"
+)
+_ANIMATED_GIF = base64.b64decode(
+    "R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABCAQQEAAh+QQACgAAACwAAAAAAgACAIEAAP8AAAAAAAAAAAAIBgABCAQQEAA7"
+)
 
 
 def _data_url(media_type: str, content: bytes) -> str:
     return f"data:{media_type};base64,{base64.b64encode(content).decode()}"
+
+
+async def _build_remote_image_message_with_admission(
+    image_url: str,
+    engine: str,
+):
+    controller = RequestAdmissionController(
+        capacity=1,
+        waiter_limit=0,
+        wait_timeout_seconds=1,
+        max_body_bytes=1024 * 1024,
+        body_budget_bytes=4 * 1024 * 1024,
+        max_response_bytes=4 * 1024 * 1024,
+    )
+    lease = await controller.acquire()
+    token = bind_request_admission_lease(lease)
+    try:
+        return await build_image_message(image_url, engine)
+    finally:
+        reset_request_admission_lease(token)
+        await lease.release()
 
 
 def test_webp_is_validated_and_forwarded_without_pillow_transcoding():
@@ -41,6 +68,48 @@ def test_webp_is_validated_and_forwarded_without_pillow_transcoding():
     message = asyncio.run(run())
     assert message["source"]["media_type"] == "image/webp"
     assert base64.b64decode(message["source"]["data"]) == webp
+
+
+def test_single_frame_gif_is_validated_and_forwarded():
+    async def run():
+        return await build_image_message(
+            _data_url("image/gif", _SINGLE_FRAME_GIF),
+            "claude",
+        )
+
+    message = asyncio.run(run())
+    assert message["source"]["media_type"] == "image/gif"
+    assert base64.b64decode(message["source"]["data"]) == _SINGLE_FRAME_GIF
+
+
+def test_animated_gif_data_url_is_rejected():
+    async def run():
+        await build_image_message(_data_url("image/gif", _ANIMATED_GIF), "gpt")
+
+    with pytest.raises(HTTPException) as rejected:
+        asyncio.run(run())
+    assert rejected.value.status_code == 415
+    assert rejected.value.detail == "Animated GIF image input is not supported"
+
+
+def test_truncated_gif_data_url_is_rejected_as_invalid():
+    async def run():
+        await build_image_message(
+            _data_url("image/gif", _SINGLE_FRAME_GIF[:-1]),
+            "gpt",
+        )
+
+    with pytest.raises(HTTPException) as rejected:
+        asyncio.run(run())
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail == "Invalid GIF image input"
+
+
+def test_gif_inspector_handles_byte_at_a_time():
+    inspector = image_inputs._GifFrameInspector()
+    for value in _SINGLE_FRAME_GIF:
+        inspector.feed(bytes([value]))
+    inspector.finish()
 
 
 def test_data_url_rejects_declared_type_mismatch():
@@ -150,6 +219,52 @@ def test_remote_image_fetch_uses_explicit_30_second_httpx_timeout(monkeypatch):
         "write": 30.0,
         "pool": 30.0,
     }
+
+
+def test_remote_single_frame_gif_is_normalized(monkeypatch):
+    async def handler(_request):
+        return httpx.Response(200, content=_SINGLE_FRAME_GIF)
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(**kwargs)
+
+    monkeypatch.setattr(image_inputs.httpx, "AsyncClient", client_factory)
+
+    message = asyncio.run(
+        _build_remote_image_message_with_admission(
+            "https://image.example/single-frame.jpg",
+            "gpt",
+        )
+    )
+
+    assert message["image_url"]["url"].startswith("data:image/gif;base64,")
+
+
+def test_remote_animated_gif_is_rejected(monkeypatch):
+    async def handler(_request):
+        return httpx.Response(200, content=_ANIMATED_GIF)
+
+    real_async_client = httpx.AsyncClient
+
+    def client_factory(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(**kwargs)
+
+    monkeypatch.setattr(image_inputs.httpx, "AsyncClient", client_factory)
+
+    with pytest.raises(HTTPException) as rejected:
+        asyncio.run(
+            _build_remote_image_message_with_admission(
+                "https://image.example/animated.jpg",
+                "gpt",
+            )
+        )
+
+    assert rejected.value.status_code == 415
+    assert rejected.value.detail == "Animated GIF image input is not supported"
 
 
 def test_remote_image_fetch_total_deadline_still_maps_to_408(monkeypatch):

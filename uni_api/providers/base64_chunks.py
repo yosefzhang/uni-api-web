@@ -4,7 +4,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
 from uni_api.admission.json_parsing import run_json_cpu
@@ -110,6 +110,7 @@ async def inspect_base64_chunks(
     prefix_bytes: int = 0,
     collect_encoded_payload: bool = False,
     start_index: int = 0,
+    decoded_chunk_observer: Callable[[bytes], None] | None = None,
 ) -> Base64Inspection:
     """Validate, count and hash decoded bytes with bounded event-loop stalls."""
 
@@ -136,6 +137,8 @@ async def inspect_base64_chunks(
         digest.update(decoded_chunk)
         if len(prefix) < prefix_bytes:
             prefix.extend(decoded_chunk[: prefix_bytes - len(prefix)])
+        if decoded_chunk_observer is not None:
+            decoded_chunk_observer(decoded_chunk)
         decoded_chunk = None
 
     encoded_payload = None
