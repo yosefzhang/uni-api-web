@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+import json
+import uuid
+from pathlib import Path
 from typing import Any
 
 from core.utils import safe_get
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+try:
+    with (_PROJECT_ROOT / "webui" / "package.json").open("r", encoding="utf-8") as _f:
+        _UNI_API_WEB_VERSION = json.load(_f)["version"]
+except Exception:
+    _UNI_API_WEB_VERSION = "0.0.0"
+
+_OPENCODE_GO_USER_AGENT = f"uni-api-web/{_UNI_API_WEB_VERSION}"
 
 
 def apply_provider_preference_headers(
@@ -13,6 +25,26 @@ def apply_provider_preference_headers(
 ) -> None:
     headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
     apply_passthrough_request_headers(headers, provider, http_request=http_request)
+    ensure_opencode_go_session_header(headers, provider)
+
+
+def ensure_opencode_go_session_header(
+    headers: dict[str, Any],
+    provider: dict[str, Any],
+) -> None:
+    if not _is_opencode_go_provider(provider):
+        return
+
+    if _get_header_case_insensitive(headers, "x-opencode-session") is None:
+        headers["x-opencode-session"] = str(uuid.uuid4())
+
+    if _get_header_case_insensitive(headers, "User-Agent") is None:
+        headers["User-Agent"] = _OPENCODE_GO_USER_AGENT
+
+
+def _is_opencode_go_provider(provider: dict[str, Any]) -> bool:
+    base_url = str(provider.get("base_url") or "").strip()
+    return "opencode.ai" in base_url and "/zen/go" in base_url
 
 
 def apply_passthrough_request_headers(
