@@ -34,7 +34,7 @@ use crate::request_spool::{SpoolObservation, StoredBody};
 use crate::resources::MemoryReservation;
 use crate::responses_native::{
     apply_overrides, classify_provider_failure, compute_retry_count, extract_api_key, request_id,
-    FailedRoute, Provider, ProviderKeySelection, CODEX_USER_AGENT,
+    FailedRoute, Provider, ProviderKeySelection, CODEX_USER_AGENT, OPENCODE_GO_USER_AGENT,
 };
 
 const ALPHA_SEARCH_ENDPOINT: &str = "/v1/alpha/search";
@@ -3430,6 +3430,28 @@ fn provider_headers(
             incoming.get(name).cloned(),
         ) {
             headers.insert(header_name, value);
+        }
+    }
+    if provider.base_url.contains("opencode.ai") && provider.base_url.contains("/zen/go") {
+        let ua = HeaderName::from_static("user-agent");
+        let session = HeaderName::from_static("x-opencode-session");
+        if headers.get(&session).is_none() {
+            let id = format!(
+                "{:x}",
+                sha2::Digest::digest(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+                    .to_le_bytes())
+            );
+            if let Ok(value) = HeaderValue::from_str(&id) {
+                headers.insert(session, value);
+            }
+        }
+        if headers.get(&ua).is_none() {
+            if let Ok(value) = HeaderValue::from_str(OPENCODE_GO_USER_AGENT) {
+                headers.insert(ua, value);
+            }
         }
     }
     Ok(headers)

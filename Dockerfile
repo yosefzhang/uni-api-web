@@ -18,6 +18,7 @@ RUN cargo chef cook --release --locked --recipe-path recipe.json
 FROM native-dependencies AS native-builder
 WORKDIR /workspace
 COPY README.md pyproject.toml ./
+COPY webui/package.json ./webui/package.json
 COPY uni_api/api/codex_models_pro_0_153_2.json ./uni_api/api/codex_models_pro_0_153_2.json
 COPY static ./static
 WORKDIR /workspace/rust/uni-api-native

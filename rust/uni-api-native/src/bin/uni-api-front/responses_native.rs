@@ -30,6 +30,9 @@ const DEFAULT_MAX_PRECOMMIT_BYTES: usize = 8 * 1024 * 1024 + 128 * 266;
 pub(crate) const CODEX_USER_AGENT: &str =
     "codex_cli_rs/0.153.2 (Debian 13.0.0; x86_64) WindowsTerminal";
 
+pub(crate) const OPENCODE_GO_USER_AGENT: &str =
+    concat!("uni-api-web/", env!("UNI_API_WEB_VERSION", "0.0.0"));
+
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static SCHEDULING_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -2905,6 +2908,7 @@ fn build_headers(
     {
         headers.insert("X-OAIX-Routing-Attempt-ID".into(), attempt_id.to_owned());
     }
+    ensure_opencode_go_headers(&mut headers, provider);
     for (name, value) in &headers {
         HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| format!("provider {} produced invalid header {name}", provider.name))?;
@@ -2912,6 +2916,37 @@ fn build_headers(
             .map_err(|_| format!("provider {} produced invalid header value", provider.name))?;
     }
     Ok(headers)
+}
+
+fn is_opencode_go_provider(provider: &Provider) -> bool {
+    provider.base_url.contains("opencode.ai") && provider.base_url.contains("/zen/go")
+}
+
+fn ensure_opencode_go_headers(headers: &mut HashMap<String, String>, provider: &Provider) {
+    if !is_opencode_go_provider(provider) {
+        return;
+    }
+    let has_session = headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("x-opencode-session"));
+    if !has_session {
+        headers.insert(
+            "x-opencode-session".into(),
+            format!("{:x}", Sha256::digest(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+                    .to_le_bytes()
+            )),
+        );
+    }
+    let has_ua = headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("user-agent"));
+    if !has_ua {
+        headers.insert("User-Agent".into(), OPENCODE_GO_USER_AGENT.into());
+    }
 }
 
 fn header_or(headers: &HeaderMap, name: &str, default: &str) -> String {
