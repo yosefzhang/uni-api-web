@@ -3438,11 +3438,13 @@ fn provider_headers(
         if headers.get(&session).is_none() {
             let id = format!(
                 "{:x}",
-                sha2::Digest::digest(std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-                    .to_le_bytes())
+                Sha256::digest(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .to_le_bytes()
+                )
             );
             if let Ok(value) = HeaderValue::from_str(&id) {
                 headers.insert(session, value);
