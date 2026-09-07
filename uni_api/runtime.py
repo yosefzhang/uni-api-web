@@ -6107,11 +6107,11 @@ def _responses_part_has_text(part: Any) -> bool:
         return False
 
     text = part.get("text")
-    if isinstance(text, str) and text:
+    if isinstance(text, str) and text.strip():
         return True
 
     refusal = part.get("refusal")
-    return isinstance(refusal, str) and bool(refusal)
+    return isinstance(refusal, str) and bool(refusal.strip())
 
 def _responses_item_has_substantive_output(item: Any) -> bool:
     if not isinstance(item, dict):
@@ -6123,7 +6123,10 @@ def _responses_item_has_substantive_output(item: Any) -> bool:
 
     item_type = str(item.get("type") or "")
     if item_type in {"function_call", "tool_call"}:
-        return bool(item.get("name") or item.get("arguments") or item.get("call_id"))
+        return any(
+            isinstance(item.get(field), str) and bool(item[field].strip())
+            for field in ("name", "arguments", "call_id")
+        )
 
     return False
 
@@ -6132,7 +6135,8 @@ def _responses_stream_event_has_real_output(event_type: str, payload: Any) -> bo
         return False
 
     if event_type.startswith("response.") and event_type.endswith(".delta"):
-        return bool(str(payload.get("delta") or ""))
+        delta = payload.get("delta")
+        return isinstance(delta, str) and bool(delta.strip())
 
     if event_type in {"response.content_part.added", "response.content_part.done"}:
         return _responses_part_has_text(payload.get("part"))
@@ -6141,7 +6145,10 @@ def _responses_stream_event_has_real_output(event_type: str, payload: Any) -> bo
         return _responses_item_has_substantive_output(payload.get("item"))
 
     if event_type.startswith("response.") and event_type.endswith(".done"):
-        return bool(str(payload.get("text") or payload.get("refusal") or payload.get("arguments") or ""))
+        return any(
+            isinstance(payload.get(field), str) and bool(payload[field].strip())
+            for field in ("text", "refusal", "arguments")
+        )
 
     return False
 

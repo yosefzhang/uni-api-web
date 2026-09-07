@@ -10,11 +10,13 @@ from core.utils import get_model_dict
 
 
 MODEL_INFO_CREATED = 1720524448858
-CODEX_PRO_MODELS_SNAPSHOT_CLIENT_VERSION = "0.144.0"
-CODEX_PRO_MODELS_SNAPSHOT_UPSTREAM_ETAG = 'W/"eaaa93847c22739b392a6260ccd9af1c"'
+CODEX_PRO_MODELS_SNAPSHOT_CLIENT_VERSION = "0.153.2"
+CODEX_PRO_MODELS_SNAPSHOT_UPSTREAM_ETAG = 'W/"568f1e5faa711c9a79e1426428e2ea34"'
+GPT6_ASTRA_CONTEXT_WINDOW = 600000
+GPT6_ASTRA_MAX_CONTEXT_WINDOW = 872000
 
 _CODEX_PRO_MODELS_SNAPSHOT = json.loads(
-    Path(__file__).with_name("codex_models_pro_0_144_0.json").read_text(encoding="utf-8")
+    Path(__file__).with_name("codex_models_pro_0_153_2.json").read_text(encoding="utf-8")
 )
 _CODEX_PRO_MODELS_BY_SLUG = {
     str(model["slug"]).strip(): model
@@ -217,6 +219,14 @@ def list_models_payload(
     models = model_response_cache.get(api_key)
     if models is None:
         models = build_models(api_index, config, api_list, models_list)
+    # Keep the regular OpenAI-compatible response useful for Codex callers too.
+    # Codex normally requests the richer snapshot with client_version, but the
+    # model metadata must remain consistent when that query parameter is absent.
+    models = copy.deepcopy(models)
+    for model in models:
+        if model.get("id") == "gpt-6-astra":
+            model["context_window"] = GPT6_ASTRA_CONTEXT_WINDOW
+            model["max_context_window"] = GPT6_ASTRA_MAX_CONTEXT_WINDOW
     return {"object": "list", "data": models}
 
 
@@ -229,32 +239,7 @@ def codex_models_payload(
     models_list: dict[str, list[str]],
     build_models: Callable[[int, dict, list[str], dict[str, list[str]]], list[dict]],
 ) -> dict[str, Any]:
-    available = list_models_payload(
-        api_index=api_index,
-        api_list=api_list,
-        model_response_cache=model_response_cache,
-        config=config,
-        models_list=models_list,
-        build_models=build_models,
-    )
-    available_model_ids = [
-        str(model.get("id", "")).strip()
-        for model in available["data"]
-        if isinstance(model, dict) and str(model.get("id", "")).strip()
-    ]
-    allowed_model_ids = set(available_model_ids)
-    models = [
-        model
-        for model in _CODEX_PRO_MODELS_SNAPSHOT["models"]
-        if model.get("slug") in allowed_model_ids
-    ]
-    included_model_ids = {str(model.get("slug", "")).strip() for model in models}
-    for model_id in available_model_ids:
-        if model_id in included_model_ids or not _is_codex_catalog_model_id(model_id):
-            continue
-        models.append(_codex_compatible_model(model_id, 100 + len(models)))
-        included_model_ids.add(model_id)
-    return {"models": models}
+    return copy.deepcopy(_CODEX_PRO_MODELS_SNAPSHOT)
 
 
 def _is_codex_catalog_model_id(model_id: str) -> bool:
@@ -281,6 +266,7 @@ def _codex_fallback_model(model_id: str, priority: int) -> dict[str, Any]:
     supports_reasoning = (
         "codex" in lower
         or lower.startswith("gpt-5")
+        or lower.startswith("gpt-6")
         or lower.startswith("o1")
         or lower.startswith("o3")
         or lower.startswith("o4")

@@ -23,10 +23,135 @@ IMAGE_FETCH_TIMEOUT_SECONDS = 30.0
 _MAX_DATA_URL_HEADER_BYTES = 128
 _FETCH_MEMORY_MULTIPLIER = 8
 _SUPPORTED_IMAGE_MEDIA_TYPES = {
+    "image/gif",
     "image/jpeg",
     "image/png",
     "image/webp",
 }
+
+
+class _InvalidGifError(ValueError):
+    pass
+
+
+class _AnimatedGifError(ValueError):
+    pass
+
+
+class _GifFrameInspector:
+    """Incrementally validate a GIF container and count rendered frames."""
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+        self._offset = 0
+        self._state = "header"
+        self._skip_bytes = 0
+        self._frames = 0
+        self._finished = False
+
+    def feed(self, chunk: bytes) -> None:
+        if self._finished or self._frames > 1:
+            return
+        self._buffer.extend(chunk)
+        self._parse_available()
+        if self._offset:
+            del self._buffer[: self._offset]
+            self._offset = 0
+
+    def finish(self) -> None:
+        self._parse_available()
+        if self._frames > 1:
+            raise _AnimatedGifError("animated GIF image input is not supported")
+        if not self._finished or self._frames != 1:
+            raise _InvalidGifError("invalid GIF image input")
+
+    def _parse_available(self) -> None:
+        while not self._finished and self._frames <= 1:
+            available = len(self._buffer) - self._offset
+            if self._state == "header":
+                if available < 13:
+                    return
+                header = bytes(self._buffer[self._offset : self._offset + 6])
+                if header not in {b"GIF87a", b"GIF89a"}:
+                    raise _InvalidGifError("invalid GIF image input")
+                packed = self._buffer[self._offset + 10]
+                self._offset += 13
+                if packed & 0x80:
+                    self._skip_bytes = 3 * (1 << ((packed & 0x07) + 1))
+                    self._state = "fixed"
+                else:
+                    self._state = "block"
+                continue
+
+            if self._state == "fixed":
+                if available < self._skip_bytes:
+                    return
+                self._offset += self._skip_bytes
+                self._skip_bytes = 0
+                self._state = "block"
+                continue
+
+            if self._state == "block":
+                if available < 1:
+                    return
+                introducer = self._buffer[self._offset]
+                if introducer == 0x3B:
+                    self._offset += 1
+                    self._finished = True
+                    continue
+                if introducer == 0x21:
+                    if available < 2:
+                        return
+                    self._offset += 2
+                    self._state = "extension_subblocks"
+                    continue
+                if introducer != 0x2C:
+                    raise _InvalidGifError("invalid GIF image input")
+                if available < 10:
+                    return
+                packed = self._buffer[self._offset + 9]
+                self._offset += 10
+                if packed & 0x80:
+                    self._skip_bytes = 3 * (1 << ((packed & 0x07) + 1))
+                    self._state = "image_color_table"
+                else:
+                    self._state = "image_lzw_code_size"
+                continue
+
+            if self._state == "image_color_table":
+                if available < self._skip_bytes:
+                    return
+                self._offset += self._skip_bytes
+                self._skip_bytes = 0
+                self._state = "image_lzw_code_size"
+                continue
+
+            if self._state == "image_lzw_code_size":
+                if available < 1:
+                    return
+                code_size = self._buffer[self._offset]
+                if code_size < 2 or code_size > 12:
+                    raise _InvalidGifError("invalid GIF image input")
+                self._offset += 1
+                self._state = "image_subblocks"
+                continue
+
+            if self._state in {"extension_subblocks", "image_subblocks"}:
+                if available < 1:
+                    return
+                block_size = self._buffer[self._offset]
+                if block_size == 0:
+                    self._offset += 1
+                    if self._state == "image_subblocks":
+                        self._frames += 1
+                    self._state = "block"
+                    continue
+                if available < block_size + 1:
+                    return
+                self._offset += block_size + 1
+                continue
+
+            raise _InvalidGifError("invalid GIF image input")
 
 
 def _detect_image_media_type(prefix: bytes) -> str | None:
@@ -40,7 +165,24 @@ def _detect_image_media_type(prefix: bytes) -> str | None:
         and prefix[8:12] == b"WEBP"
     ):
         return "image/webp"
+    if prefix.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
     return None
+
+
+def _validate_single_frame_gif(content: bytes) -> None:
+    inspector = _GifFrameInspector()
+    inspector.feed(content)
+    inspector.finish()
+
+
+def _raise_gif_http_error(exc: ValueError) -> None:
+    if isinstance(exc, _AnimatedGifError):
+        raise HTTPException(
+            status_code=415,
+            detail="Animated GIF image input is not supported",
+        ) from exc
+    raise HTTPException(status_code=400, detail="Invalid GIF image input") from exc
 
 
 def _data_url_metadata(value: str) -> tuple[str, int, int]:
@@ -78,6 +220,7 @@ async def _extract_and_validate_image_base64_payload(
 ) -> tuple[str, str]:
     """Incrementally validate/hash a data URL with bounded GIL hold times."""
 
+    gif_inspector = _GifFrameInspector() if media_type == "image/gif" else None
     try:
         inspection = await inspect_base64_chunks(
             data_url,
@@ -86,9 +229,21 @@ async def _extract_and_validate_image_base64_payload(
             max_decoded_bytes=None,
             prefix_bytes=16,
             collect_encoded_payload=collect_encoded_payload,
+            decoded_chunk_observer=(
+                gif_inspector.feed if gif_inspector is not None else None
+            ),
         )
     except ChunkedBase64Error as exc:
         raise HTTPException(status_code=400, detail="Invalid image base64") from exc
+    except (_InvalidGifError, _AnimatedGifError) as exc:
+        _raise_gif_http_error(exc)
+        raise AssertionError("unreachable")
+    if gif_inspector is not None:
+        try:
+            gif_inspector.finish()
+        except (_InvalidGifError, _AnimatedGifError) as exc:
+            _raise_gif_http_error(exc)
+            raise AssertionError("unreachable")
     detected = _detect_image_media_type(inspection.prefix)
     if detected is None or detected != media_type:
         raise HTTPException(
@@ -147,6 +302,12 @@ async def _fetch_image_data_url(
     media_type = _detect_image_media_type(body[:16])
     if media_type is None:
         raise HTTPException(status_code=415, detail="Unsupported image media type")
+    if media_type == "image/gif":
+        try:
+            _validate_single_frame_gif(body)
+        except (_InvalidGifError, _AnimatedGifError) as exc:
+            _raise_gif_http_error(exc)
+            raise AssertionError("unreachable")
     data_url = await encode_bytes_base64_chunks(
         body,
         prefix=f"data:{media_type};base64,",

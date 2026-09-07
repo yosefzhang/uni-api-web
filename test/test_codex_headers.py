@@ -29,7 +29,7 @@ def test_codex_payload_uses_current_cli_version_headers():
 
     assert headers["Authorization"] == "Bearer access-token"
     assert "Version" not in headers
-    assert headers["User-Agent"] == "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+    assert headers["User-Agent"] == "codex_cli_rs/0.153.2 (Debian 13.0.0; x86_64) WindowsTerminal"
 
 
 def test_force_codex_client_headers_removes_stale_case_variants():
@@ -43,7 +43,7 @@ def test_force_codex_client_headers_removes_stale_case_variants():
 
     assert headers == {
         "X-Test": "kept",
-        "User-Agent": "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+        "User-Agent": "codex_cli_rs/0.153.2 (Debian 13.0.0; x86_64) WindowsTerminal",
     }
 
 

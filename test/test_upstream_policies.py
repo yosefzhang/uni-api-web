@@ -481,6 +481,36 @@ def test_responses_semantic_error_bounds_attacker_sized_message():
     assert error.passthrough_error_body is None
 
 
+def test_responses_upstream_unavailable_maps_to_retryable_503():
+    classifier = ProviderErrorClassifier(_safe_get)
+    retry_policy = RetryPolicy(classifier, _get_engine)
+    error = responses_failure_error(
+        {
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "code": "upstream_unavailable",
+                    "message": "Service temporarily unavailable. Please try again later.",
+                },
+            },
+        },
+        event_type="response.failed",
+    )
+
+    assert error is not None
+    status_code, detail = classifier.normalize_exception(error)
+    assert status_code == 503
+    assert retry_policy.should_retry(
+        True,
+        status_code,
+        {"base_url": "https://example.com/v1/responses", "engine": "codex"},
+        error_message=detail,
+        endpoint="/v1/responses",
+        original_model="gpt-5.6-sol",
+    ) is True
+
+
 def test_response_failed_has_detached_bounded_responses_terminal():
     error = responses_failure_error(
         {

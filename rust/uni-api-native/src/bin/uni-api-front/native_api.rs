@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -233,58 +233,26 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
     };
     if query_value(uri, "client_version").is_some() {
         let catalog: Value = serde_json::from_str(include_str!(
-            "../../../../../uni_api/api/codex_models_pro_0_144_0.json"
+            "../../../../../uni_api/api/codex_models_pro_0_153_2.json"
         ))
         .unwrap_or_else(|_| json!({"models":[]}));
-        let allowed = models.iter().map(String::as_str).collect::<HashSet<_>>();
-        let catalog_models = catalog
-            .get("models")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let by_slug = catalog_models
-            .iter()
-            .filter_map(|model| {
-                Some((
-                    model.get("slug")?.as_str()?.to_ascii_lowercase(),
-                    model.clone(),
-                ))
-            })
-            .collect::<HashMap<_, _>>();
-        let mut filtered = catalog_models
-            .into_iter()
-            .filter(|model| {
-                model
-                    .get("slug")
-                    .and_then(Value::as_str)
-                    .is_some_and(|slug| allowed.contains(slug))
-            })
-            .collect::<Vec<_>>();
-        let mut included = filtered
-            .iter()
-            .filter_map(|model| model.get("slug").and_then(Value::as_str))
-            .map(str::to_owned)
-            .collect::<HashSet<_>>();
-        for model in &models {
-            if included.contains(model) || !is_codex_catalog_model(model) {
-                continue;
-            }
-            filtered.push(codex_compatible_model(
-                model,
-                100 + filtered.len(),
-                &by_slug,
-            ));
-            included.insert(model.clone());
-        }
-        let mut response = json_response(StatusCode::OK, json!({"models":filtered}));
+        let mut response = json_response(StatusCode::OK, catalog);
         response.headers_mut().insert(
             "x-uni-api-models-source",
             HeaderValue::from_static("codex-pro-snapshot"),
         );
+        response.headers_mut().insert(
+            "x-uni-api-models-snapshot-client-version",
+            HeaderValue::from_static("0.153.2"),
+        );
+        response.headers_mut().insert(
+            "x-uni-api-models-upstream-etag",
+            HeaderValue::from_static("W/\"568f1e5faa711c9a79e1426428e2ea34\""),
+        );
         return response;
     }
     let caps_map = model_caps_map();
-    let data: Vec<Value> = models
+    let mut data: Vec<Value> = models
         .into_iter()
         .map(|model| {
             let caps = model_caps_for_in(&caps_map, &model);
@@ -299,6 +267,14 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
             })
         })
         .collect();
+    // Keep the regular OpenAI-compatible response consistent for Codex callers:
+    // gpt-6-astra metadata must match even when the client_version snapshot is absent.
+    for item in &mut data {
+        if item.get("id").and_then(Value::as_str) == Some("gpt-6-astra") {
+            item["context_window"] = json!(600000);
+            item["max_context_window"] = json!(872000);
+        }
+    }
     json_response(
         StatusCode::OK,
         json!({
@@ -306,89 +282,6 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
             "data": data,
         }),
     )
-}
-
-fn is_codex_catalog_model(model: &str) -> bool {
-    let lower = model.trim().to_ascii_lowercase();
-    !lower.is_empty()
-        && ![
-            "audio",
-            "dall-e",
-            "embedding",
-            "image",
-            "moderation",
-            "rerank",
-            "seedance",
-            "sora",
-            "speech",
-            "tts",
-            "video",
-            "whisper",
-        ]
-        .into_iter()
-        .any(|token| lower.contains(token))
-}
-
-fn codex_compatible_model(model: &str, priority: usize, catalog: &HashMap<String, Value>) -> Value {
-    let lower = model.to_ascii_lowercase();
-    if let Some(mut template) = catalog
-        .iter()
-        .filter(|(family, _)| lower == **family || lower.starts_with(&format!("{family}-")))
-        .max_by_key(|(family, _)| family.len())
-        .map(|(_, value)| value.clone())
-    {
-        template["slug"] = Value::String(model.to_owned());
-        template["display_name"] = Value::String(model.to_owned());
-        template["description"] = Value::String("Available through uni-api.".into());
-        template["priority"] = json!(priority);
-        return template;
-    }
-    let supports_reasoning = lower.contains("codex")
-        || ["gpt-5", "o1", "o3", "o4"]
-            .into_iter()
-            .any(|prefix| lower.starts_with(prefix));
-    let supports_images = !lower.contains("deepseek");
-    let mut fallback = json!({
-        "slug":model,
-        "display_name":model,
-        "description":"Available through uni-api.",
-        "supported_reasoning_levels":if supports_reasoning { json!([
-            {"effort":"low","description":"Fast responses with lighter reasoning"},
-            {"effort":"medium","description":"Balances speed and reasoning depth for everyday tasks"},
-            {"effort":"high","description":"Greater reasoning depth for complex problems"},
-            {"effort":"xhigh","description":"Extra high reasoning depth for complex problems"}
-        ]) } else { json!([]) },
-        "shell_type":"shell_command",
-        "visibility":"list",
-        "supported_in_api":true,
-        "priority":priority,
-        "additional_speed_tiers":["fast"],
-        "service_tiers":[{"id":"priority","name":"Fast","description":"1.5x speed, increased usage"}],
-        "availability_nux":Value::Null,
-        "upgrade":Value::Null,
-        "base_instructions":"You are Codex, a coding agent. Read the codebase before making focused changes, preserve unrelated work, validate the result, and communicate concise progress.",
-        "supports_reasoning_summaries":supports_reasoning,
-        "default_reasoning_summary":"auto",
-        "support_verbosity":false,
-        "default_verbosity":Value::Null,
-        "apply_patch_tool_type":"freeform",
-        "web_search_tool_type":"text",
-        "truncation_policy":{"mode":"tokens","limit":10000},
-        "supports_parallel_tool_calls":true,
-        "supports_image_detail_original":supports_images,
-        "context_window":272000,
-        "max_context_window":272000,
-        "auto_compact_token_limit":Value::Null,
-        "effective_context_window_percent":95,
-        "experimental_supported_tools":[],
-        "input_modalities":if supports_images { json!(["text","image"]) } else { json!(["text"]) },
-        "supports_search_tool":false,
-        "use_responses_lite":false,
-    });
-    if supports_reasoning {
-        fallback["default_reasoning_level"] = Value::String("medium".into());
-    }
-    fallback
 }
 
 async fn stats_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Response<Body> {
@@ -679,15 +572,5 @@ mod tests {
     fn parses_unix_and_iso_time_ranges() {
         assert_eq!(parse_datetime("1700000000"), Some(1_700_000_000));
         assert_eq!(parse_datetime("1970-01-01T00:00:00Z"), Some(0));
-    }
-
-    #[test]
-    fn codex_catalog_generates_safe_fallback_models() {
-        let fallback = codex_compatible_model("gpt-5-custom", 101, &HashMap::new());
-        assert_eq!(fallback["slug"], "gpt-5-custom");
-        assert_eq!(fallback["default_reasoning_level"], "medium");
-        assert_eq!(fallback["input_modalities"], json!(["text", "image"]));
-        assert!(is_codex_catalog_model("deepseek-chat"));
-        assert!(!is_codex_catalog_model("text-embedding-3-large"));
     }
 }

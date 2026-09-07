@@ -28,7 +28,7 @@ const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
 const DEFAULT_MAX_PRECOMMIT_ITEMS: usize = 128;
 const DEFAULT_MAX_PRECOMMIT_BYTES: usize = 8 * 1024 * 1024 + 128 * 266;
 pub(crate) const CODEX_USER_AGENT: &str =
-    "codex_cli_rs/0.144.0 (Debian 13.0.0; x86_64) WindowsTerminal";
+    "codex_cli_rs/0.153.2 (Debian 13.0.0; x86_64) WindowsTerminal";
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static SCHEDULING_NONCE: AtomicU64 = AtomicU64::new(1);

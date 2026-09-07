@@ -33,6 +33,7 @@ RESPONSES_FAILURE_STATUS_BY_CODE = {
     "permission_denied": 403,
     "rate_limit_exceeded": 429,
     "unsupported_parameter": 400,
+    "upstream_unavailable": 503,
     "user_deactivated": 403,
     "user_suspended": 403,
 }
@@ -44,6 +45,7 @@ RESPONSES_FAILURE_STATUS_BY_TYPE = {
     "permission_error": 403,
     "rate_limit_error": 429,
     "tokens": 429,
+    "upstream_unavailable": 503,
 }
 
 _FAILURE_EVENT_TYPES = frozenset({"error", "response.failed"})

@@ -3129,8 +3129,40 @@ def test_retry_success_does_not_leak_previous_response_failed_terminal(
             "https://provider-a.example/v1/responses": DummyStreamingUpstreamResponse(
                 chunks=[
                     _responses_sse(
-                        "keepalive",
-                        {"type": "keepalive", "sequence_number": 0},
+                        "response.created",
+                        {
+                            "type": "response.created",
+                            "response": {"status": "in_progress"},
+                        },
+                    ),
+                    _responses_sse(
+                        "response.in_progress",
+                        {
+                            "type": "response.in_progress",
+                            "response": {"status": "in_progress"},
+                        },
+                    ),
+                    _responses_sse(
+                        "response.output_item.added",
+                        {
+                            "type": "response.output_item.added",
+                            "item": {
+                                "type": "message",
+                                "content": [],
+                                "status": "in_progress",
+                            },
+                        },
+                    ),
+                    _responses_sse(
+                        "response.content_part.added",
+                        {
+                            "type": "response.content_part.added",
+                            "part": {"type": "output_text", "text": ""},
+                        },
+                    ),
+                    _responses_sse(
+                        "response.output_text.delta",
+                        {"type": "response.output_text.delta", "delta": " "},
                     ),
                     _responses_sse(
                         "response.failed",

@@ -127,6 +127,7 @@ pub async fn translate_responses_to_chat(
     };
     let idle = positive_duration(idle_timeout_seconds);
     let mut buffer = Vec::new();
+    let mut retained = Vec::new();
 
     loop {
         while let Some((end, separator)) = next_event_boundary(&buffer) {
@@ -134,8 +135,19 @@ pub async fn translate_responses_to_chat(
             buffer.drain(..separator);
             match classify_responses_precommit_event(&event)? {
                 PrecommitDecision::Ignore => {}
+                PrecommitDecision::Retain => {
+                    retained.extend_from_slice(&event);
+                    retained.extend_from_slice(b"\n\n");
+                    if retained.len() > MAX_STREAM_FRAME_BYTES {
+                        return Err(PrecommitFailure {
+                            status_code: 502,
+                            detail: "upstream Responses precommit output exceeded 1 MiB".into(),
+                        });
+                    }
+                }
                 PrecommitDecision::Commit => {
-                    let mut primed = event;
+                    let mut primed = retained;
+                    primed.extend_from_slice(&event);
                     primed.extend_from_slice(b"\n\n");
                     primed.extend_from_slice(&buffer);
                     let upstream = stream::iter([Ok(Bytes::from(primed))])
@@ -180,7 +192,8 @@ pub async fn translate_responses_to_chat(
                 if !buffer.iter().all(u8::is_ascii_whitespace) {
                     match classify_responses_precommit_event(&buffer)? {
                         PrecommitDecision::Commit => {
-                            let upstream = stream::iter([Ok(Bytes::from(buffer))]).boxed();
+                            retained.extend_from_slice(&buffer);
+                            let upstream = stream::iter([Ok(Bytes::from(retained))]).boxed();
                             return Ok(spawn_translation(
                                 status,
                                 content_type,
@@ -194,7 +207,7 @@ pub async fn translate_responses_to_chat(
                                 emit_precommit_comment,
                             ));
                         }
-                        PrecommitDecision::Ignore => {}
+                        PrecommitDecision::Ignore | PrecommitDecision::Retain => {}
                     }
                 }
                 return Err(PrecommitFailure {
@@ -449,6 +462,7 @@ fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrecommitDecision {
     Ignore,
+    Retain,
     Commit,
 }
 
@@ -550,8 +564,7 @@ fn classify_responses_precommit_event(event: &[u8]) -> Result<PrecommitDecision,
             status_code: 502,
             detail: "upstream Responses request ended incomplete before commit".into(),
         }),
-        _ if responses_event_has_real_output(event_type, &payload) => Ok(PrecommitDecision::Commit),
-        _ => Ok(PrecommitDecision::Ignore),
+        _ => Ok(responses_event_precommit_decision(event_type, &payload)),
     }
 }
 
@@ -583,6 +596,18 @@ fn validate_responses_terminal(event_type: &str, payload: &Value) -> Result<(), 
 }
 
 fn responses_event_has_real_output(event_type: &str, payload: &Value) -> bool {
+    responses_event_has_output(event_type, payload, |value| !value.trim().is_empty())
+}
+
+fn responses_event_has_nonempty_output(event_type: &str, payload: &Value) -> bool {
+    responses_event_has_output(event_type, payload, |value| !value.is_empty())
+}
+
+fn responses_event_has_output(
+    event_type: &str,
+    payload: &Value,
+    has_text: fn(&str) -> bool,
+) -> bool {
     match event_type {
         "response.output_text.delta"
         | "response.reasoning_summary_text.delta"
@@ -590,7 +615,7 @@ fn responses_event_has_real_output(event_type: &str, payload: &Value) -> bool {
         | "response.function_call_arguments.delta" => payload
             .get("delta")
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty()),
+            .is_some_and(has_text),
         "response.output_item.added" => payload
             .get("item")
             .filter(|item| {
@@ -603,44 +628,50 @@ fn responses_event_has_real_output(event_type: &str, payload: &Value) -> bool {
                 ["name", "arguments", "call_id"].iter().any(|field| {
                     item.get(*field)
                         .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty())
+                        .is_some_and(has_text)
                 })
             }),
-        "response.output_item.done" => payload.get("item").is_some_and(item_has_real_output),
-        "response.content_part.added" | "response.content_part.done" => {
-            payload.get("part").is_some_and(|part| {
-                ["text", "refusal"].iter().any(|field| {
-                    part.get(*field)
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty())
-                })
-            })
-        }
+        "response.output_item.done" => payload
+            .get("item")
+            .is_some_and(|item| item_has_output(item, has_text)),
+        "response.content_part.added" | "response.content_part.done" => payload
+            .get("part")
+            .is_some_and(|part| part_has_output(part, has_text)),
         event_type if event_type.starts_with("response.") && event_type.ends_with(".done") => {
             ["text", "refusal", "arguments"].iter().any(|field| {
                 payload
                     .get(*field)
                     .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
+                    .is_some_and(has_text)
             })
         }
         _ => false,
     }
 }
 
-fn item_has_real_output(item: &Value) -> bool {
+fn responses_event_precommit_decision(event_type: &str, payload: &Value) -> PrecommitDecision {
+    if responses_event_has_real_output(event_type, payload) {
+        PrecommitDecision::Commit
+    } else if responses_event_has_nonempty_output(event_type, payload) {
+        PrecommitDecision::Retain
+    } else {
+        PrecommitDecision::Ignore
+    }
+}
+
+fn part_has_output(part: &Value, has_text: fn(&str) -> bool) -> bool {
+    ["text", "refusal"].iter().any(|field| {
+        part.get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(has_text)
+    })
+}
+
+fn item_has_output(item: &Value, has_text: fn(&str) -> bool) -> bool {
     if item
         .get("content")
         .and_then(Value::as_array)
-        .is_some_and(|parts| {
-            parts.iter().any(|part| {
-                ["text", "refusal"].iter().any(|field| {
-                    part.get(*field)
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty())
-                })
-            })
-        })
+        .is_some_and(|parts| parts.iter().any(|part| part_has_output(part, has_text)))
     {
         return true;
     }
@@ -650,7 +681,7 @@ fn item_has_real_output(item: &Value) -> bool {
     ) && ["name", "arguments", "call_id"].iter().any(|field| {
         item.get(*field)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty())
+            .is_some_and(has_text)
     })
 }
 
@@ -735,7 +766,7 @@ async fn drain_aws_frames(
         let event_type = payload.get("type").and_then(Value::as_str);
         let chunks = match event_type {
             Some("message_delta") => {
-                state.completion_tokens = number(payload.pointer("/usage/output_tokens"));
+                state.update_claude_usage(payload.get("usage"));
                 Vec::new()
             }
             Some("message_stop") => Vec::new(),
@@ -747,6 +778,11 @@ async fn drain_aws_frames(
         if let Some(metrics) = payload.get("amazon-bedrock-invocationMetrics") {
             state.prompt_tokens = number(metrics.get("inputTokenCount"));
             state.completion_tokens = number(metrics.get("outputTokenCount"));
+            state.chat_usage = Some(json!({
+                "prompt_tokens":state.prompt_tokens,
+                "completion_tokens":state.completion_tokens,
+                "total_tokens":state.prompt_tokens.saturating_add(state.completion_tokens),
+            }));
             for chunk in state.finish_chunks_for_output("stop") {
                 send_wire(tx, &chunk, state.output_protocol).await?;
             }
@@ -842,9 +878,10 @@ impl StreamState {
         if let Some(id) = value.get("id").and_then(Value::as_str) {
             self.id = id.to_owned();
         }
-        if let Some(usage) = value.get("usage") {
+        if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
             self.prompt_tokens = number(usage.get("prompt_tokens"));
             self.completion_tokens = number(usage.get("completion_tokens"));
+            self.chat_usage = Some(usage.clone());
         }
         if value
             .pointer("/choices/0/finish_reason")
@@ -908,10 +945,15 @@ impl StreamState {
                 )]
             }
             "response.completed" if responses_completed_is_valid(value) => {
-                let usage = responses_usage_to_chat(value.pointer("/response/usage"));
-                self.prompt_tokens = number(usage.get("prompt_tokens"));
-                self.completion_tokens = number(usage.get("completion_tokens"));
-                self.chat_usage = Some(usage);
+                if let Some(source_usage) = value
+                    .pointer("/response/usage")
+                    .filter(|usage| usage.is_object())
+                {
+                    let usage = responses_usage_to_chat(Some(source_usage));
+                    self.prompt_tokens = number(usage.get("prompt_tokens"));
+                    self.completion_tokens = number(usage.get("completion_tokens"));
+                    self.chat_usage = Some(usage);
+                }
                 self.finish_chunks(if self.tools.is_empty() {
                     "stop"
                 } else {
@@ -998,6 +1040,7 @@ impl StreamState {
             self.prompt_tokens = number(usage.get("promptTokenCount"));
             self.completion_tokens =
                 number(usage.get("candidatesTokenCount")) + number(usage.get("thoughtsTokenCount"));
+            self.chat_usage = Some(gemini_usage_to_chat(usage));
         }
         if value
             .pointer("/candidates/0/finishReason")
@@ -1024,7 +1067,7 @@ impl StreamState {
                 if let Some(id) = value.pointer("/message/id").and_then(Value::as_str) {
                     self.id = id.to_owned();
                 }
-                self.prompt_tokens = number(value.pointer("/message/usage/input_tokens"));
+                self.update_claude_usage(value.pointer("/message/usage"));
                 vec![self.chunk(json!({"role":"assistant"}), None, None)]
             }
             "content_block_start" => {
@@ -1077,7 +1120,7 @@ impl StreamState {
                 _ => Vec::new(),
             },
             "message_delta" => {
-                self.completion_tokens = number(value.pointer("/usage/output_tokens"));
+                self.update_claude_usage(value.get("usage"));
                 value
                     .pointer("/delta/stop_reason")
                     .and_then(Value::as_str)
@@ -1128,6 +1171,11 @@ impl StreamState {
         if value.get("is_finished").and_then(Value::as_bool) == Some(true) {
             self.prompt_tokens = number(value.pointer("/meta/billed_units/input_tokens"));
             self.completion_tokens = number(value.pointer("/meta/billed_units/output_tokens"));
+            self.chat_usage = Some(json!({
+                "prompt_tokens":self.prompt_tokens,
+                "completion_tokens":self.completion_tokens,
+                "total_tokens":self.prompt_tokens.saturating_add(self.completion_tokens),
+            }));
             return self.finish_chunks("stop");
         }
         Vec::new()
@@ -1192,6 +1240,18 @@ impl StreamState {
         index
     }
 
+    fn update_claude_usage(&mut self, usage: Option<&Value>) {
+        let Some(usage) = usage.filter(|usage| usage.is_object()) else {
+            return;
+        };
+        let mut merged = self.chat_usage.take().unwrap_or_else(|| json!({}));
+        merge_usage_objects(&mut merged, usage);
+        let mapped = claude_usage_to_chat(&merged);
+        self.prompt_tokens = number(mapped.get("prompt_tokens"));
+        self.completion_tokens = number(mapped.get("completion_tokens"));
+        self.chat_usage = Some(mapped);
+    }
+
     fn chunk(&self, delta: Value, finish_reason: Option<&str>, usage: Option<Value>) -> Value {
         let mut chunk = json!({
             "id":self.id,
@@ -1223,14 +1283,15 @@ impl StreamState {
             json!({
                 "prompt_tokens":self.prompt_tokens,
                 "completion_tokens":self.completion_tokens,
-                "total_tokens":self.prompt_tokens + self.completion_tokens,
+                "total_tokens":self.prompt_tokens.saturating_add(self.completion_tokens),
             })
         });
         if self.output_protocol == OutputProtocol::Responses {
             return vec![self.chunk(json!({}), Some(reason), Some(usage))];
         }
+        let emit_final_usage = self.include_usage || self.chat_usage.is_some();
         let mut chunks = vec![self.chunk(json!({}), Some(reason), None)];
-        if self.include_usage {
+        if emit_final_usage {
             chunks.push(json!({
                 "id":self.id,
                 "object":"chat.completion.chunk",
@@ -1252,7 +1313,10 @@ impl StreamState {
         (
             self.prompt_tokens,
             self.completion_tokens,
-            self.prompt_tokens + self.completion_tokens,
+            self.chat_usage
+                .as_ref()
+                .map(|usage| number(usage.get("total_tokens")))
+                .unwrap_or_else(|| self.prompt_tokens.saturating_add(self.completion_tokens)),
         )
     }
 
@@ -1679,7 +1743,7 @@ impl ResponsesOutputState {
             "usage":include_usage.then(|| json!({
                 "input_tokens":self.prompt_tokens,
                 "output_tokens":self.completion_tokens,
-                "total_tokens":self.prompt_tokens + self.completion_tokens,
+                "total_tokens":self.prompt_tokens.saturating_add(self.completion_tokens),
                 "input_tokens_details":{},
                 "output_tokens_details":{},
             })),
@@ -1742,11 +1806,122 @@ impl ResponsesOutputState {
 fn number(value: Option<&Value>) -> i64 {
     value
         .and_then(|value| {
-            value
-                .as_i64()
-                .or_else(|| value.as_u64().map(|value| value as i64))
+            value.as_i64().or_else(|| {
+                value
+                    .as_u64()
+                    .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+            })
         })
+        .filter(|value| *value >= 0)
         .unwrap_or(0)
+}
+
+fn merge_usage_objects(target: &mut Value, source: &Value) {
+    let Some(source) = source.as_object() else {
+        return;
+    };
+    let Some(target) = target.as_object_mut() else {
+        *target = Value::Object(source.clone());
+        return;
+    };
+    for (key, value) in source {
+        if value.is_object() && target.get(key).is_some_and(Value::is_object) {
+            merge_usage_objects(target.get_mut(key).expect("existing object"), value);
+        } else if value.is_number() && target.get(key).is_some_and(Value::is_number) {
+            let retained = number(target.get(key)).max(number(Some(value)));
+            target.insert(key.clone(), json!(retained));
+        } else {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn claude_usage_to_chat(usage: &Value) -> Value {
+    let mut mapped = usage.clone();
+    if !mapped.is_object() {
+        mapped = json!({});
+    }
+    let prompt_tokens = number(
+        usage
+            .get("input_tokens")
+            .or_else(|| usage.get("prompt_tokens")),
+    );
+    let completion_tokens = number(
+        usage
+            .get("output_tokens")
+            .or_else(|| usage.get("completion_tokens")),
+    );
+    let cache_creation_tokens = number(usage.get("cache_creation_input_tokens")).max(
+        number(usage.pointer("/cache_creation/ephemeral_5m_input_tokens")).saturating_add(number(
+            usage.pointer("/cache_creation/ephemeral_1h_input_tokens"),
+        )),
+    );
+    let cache_read_tokens = number(usage.get("cache_read_input_tokens"));
+    let total_tokens = prompt_tokens
+        .saturating_add(cache_creation_tokens)
+        .saturating_add(cache_read_tokens)
+        .saturating_add(completion_tokens);
+    let thinking_tokens = number(
+        usage
+            .pointer("/output_tokens_details/thinking_tokens")
+            .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
+            .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
+            .or_else(|| usage.get("reasoning_tokens")),
+    );
+
+    let root = mapped.as_object_mut().expect("Claude usage object");
+    root.insert("prompt_tokens".into(), json!(prompt_tokens));
+    root.insert("completion_tokens".into(), json!(completion_tokens));
+    root.insert("total_tokens".into(), json!(total_tokens));
+    if thinking_tokens > 0 {
+        root.insert("reasoning_tokens".into(), json!(thinking_tokens));
+    }
+
+    let mut prompt_details = root
+        .get("prompt_tokens_details")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    prompt_details.insert("cached_tokens".into(), json!(cache_read_tokens));
+    prompt_details.insert("cache_write_tokens".into(), json!(cache_creation_tokens));
+    root.insert(
+        "prompt_tokens_details".into(),
+        Value::Object(prompt_details),
+    );
+
+    let mut completion_details = root
+        .get("completion_tokens_details")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    completion_details.insert("reasoning_tokens".into(), json!(thinking_tokens));
+    root.insert(
+        "completion_tokens_details".into(),
+        Value::Object(completion_details),
+    );
+    mapped
+}
+
+fn gemini_usage_to_chat(usage: &Value) -> Value {
+    let prompt_tokens = number(usage.get("promptTokenCount"));
+    let reasoning_tokens = number(usage.get("thoughtsTokenCount"));
+    let completion_tokens =
+        number(usage.get("candidatesTokenCount")).saturating_add(reasoning_tokens);
+    let total_tokens = usage
+        .get("totalTokenCount")
+        .map(|value| number(Some(value)))
+        .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
+    json!({
+        "prompt_tokens":prompt_tokens,
+        "completion_tokens":completion_tokens,
+        "total_tokens":total_tokens,
+        "prompt_tokens_details":{
+            "cached_tokens":number(usage.get("cachedContentTokenCount")),
+        },
+        "completion_tokens_details":{
+            "reasoning_tokens":reasoning_tokens,
+        },
+    })
 }
 
 pub(crate) fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
@@ -1763,7 +1938,7 @@ pub(crate) fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
     let total_tokens = usage
         .and_then(|value| value.get("total_tokens"))
         .map(|value| number(Some(value)))
-        .unwrap_or(prompt_tokens + completion_tokens);
+        .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
     let prompt_details = usage.and_then(|value| {
         value
             .get("prompt_tokens_details")
@@ -1964,6 +2139,13 @@ mod tests {
         );
         assert_eq!(
             classify_responses_precommit_event(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" \\n\\t\"}"
+            )
+            .unwrap(),
+            PrecommitDecision::Retain
+        );
+        assert_eq!(
+            classify_responses_precommit_event(
                 b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"in_progress\"}}"
             )
             .unwrap_err()
@@ -2012,9 +2194,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_precommit_retains_whitespace_prefix_for_successful_output() {
+        let response = mock_sse_response(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n\
+             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" \"}\n\n\
+             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n\
+             event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        )
+        .await;
+        let translation = translate_responses_to_chat(
+            response,
+            OutputProtocol::Chat,
+            "public-model".into(),
+            false,
+            None,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(translation.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let wire = String::from_utf8(body.to_vec()).unwrap();
+
+        let whitespace = wire.find("\"content\":\" \"").unwrap();
+        let text = wire.find("\"content\":\"hello\"").unwrap();
+        assert!(whitespace < text);
+    }
+
+    #[tokio::test]
     async fn responses_precommit_returns_semantic_failure_before_response_commit() {
         let response = mock_sse_response(
             "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n\
+             event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"content\":[]}}\n\n\
+             event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n\
+             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" \"}\n\n\
              event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"Concurrency limit exceeded for account, please retry later\"}}}\n\n",
         )
         .await;
@@ -2076,7 +2292,7 @@ mod tests {
 
     #[test]
     fn gemini_stream_maps_text_tools_and_usage() {
-        let mut state = StreamState::new_with_options("gemini-public", OutputProtocol::Chat, true);
+        let mut state = StreamState::new_with_options("gemini-public", OutputProtocol::Chat, false);
         let chunks = state.gemini(&json!({
             "candidates":[{"content":{"parts":[
                 {"text":"hello"},
@@ -2115,6 +2331,72 @@ mod tests {
             delta[0].pointer("/choices/0/delta/tool_calls/0/function/arguments"),
             Some(&json!("{\"q\":"))
         );
+    }
+
+    #[test]
+    fn claude_stream_preserves_billing_usage_without_client_opt_in() {
+        let mut state = StreamState::new_with_options("claude-public", OutputProtocol::Chat, false);
+        let started = state.claude(&json!({
+            "type":"message_start",
+            "message":{
+                "id":"msg_claude",
+                "usage":{
+                    "input_tokens":5,
+                    "cache_creation_input_tokens":7,
+                    "cache_read_input_tokens":11,
+                    "cache_creation":{
+                        "ephemeral_5m_input_tokens":2,
+                        "ephemeral_1h_input_tokens":5
+                    },
+                    "service_tier":"standard"
+                }
+            }
+        }));
+        let completed = state.claude(&json!({
+            "type":"message_delta",
+            "delta":{"stop_reason":"end_turn"},
+            "usage":{
+                "input_tokens":0,
+                "cache_creation_input_tokens":0,
+                "cache_read_input_tokens":0,
+                "output_tokens":13,
+                "output_tokens_details":{"thinking_tokens":3}
+            }
+        }));
+
+        assert_eq!(started.len(), 1);
+        assert!(started[0].get("usage").is_none());
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0]["choices"][0]["finish_reason"], "stop");
+        assert!(completed[0].get("usage").is_none());
+        assert_eq!(completed[1]["choices"], json!([]));
+        assert_eq!(completed[1]["usage"]["prompt_tokens"], 5);
+        assert_eq!(completed[1]["usage"]["completion_tokens"], 13);
+        assert_eq!(completed[1]["usage"]["total_tokens"], 36);
+        assert_eq!(completed[1]["usage"]["cache_creation_input_tokens"], 7);
+        assert_eq!(completed[1]["usage"]["cache_read_input_tokens"], 11);
+        assert_eq!(
+            completed[1]["usage"]["cache_creation"]["ephemeral_5m_input_tokens"],
+            2
+        );
+        assert_eq!(
+            completed[1]["usage"]["cache_creation"]["ephemeral_1h_input_tokens"],
+            5
+        );
+        assert_eq!(
+            completed[1]["usage"]["prompt_tokens_details"]["cached_tokens"],
+            11
+        );
+        assert_eq!(
+            completed[1]["usage"]["prompt_tokens_details"]["cache_write_tokens"],
+            7
+        );
+        assert_eq!(
+            completed[1]["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+        assert_eq!(completed[1]["usage"]["service_tier"], "standard");
+        assert_eq!(state.usage(), (5, 13, 36));
     }
 
     #[test]
@@ -2207,11 +2489,25 @@ mod tests {
     }
 
     #[test]
-    fn responses_stream_omits_usage_when_not_requested() {
+    fn responses_stream_preserves_reported_usage_without_client_opt_in() {
         let mut state = StreamState::new_with_options("public-model", OutputProtocol::Chat, false);
         let chunks = state.responses(&json!({
             "type":"response.completed",
             "response":{"usage":{"input_tokens":3,"output_tokens":5,"total_tokens":8}},
+        }));
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].get("usage").is_none());
+        assert_eq!(chunks[1]["choices"], json!([]));
+        assert_eq!(chunks[1]["usage"]["total_tokens"], 8);
+    }
+
+    #[test]
+    fn responses_stream_does_not_invent_unreported_usage_without_client_opt_in() {
+        let mut state = StreamState::new_with_options("public-model", OutputProtocol::Chat, false);
+        let chunks = state.responses(&json!({
+            "type":"response.completed",
+            "response":{"status":"completed"},
         }));
 
         assert_eq!(chunks.len(), 1);

@@ -70,7 +70,7 @@ def test_list_models_payload_uses_cache_before_fallback():
     assert len(calls) == 1
 
 
-def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
+def test_codex_models_payload_returns_complete_verified_pro_snapshot():
     payload = codex_models_payload(
         api_index=0,
         api_list=["sk-test"],
@@ -78,6 +78,8 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
             "sk-test": [
                 {"id": "gpt-5.4"},
                 {"id": "gpt-5.5"},
+                {"id": "gpt-6-astra"},
+                {"id": "gpt-reserve"},
                 {"id": "gpt-5.6-sol"},
                 {"id": "gpt-5.6-terra"},
                 {"id": "gpt-5.6-luna"},
@@ -94,18 +96,27 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
 
     models = {model["slug"]: model for model in payload["models"]}
     assert list(models) == [
+        "gpt-6-astra",
+        "gpt-reserve",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
         "gpt-5.5",
         "gpt-5.4",
-        "gpt-5.6-sol-max",
-        "gpt-5.5-fast",
-        "gpt-default",
+        "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+        "codex-auto-review",
     ]
-    assert "gpt-5.3-codex-spark" not in models
-    assert "codex-auto-review" not in models
     assert "gpt-image-2" not in models
+
+    astra = models["gpt-6-astra"]
+    assert astra["minimal_client_version"] == "0.153.0"
+    assert astra["context_window"] == 600000
+    assert astra["max_context_window"] == 872000
+    assert [level["effort"] for level in astra["supported_reasoning_levels"]][-2:] == [
+        "max",
+        "ultra",
+    ]
 
     sol = models["gpt-5.6-sol"]
     assert sol["default_reasoning_level"] == "low"
@@ -117,8 +128,8 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
         "max",
         "ultra",
     ]
-    assert sol["context_window"] == 372000
-    assert sol["max_context_window"] == 372000
+    assert sol["context_window"] == 272000
+    assert sol["max_context_window"] == 872000
     assert sol["use_responses_lite"] is True
     assert sol["tool_mode"] == "code_mode_only"
     assert sol["multi_agent_version"] == "v2"
@@ -130,14 +141,6 @@ def test_codex_models_payload_uses_pro_metadata_and_filters_unroutable_models():
     assert luna["multi_agent_version"] == "v1"
     assert models["gpt-5.4"]["max_context_window"] == 1000000
     assert models["gpt-5.5"]["max_context_window"] == 272000
-    assert models["gpt-5.6-sol-max"]["context_window"] == 372000
-    assert [
-        level["effort"]
-        for level in models["gpt-5.6-sol-max"]["supported_reasoning_levels"]
-    ][-2:] == ["max", "ultra"]
-    assert models["gpt-5.5-fast"]["comp_hash"] == "2911"
-    assert models["gpt-default"]["description"] == "Available through uni-api."
-    assert models["gpt-default"]["priority"] >= 100
 
 
 def test_codex_pro_models_snapshot_matches_verified_official_response():
@@ -145,11 +148,27 @@ def test_codex_pro_models_snapshot_matches_verified_official_response():
         Path(__file__).parents[1]
         / "uni_api"
         / "api"
-        / "codex_models_pro_0_144_0.json"
+        / "codex_models_pro_0_153_2.json"
     )
     assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == (
-        "c21a449d1a9785661087e9a6d2aaa217c4b77813a69f1190fa02728b5bd68345"
+        "a5e9d8c7b26c83640103e2c0bb8786c89ffcef8777f98ae3ec06e1fd3e255a66"
     )
+
+
+def test_list_models_adds_astra_context_without_client_version():
+    payload = list_models_payload(
+        api_index=0,
+        api_list=["sk-test"],
+        model_response_cache={},
+        config={"api_keys": [{"api": "sk-test"}]},
+        models_list={"sk-test": ["gpt-6-astra"]},
+        build_models=lambda *_: [
+            {"id": "gpt-6-astra", "object": "model", "created": 1, "owned_by": "uni-api"}
+        ],
+    )
+    astra = next(item for item in payload["data"] if item["id"] == "gpt-6-astra")
+    assert astra["context_window"] == 600000
+    assert astra["max_context_window"] == 872000
 
 
 async def test_admin_config_handlers_read_and_update_runtime_state():

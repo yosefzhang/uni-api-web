@@ -2023,6 +2023,7 @@ pub(crate) fn responses_semantic_error(payload: &Value, event_type: &str) -> (u1
         | "user_suspended" => Some(403),
         "authentication_error" | "incorrect_api_key_provided" | "invalid_api_key" => Some(401),
         "billing_hard_limit_reached" | "insufficient_quota" | "rate_limit_exceeded" => Some(429),
+        "upstream_unavailable" => Some(503),
         "context_length_exceeded"
         | "invalid_request_error"
         | "invalid_type"
@@ -2051,6 +2052,7 @@ pub(crate) fn responses_semantic_error(payload: &Value, event_type: &str) -> (u1
         "not_found_error" => Some(404),
         "permission_error" => Some(403),
         "rate_limit_error" | "tokens" => Some(429),
+        "upstream_unavailable" => Some(503),
         _ => None,
     };
     if let Some(status) = status {
@@ -2745,7 +2747,7 @@ fn has_real_output(event_type: &str, payload: &Value) -> bool {
         return payload
             .get("delta")
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty());
+            .is_some_and(|value| !value.trim().is_empty());
     }
     if matches!(
         event_type,
@@ -2761,7 +2763,7 @@ fn has_real_output(event_type: &str, payload: &Value) -> bool {
             payload
                 .get(*field)
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
+                .is_some_and(|value| !value.trim().is_empty())
         });
     }
     false
@@ -2771,7 +2773,7 @@ fn part_has_text(part: &Value) -> bool {
     ["text", "refusal"].iter().any(|field| {
         part.get(*field)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty())
+            .is_some_and(|value| !value.trim().is_empty())
     })
 }
 
@@ -2792,7 +2794,7 @@ fn item_has_output(item: &Value) -> bool {
     ["name", "arguments", "call_id"].iter().any(|field| {
         item.get(*field)
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty())
+            .is_some_and(|value| !value.trim().is_empty())
     })
 }
 
@@ -3399,6 +3401,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_whitespace_priming_does_not_commit_before_rate_limit_failure() {
+        let mut active = test_active("codex");
+        let frames = active
+            .decoder
+            .feed(
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n\
+                  event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"status\":\"in_progress\"}}\n\n\
+                  event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"content\":[]}}\n\n\
+                  event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n\
+                  event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\" \"}\n\n\
+                  event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"rate_limit_error\",\"code\":null,\"message\":\"Upstream rate limit exceeded, please retry later\"}}}\n\n",
+            )
+            .unwrap();
+
+        let PreflightResult::Retry(outcome) = process_preflight_frames(&mut active, frames)
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("whitespace-only priming must remain retryable");
+        };
+        assert_eq!(outcome["status_code"], 429);
+        assert_eq!(outcome["committed"], false);
+        assert!(!active.business_committed);
+    }
+
+    #[test]
     fn gpt_preflight_commits_response_created_without_synthetic_keepalive() {
         let mut active = test_active("gpt");
         let frames = active
@@ -3574,6 +3602,25 @@ mod tests {
                 "error",
             ),
             (413, "payload too large".to_owned())
+        );
+        assert_eq!(
+            responses_semantic_error(
+                &json!({
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "upstream_unavailable",
+                            "message": "Service temporarily unavailable. Please try again later."
+                        }
+                    }
+                }),
+                "response.failed",
+            ),
+            (
+                503,
+                "Service temporarily unavailable. Please try again later.".to_owned()
+            )
         );
     }
 }

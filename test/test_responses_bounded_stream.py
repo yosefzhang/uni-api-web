@@ -14,6 +14,7 @@ from uni_api.admission import (
 )
 from uni_api.runtime import ResponsesRequestExecution, _prime_responses_upstream_stream
 from uni_api.observability.responses_stream import ResponsesStreamDiagnostics
+from uni_api.upstream.responses_errors import ResponsesSemanticError
 from uni_api.streaming.bounded_queue import (
     ObservedStreamChunk,
     ObservedStreamFrame,
@@ -463,6 +464,31 @@ def test_responses_guarded_precommit_keeps_response_created_private_and_emits_ke
             assert callbacks == [None]
         finally:
             await buffered.clear()
+
+    asyncio.run(scenario())
+
+
+def test_responses_guarded_precommit_rejects_failure_after_whitespace_priming():
+    async def scenario():
+        upstream = (
+            'event: response.created\ndata: {"type":"response.created","response":{"status":"in_progress"}}\n\n'
+            'event: response.in_progress\ndata: {"type":"response.in_progress","response":{"status":"in_progress"}}\n\n'
+            'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"message","content":[]}}\n\n'
+            'event: response.content_part.added\ndata: {"type":"response.content_part.added","part":{"type":"output_text","text":""}}\n\n'
+            'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":" "}\n\n'
+            'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","error":{"type":"rate_limit_error","code":null,"message":"Upstream rate limit exceeded, please retry later"}}}\n\n'
+        ).encode()
+
+        async def upstream_chunks():
+            yield upstream
+
+        with pytest.raises(ResponsesSemanticError) as exc_info:
+            await _prime_responses_upstream_stream(
+                upstream_chunks(),
+                precommit_semantic_guard=True,
+            )
+
+        assert exc_info.value.status_code == 429
 
     asyncio.run(scenario())
 

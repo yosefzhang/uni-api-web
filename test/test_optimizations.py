@@ -82,20 +82,26 @@ def test_list_models_returns_codex_catalog_for_client_version():
         ]
     }
 
-    response = asyncio.run(main.list_models(client_version="0.144.0", api_index=0))
+    response = asyncio.run(main.list_models(client_version="0.153.2", api_index=0))
     body = json.loads(response.body)
 
     assert response.headers["x-uni-api-models-source"] == "codex-pro-snapshot"
-    assert response.headers["x-uni-api-models-snapshot-client-version"] == "0.144.0"
+    assert response.headers["x-uni-api-models-snapshot-client-version"] == "0.153.2"
     assert response.headers["x-uni-api-models-upstream-etag"] == (
-        'W/"eaaa93847c22739b392a6260ccd9af1c"'
+        'W/"568f1e5faa711c9a79e1426428e2ea34"'
     )
     assert "etag" not in response.headers
     assert [model["slug"] for model in body["models"]] == [
+        "gpt-6-astra",
+        "gpt-reserve",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
         "gpt-5.4-mini",
+        "gpt-5.3-codex-spark",
+        "codex-auto-review",
     ]
 
 

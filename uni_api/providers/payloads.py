@@ -39,7 +39,7 @@ from uni_api.admission.json_parsing import parse_owned_json_value, run_json_cpu
 from uni_api.upstream.response_limits import read_limited_response_body
 
 gemini_max_token_65k_models = ["gemini-3-pro", "gemini-2.5-pro", "gemini-2.0-pro", "gemini-2.0-flash-thinking", "gemini-2.5-flash"]
-CODEX_CLI_VERSION = "0.144.0"
+CODEX_CLI_VERSION = "0.153.2"
 CODEX_USER_AGENT = f"codex_cli_rs/{CODEX_CLI_VERSION} (Debian 13.0.0; x86_64) WindowsTerminal"
 _FORCED_CODEX_CLIENT_HEADER_KEYS = {"version", "user-agent"}
 
