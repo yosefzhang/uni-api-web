@@ -31,7 +31,7 @@ pub(crate) const CODEX_USER_AGENT: &str =
     "codex_cli_rs/0.153.2 (Debian 13.0.0; x86_64) WindowsTerminal";
 
 pub(crate) const OPENCODE_GO_USER_AGENT: &str =
-    concat!("uni-api-web/", env!("UNI_API_WEB_VERSION", "0.0.0"));
+    concat!("uni-api-web/", env!("UNI_API_WEB_VERSION"));
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static SCHEDULING_NONCE: AtomicU64 = AtomicU64::new(1);
