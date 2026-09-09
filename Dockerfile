@@ -65,7 +65,7 @@ ENV SOURCE_COMMIT=${SOURCE_COMMIT} \
     MALLOC_ARENA_MAX=2 \
     MALLOC_MMAP_THRESHOLD_=131072 \
     MALLOC_TRIM_THRESHOLD_=131072
-RUN apt-get update && \
+RUN apt-get -o Acquire::Check-Valid-Until=false update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 EXPOSE 8000
