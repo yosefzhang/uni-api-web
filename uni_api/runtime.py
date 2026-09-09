@@ -39,6 +39,18 @@ from uni_api.providers.payloads import (
     strip_unsupported_codex_payload_fields,
 )
 from uni_api.providers.header_passthrough import apply_provider_preference_headers
+from uni_api.messages.anthropic_to_responses import (
+    anthropic_thinking_enabled,
+    build_responses_upstream_request,
+)
+from uni_api.messages.responses_to_anthropic import (
+    anthropic_error_body_bytes,
+    anthropic_message_from_responses,
+)
+from uni_api.streaming.anthropic_events import (
+    anthropic_protocol_error_sse,
+    stream_responses_to_anthropic,
+)
 from uni_api.providers.responses import fetch_response, fetch_response_stream
 from core.models import RequestModel, ResponsesRequest, ImageGenerationRequest, ImageEditRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, EmbeddingRequest
 from core.utils import (
@@ -9858,14 +9870,20 @@ class MessagesPassthroughHandler:
         engine, stream_mode = get_engine(provider, endpoint=endpoint, original_model=original_model)
         attempt.state["failure_stage"] = "validation"
 
-        upstream_url = _normalize_messages_upstream_url(provider.get("base_url", ""))
+        raw_base_url = str(provider.get("base_url", "") or "")
+        raw_base_path = urlparse(raw_base_url).path.rstrip("/")
+        is_messages_upstream = raw_base_path.endswith("/v1/messages") or raw_base_path.endswith("/messages")
+        is_responses_upstream = engine in ("gpt", "codex") and (
+            engine == "codex"
+            or raw_base_path.endswith("/v1/responses")
+            or raw_base_path.endswith("/responses")
+        )
+        if engine != "claude" and not is_messages_upstream and not is_responses_upstream:
+            raise HTTPException(status_code=400, detail=f"{endpoint} only supports upstream engine: claude (got {engine})")
+
+        upstream_url = raw_base_url if is_responses_upstream else _normalize_messages_upstream_url(raw_base_url)
         if not upstream_url:
             raise HTTPException(status_code=400, detail=f"{endpoint} requires provider base_url")
-
-        upstream_path = urlparse(upstream_url).path.rstrip("/")
-        is_messages_upstream = upstream_path.endswith("/v1/messages") or upstream_path.endswith("/messages")
-        if engine != "claude" and not is_messages_upstream:
-            raise HTTPException(status_code=400, detail=f"{endpoint} only supports upstream engine: claude (got {engine})")
 
         proxy = safe_get(ctx["config"], "preferences", "proxy", default=None)
         proxy = safe_get(provider, "preferences", "proxy", default=proxy)
@@ -9873,19 +9891,35 @@ class MessagesPassthroughHandler:
             {
                 "upstream_url": upstream_url,
                 "channel_id": f"{provider_name}",
-                "engine": "claude",
+                "engine": engine if is_responses_upstream else "claude",
+                "responses_upstream": bool(is_responses_upstream),
                 "proxy": proxy,
                 "stream_mode": stream_mode,
                 "failure_stage": "auth",
             }
         )
         attempt.provider_api_key_raw = await ctx["runner"].select_provider_api_key(attempt)
+        api_key = attempt.provider_api_key_raw
+        codex_account_id = None
+        if engine == "codex" and is_responses_upstream and attempt.provider_api_key_raw:
+            try:
+                api_key, codex_account_id = await _resolve_codex_upstream_auth(
+                    provider_name,
+                    attempt.provider_api_key_raw,
+                    proxy,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
         timeout_value = get_preference(
             app.state.provider_timeouts,
             provider_name,
             (original_model, request_model_name),
             DEFAULT_TIMEOUT,
         )
+        if is_responses_upstream:
+            timeout_engine = engine
+        else:
+            timeout_engine = "claude"
         timeout_resolution = apply_timeout_policy(
             base_timeout=int(timeout_value),
             timeout_policy=getattr(app.state, "timeout_policy", {}),
@@ -9893,12 +9927,13 @@ class MessagesPassthroughHandler:
             endpoint=endpoint,
             method="POST",
             stream=bool(stream_mode) if stream_mode is not None else bool((ctx["request_body"] or {}).get("stream")),
-            engine="claude",
+            engine=timeout_engine,
             original_model=original_model,
             request_model=request_model_name,
             role=ctx["plan"].role,
         )
-        attempt.state["api_key"] = attempt.provider_api_key_raw
+        attempt.state["api_key"] = api_key
+        attempt.state["codex_account_id"] = codex_account_id
         attempt.state["timeout_value"] = int(timeout_resolution["timeout_value"])
         attempt.state["timeout_policy_sources"] = timeout_resolution["timeout_policy_sources"]
 
@@ -9910,14 +9945,30 @@ class MessagesPassthroughHandler:
         timeout_value = attempt.state["timeout_value"]
         channel_id = attempt.state["channel_id"]
         request_model_name = ctx["request_model_name"]
+        is_responses = attempt.state.get("responses_upstream", False)
 
-        payload = dict(ctx["request_body"])
-        payload["model"] = original_model
-        if attempt.state.get("stream_mode") is not None:
-            payload["stream"] = bool(attempt.state["stream_mode"])
-        apply_post_body_parameter_overrides(payload, provider, request_model_name)
+        if is_responses:
+            upstream_url, headers, payload = await build_responses_upstream_request(
+                request_body=ctx["request_body"],
+                provider=provider,
+                engine=attempt.state["engine"],
+                original_model=original_model,
+                api_key=attempt.state.get("api_key"),
+                codex_account_id=attempt.state.get("codex_account_id"),
+                http_request=ctx["http_request"],
+                request_model_name=request_model_name,
+            )
+            attempt.state["upstream_url"] = upstream_url
+            if attempt.state.get("stream_mode") is not None:
+                payload["stream"] = bool(attempt.state["stream_mode"])
+        else:
+            payload = dict(ctx["request_body"])
+            payload["model"] = original_model
+            if attempt.state.get("stream_mode") is not None:
+                payload["stream"] = bool(attempt.state["stream_mode"])
+            apply_post_body_parameter_overrides(payload, provider, request_model_name)
+            headers = self._messages_headers(ctx["http_request"], provider, attempt.state["api_key"])
 
-        headers = self._messages_headers(ctx["http_request"], provider, attempt.state["api_key"])
         apply_oaix_routing_attempt_id(
             headers,
             provider=attempt.provider,
@@ -9940,9 +9991,29 @@ class MessagesPassthroughHandler:
         attempt.state["request_body_wire_bytes"] = prepared_body.content_length
 
         try:
-            async with app.state.client_manager.get_client(upstream_url, proxy) as client:
+            async with app.state.client_manager.get_client(
+                upstream_url,
+                proxy,
+                http2=False if attempt.state.get("engine") == "codex" else None,
+            ) as client:
                 if payload.get("stream"):
+                    if is_responses:
+                        return await self._messages_responses_stream_response(
+                            client,
+                            attempt,
+                            ctx,
+                            headers,
+                            prepared_body.content,
+                        )
                     return await self._messages_stream_response(
+                        client,
+                        attempt,
+                        ctx,
+                        headers,
+                        prepared_body.content,
+                    )
+                if is_responses:
+                    return await self._messages_responses_non_stream_response(
                         client,
                         attempt,
                         ctx,
@@ -9976,14 +10047,15 @@ class MessagesPassthroughHandler:
         channel_id = attempt.state["channel_id"]
         upstream_url = attempt.state["upstream_url"]
         request_model_name = ctx["request_model_name"]
-        _log_stdout_request_summary(channel_id, request_model_name, "claude", ctx["plan"].role)
+        engine_label = attempt.state.get("engine", "claude")
+        _log_stdout_request_summary(channel_id, request_model_name, engine_label, ctx["plan"].role)
         trace_logger.info(
             "endpoint=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
             ctx["endpoint"],
             ctx["request_id"],
             channel_id[:11],
             request_model_name,
-            "claude",
+            engine_label,
             ctx["plan"].role,
             upstream_url,
         )
@@ -10338,6 +10410,248 @@ class MessagesPassthroughHandler:
             status_code=upstream_resp.status_code,
             headers=response_headers,
             media_type=response_headers.get("content-type", "application/json"),
+        )
+
+    async def _messages_responses_stream_response(self, client: Any, attempt: Any, ctx: dict[str, Any], headers: dict[str, str], json_payload: Any):
+        """Stream to a Responses-protocol upstream and translate its SSE into
+        Anthropic SSE for the ``/v1/messages`` caller."""
+        upstream_url = attempt.state["upstream_url"]
+        stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=attempt.state["timeout_value"])
+
+        async def cleanup_cancelled_stream_enter(response: Any) -> None:
+            await _close_upstream_response_stream_safely(stream_cm, response)
+
+        try:
+            upstream_resp = await _await_first_byte_deadline(
+                stream_cm.__aenter__(),
+                disconnect_event=ctx["disconnect_event"],
+                cancel_result_cleanup=cleanup_cancelled_stream_enter,
+            )
+        except DownstreamDisconnectedDuringWait:
+            trace_logger.info(
+                "%s downstream disconnect stage=upstream-response-headers request_id=%s model=%s provider=%s",
+                ctx["endpoint"],
+                ctx["request_id"],
+                ctx["request_model_name"],
+                attempt.provider_name,
+            )
+            return Response(content="", status_code=499)
+        response_headers = dict(_copy_upstream_response_headers(upstream_resp.headers))
+        if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
+            raw = await read_limited_response_body(upstream_resp)
+            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            error_body = anthropic_error_body_bytes(raw.body, upstream_resp.status_code)
+            self._messages_set_last_error(ctx, error_body, {"content-type": "application/json"})
+            raise HTTPException(status_code=upstream_resp.status_code, detail=raw.text())
+
+        upstream_iter = upstream_resp.aiter_raw()
+        try:
+            buffered_chunks = await _prime_passthrough_upstream_stream(upstream_iter, disconnect_event=ctx["disconnect_event"])
+        except DownstreamDisconnectedDuringWait:
+            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            trace_logger.info(
+                "%s downstream disconnect stage=before-stream-commit request_id=%s model=%s provider=%s",
+                ctx["endpoint"],
+                ctx["request_id"],
+                ctx["request_model_name"],
+                attempt.provider_name,
+            )
+            return Response(content="", status_code=499)
+        except BaseException:
+            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            raise
+
+        if ctx["disconnect_event"] is not None and ctx["disconnect_event"].is_set():
+            await _close_upstream_response_stream_safely(stream_cm, upstream_resp)
+            trace_logger.info(
+                "%s downstream disconnect stage=before-stream-commit request_id=%s model=%s provider=%s",
+                ctx["endpoint"],
+                ctx["request_id"],
+                ctx["request_model_name"],
+                attempt.provider_name,
+            )
+            return Response(content="", status_code=499)
+
+        attempt.state["stream_upstream_status_code"] = upstream_resp.status_code
+        response_headers.pop("content-type", None)
+        response_headers.pop("Content-Type", None)
+        response_headers["content-type"] = "text/event-stream"
+        return StarletteStreamingResponse(
+            self._messages_responses_stream_body(
+                ctx,
+                attempt,
+                buffered_chunks,
+                upstream_iter,
+                stream_cm,
+                upstream_resp,
+            ),
+            status_code=upstream_resp.status_code,
+            headers=response_headers,
+            media_type="text/event-stream",
+        )
+
+    async def _messages_responses_stream_body(
+        self,
+        ctx: dict[str, Any],
+        attempt: Any,
+        buffered_chunks: list[bytes],
+        upstream_iter: Any,
+        stream_cm: Any,
+        upstream_resp: Any,
+    ):
+        """Translate an upstream Responses SSE stream into Anthropic SSE events."""
+        thinking_enabled = anthropic_thinking_enabled(ctx["request_body"])
+
+        async def source_chunks():
+            try:
+                while buffered_chunks:
+                    chunk = buffered_chunks.pop(0)
+                    yield chunk
+                buffered_chunks.clear()
+            finally:
+                buffered_chunks.clear()
+            while True:
+                try:
+                    chunk = await _await_first_byte_deadline(
+                        upstream_iter.__anext__(),
+                        disconnect_event=ctx["disconnect_event"],
+                    )
+                except StopAsyncIteration:
+                    break
+                yield chunk
+
+        translated = stream_responses_to_anthropic(
+            source_chunks(),
+            request_model=attempt.original_model,
+            thinking_enabled=thinking_enabled,
+        )
+        try:
+            async for chunk in translated:
+                if self._messages_downstream_disconnected(ctx, attempt, stage="after-stream-commit"):
+                    self._messages_finalize_stream_disconnect(ctx, attempt)
+                    return
+                yield chunk
+                if "message_stop" in chunk:
+                    self._messages_finalize_stream_success(ctx, attempt)
+                    return
+            raise SSEProtocolError(
+                "Responses-to-Anthropic translation ended without message_stop"
+            )
+        except DownstreamDisconnectedDuringWait:
+            self._messages_finalize_stream_disconnect(ctx, attempt)
+            return
+        except SSEProtocolError as exc:
+            self._messages_finalize_stream_failure(ctx, attempt, exc)
+            _record_postcommit_sse_protocol_error_isolation(
+                ctx["current_info"],
+                exc,
+            )
+            yield anthropic_protocol_error_sse()
+            return
+        except UPSTREAM_NETWORK_ERRORS as exc:
+            self._messages_finalize_stream_failure(ctx, attempt, exc)
+            raise
+        except AdmissionRejected as exc:
+            _record_local_admission_rejection(ctx["current_info"], exc)
+            ctx["current_info"]["stream_outcome"] = "local_backpressure_abort"
+            ctx["current_info"]["stream_error_status_code"] = int(
+                getattr(exc, "status_code", 503)
+            )
+            attempt.state["messages_stream_finalized"] = True
+            raise
+        except (asyncio.CancelledError, GeneratorExit):
+            if ctx["disconnect_event"] is not None and ctx["disconnect_event"].is_set():
+                self._messages_finalize_stream_disconnect(ctx, attempt)
+            raise
+        finally:
+            try:
+                await translated.aclose()
+            finally:
+                try:
+                    if (
+                        not attempt.state.get("messages_stream_finalized")
+                        and ctx["disconnect_event"] is not None
+                        and ctx["disconnect_event"].is_set()
+                    ):
+                        self._messages_finalize_stream_disconnect(ctx, attempt)
+                finally:
+                    await _close_upstream_response_stream_safely(
+                        stream_cm,
+                        upstream_resp,
+                    )
+
+    async def _messages_responses_non_stream_response(self, client: Any, attempt: Any, ctx: dict[str, Any], headers: dict[str, str], json_payload: Any):
+        """Post to a Responses-protocol upstream and translate its JSON response
+        into an Anthropic message object."""
+        async def cleanup_cancelled_response(response: Any) -> None:
+            close = getattr(response, "aclose", None)
+            if callable(close):
+                await close()
+
+        try:
+            upstream_resp = await _await_first_byte_deadline(
+                client.post(
+                    attempt.state["upstream_url"],
+                    headers=headers,
+                    content=json_payload,
+                    timeout=attempt.state["timeout_value"],
+                ),
+                disconnect_event=ctx["disconnect_event"],
+                cancel_result_cleanup=cleanup_cancelled_response,
+            )
+        except DownstreamDisconnectedDuringWait:
+            trace_logger.info(
+                "%s downstream disconnect stage=non-stream-upstream-response request_id=%s model=%s provider=%s",
+                ctx["endpoint"],
+                ctx["request_id"],
+                ctx["request_model_name"],
+                attempt.provider_name,
+            )
+            return Response(content="", status_code=499)
+        if ctx["disconnect_event"] is not None and ctx["disconnect_event"].is_set():
+            await cleanup_cancelled_response(upstream_resp)
+            trace_logger.info(
+                "%s downstream disconnect stage=non-stream-upstream-response request_id=%s model=%s provider=%s",
+                ctx["endpoint"],
+                ctx["request_id"],
+                ctx["request_model_name"],
+                attempt.provider_name,
+            )
+            return Response(content="", status_code=499)
+        response_headers = dict(_copy_upstream_response_headers(upstream_resp.headers))
+        raw = upstream_resp.content
+        if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
+            error_body = anthropic_error_body_bytes(raw, upstream_resp.status_code)
+            self._messages_set_last_error(ctx, error_body, {"content-type": "application/json"})
+            raise HTTPException(
+                status_code=upstream_resp.status_code,
+                detail=raw.decode("utf-8", errors="replace"),
+            )
+
+        try:
+            response_json = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            error_body = anthropic_error_body_bytes(raw, 502)
+            self._messages_set_last_error(ctx, error_body, {"content-type": "application/json"})
+            raise HTTPException(status_code=502, detail="Upstream Responses response was not valid JSON")
+
+        thinking_enabled = anthropic_thinking_enabled(ctx["request_body"])
+        message = anthropic_message_from_responses(
+            response_json,
+            fallback_model=attempt.original_model,
+            thinking_enabled=thinking_enabled,
+        )
+        payload_bytes = json.dumps(message, ensure_ascii=False).encode("utf-8")
+        response_headers.pop("content-type", None)
+        response_headers.pop("Content-Type", None)
+        response_headers["content-type"] = "application/json"
+
+        self._messages_record_success(ctx, attempt)
+        return Response(
+            content=payload_bytes,
+            status_code=upstream_resp.status_code,
+            headers=response_headers,
+            media_type="application/json",
         )
 
     def _messages_set_last_error(self, ctx: dict[str, Any], body: bytes, headers: dict[str, str]) -> None:
