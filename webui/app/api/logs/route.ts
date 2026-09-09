@@ -14,8 +14,8 @@ export async function GET(request: NextRequest) {
     const provider = sp.get('provider');
     const status = sp.get('status');
 
-    const whereClauses = ['r.api_key = ?', 'r.endpoint = ?'];
-    const params: any[] = [api, '/v1/chat/completions'];
+    const whereClauses = ['r.api_key = ?'];
+    const params: any[] = [api];
     if (model) { whereClauses.push(`r.model = ?`); params.push(model); }
     if (provider) { whereClauses.push(`r.provider = ?`); params.push(provider); }
     if (status) {

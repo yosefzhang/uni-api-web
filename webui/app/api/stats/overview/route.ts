@@ -14,7 +14,7 @@ export async function GET(request: NextRequest) {
         COALESCE(SUM(completion_tokens), 0) as completionTokens,
         COALESCE(AVG(process_time), 0) as avgProcessTime,
         COALESCE(AVG(first_response_time), 0) as avgFirstResponseTime
-        FROM request_stats WHERE api_key = ? AND endpoint = '/v1/chat/completions'`,
+        FROM request_stats WHERE api_key = ?`,
       params: [api],
     });
     const stats = rows[0] || {

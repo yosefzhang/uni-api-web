@@ -8,11 +8,11 @@ export async function GET(request: NextRequest) {
     const { entry } = requireKey(apiKey);
     const api = entry.api;
     const models = queryRows({
-      sql: `SELECT DISTINCT model FROM request_stats WHERE api_key = ? AND endpoint = '/v1/chat/completions' ORDER BY model`,
+      sql: `SELECT DISTINCT model FROM request_stats WHERE api_key = ? ORDER BY model`,
       params: [api],
     }).map((r) => r.model).filter((v) => v != null);
     const providers = queryRows({
-      sql: `SELECT DISTINCT provider FROM request_stats WHERE api_key = ? AND endpoint = '/v1/chat/completions' ORDER BY provider`,
+      sql: `SELECT DISTINCT provider FROM request_stats WHERE api_key = ? ORDER BY provider`,
       params: [api],
     }).map((r) => r.provider).filter((v) => v != null);
     return NextResponse.json({ models, providers });

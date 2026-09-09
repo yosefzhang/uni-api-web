@@ -489,7 +489,7 @@ async fn stats_overview(
          COALESCE(SUM(completion_tokens), 0) as completionTokens, \
          COALESCE(AVG(process_time), 0) as avgProcessTime, \
          COALESCE(AVG(first_response_time), 0) as avgFirstResponseTime \
-         FROM request_stats WHERE api_key = $1 AND endpoint = '/v1/chat/completions'"
+         FROM request_stats WHERE api_key = $1"
             .to_owned(),
         vec![text_arg(&api_key)],
     )
@@ -522,7 +522,7 @@ const RANKING_SQL: &str = "SELECT r.{group} as {group}, \
      COALESCE(AVG(r.process_time), 0) as avgProcessTime, \
      COALESCE(AVG(r.first_response_time), 0) as avgFirstResponseTime \
      FROM request_stats r LEFT JOIN channel_stats c ON r.request_id = c.request_id \
-     WHERE r.api_key = $1 AND r.endpoint = '/v1/chat/completions' \
+     WHERE r.api_key = $1 \
      GROUP BY r.{group} ORDER BY requests DESC";
 
 async fn run_ranking(state: &StatusState, group: &str, api_key: String) -> Response {
@@ -571,7 +571,7 @@ async fn stats_channels(
 }
 
 const DISTINCT_SQL: &str = "SELECT DISTINCT {column} FROM request_stats \
-     WHERE api_key = $1 AND endpoint = '/v1/chat/completions' ORDER BY {column}";
+     WHERE api_key = $1 ORDER BY {column}";
 
 async fn filters(
     State(state): State<StatusState>,
@@ -643,8 +643,8 @@ async fn logs(
         .unwrap_or(30)
         .clamp(1, 100);
 
-    let mut where_clauses = vec!["r.api_key = $1".to_owned(), "r.endpoint = $2".to_owned()];
-    let mut args: Vec<SqlValue> = vec![text_arg(&api_key), text_arg("/v1/chat/completions")];
+    let mut where_clauses = vec!["r.api_key = $1".to_owned()];
+    let mut args: Vec<SqlValue> = vec![text_arg(&api_key)];
     if let Some(value) = get("model") {
         where_clauses.push(format!("r.model = ${}", args.len() + 1));
         args.push(text_arg(&value));
