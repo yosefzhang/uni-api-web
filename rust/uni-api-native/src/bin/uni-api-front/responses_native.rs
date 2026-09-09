@@ -2932,18 +2932,19 @@ fn ensure_opencode_go_headers(headers: &mut HashMap<String, String>, provider: &
     if !has_session {
         headers.insert(
             "x-opencode-session".into(),
-            format!("{:x}", Sha256::digest(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-                    .to_le_bytes()
-            )),
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .to_le_bytes()
+                )
+            ),
         );
     }
-    let has_ua = headers
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("user-agent"));
+    let has_ua = headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent"));
     if !has_ua {
         headers.insert("User-Agent".into(), OPENCODE_GO_USER_AGENT.into());
     }

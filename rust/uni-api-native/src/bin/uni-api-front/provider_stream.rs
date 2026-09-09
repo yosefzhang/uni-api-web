@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::pin::Pin;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,6 +32,7 @@ pub enum Protocol {
 pub enum OutputProtocol {
     Chat,
     Responses,
+    Claude,
 }
 
 pub struct Translation {
@@ -65,8 +66,10 @@ struct StreamTimeouts {
 struct TranslationOptions {
     include_usage: bool,
     timeouts: StreamTimeouts,
+    claude_thinking: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate(
     response: reqwest::Response,
     protocol: Protocol,
@@ -75,6 +78,7 @@ pub fn translate(
     include_usage: bool,
     idle_timeout_seconds: Option<f64>,
     total_timeout_seconds: Option<f64>,
+    claude_thinking_enabled: bool,
 ) -> Translation {
     let status = response.status();
     let content_type = response
@@ -94,6 +98,7 @@ pub fn translate(
         idle_timeout_seconds,
         total_timeout_seconds,
         false,
+        claude_thinking_enabled,
     )
 }
 
@@ -164,6 +169,7 @@ pub async fn translate_responses_to_chat(
                         idle_timeout_seconds,
                         total_timeout_seconds,
                         emit_precommit_comment,
+                        false,
                     ));
                 }
             }
@@ -205,6 +211,7 @@ pub async fn translate_responses_to_chat(
                                 idle_timeout_seconds,
                                 total_timeout_seconds,
                                 emit_precommit_comment,
+                                false,
                             ));
                         }
                         PrecommitDecision::Ignore | PrecommitDecision::Retain => {}
@@ -233,6 +240,7 @@ fn spawn_translation(
     idle_timeout_seconds: Option<f64>,
     total_timeout_seconds: Option<f64>,
     emit_precommit_comment: bool,
+    claude_thinking: bool,
 ) -> Translation {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let (outcome_tx, outcome_rx) = oneshot::channel();
@@ -246,6 +254,7 @@ fn spawn_translation(
                 idle: positive_duration(idle_timeout_seconds),
                 total: positive_duration(total_timeout_seconds),
             },
+            claude_thinking,
         };
         let result = run_translation(
             stream,
@@ -262,6 +271,15 @@ fn spawn_translation(
             Err(error) => {
                 let payload = match output_protocol {
                     OutputProtocol::Chat => json!({"error":{"message":error}}),
+                    OutputProtocol::Claude => json!({
+                        "type":"error",
+                        "error":{
+                            "message":error,
+                            "type":"stream_error",
+                            "code":"upstream_sse_protocol_error",
+                            "status_code":502,
+                        }
+                    }),
                     OutputProtocol::Responses => json!({
                         "type":"response.failed",
                         "response":{
@@ -310,6 +328,7 @@ async fn run_translation(
     options: TranslationOptions,
 ) -> Result<StreamOutcome, String> {
     let mut state = StreamState::new_with_options(model, output_protocol, options.include_usage);
+    state.claude_thinking = options.claude_thinking;
     let timeouts = options.timeouts;
     for event in state.start_chunks() {
         send_wire(tx, &event, output_protocol).await?;
@@ -796,7 +815,10 @@ async fn send_wire(
     output_protocol: OutputProtocol,
 ) -> Result<(), String> {
     let mut wire = Vec::new();
-    if output_protocol == OutputProtocol::Responses {
+    if matches!(
+        output_protocol,
+        OutputProtocol::Responses | OutputProtocol::Claude
+    ) {
         if let Some(event_type) = value.get("type").and_then(Value::as_str) {
             wire.extend_from_slice(b"event: ");
             wire.extend_from_slice(event_type.as_bytes());
@@ -809,6 +831,100 @@ async fn send_wire(
     tx.send(Ok(Bytes::from(wire)))
         .await
         .map_err(|_| "downstream disconnected".to_owned())
+}
+
+fn anthropic_content_block_start(index: usize, block: Value) -> Value {
+    json!({"type":"content_block_start","index":index,"content_block":block})
+}
+
+fn anthropic_content_block_delta(index: usize, delta: Value) -> Value {
+    json!({"type":"content_block_delta","index":index,"delta":delta})
+}
+
+fn anthropic_content_block_stop(index: usize) -> Value {
+    json!({"type":"content_block_stop","index":index})
+}
+
+fn anthropic_usage_from_responses(usage: Option<&Value>) -> Value {
+    let Some(usage) = usage.filter(|usage| usage.is_object()) else {
+        return json!({"input_tokens":0,"output_tokens":0});
+    };
+    let input_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cached_tokens = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let mut out = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    });
+    if cached_tokens > 0 {
+        out.as_object_mut()
+            .expect("anthropic usage object")
+            .insert("cache_read_input_tokens".into(), json!(cached_tokens));
+    }
+    if reasoning_tokens > 0 {
+        out.as_object_mut().expect("anthropic usage object").insert(
+            "output_tokens_details".into(),
+            json!({"thinking_tokens":reasoning_tokens}),
+        );
+    }
+    out
+}
+
+fn anthropic_reasoning_item_text(item: &Value) -> String {
+    match item.get("summary") {
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Value::String(text)) => text.clone(),
+        _ => String::new(),
+    }
+}
+
+fn anthropic_message_item_text(item: &Value) -> String {
+    let mut text = String::new();
+    for part in item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if matches!(
+            part.get("type").and_then(Value::as_str),
+            Some("output_text") | Some("text")
+        ) {
+            if let Some(chunk) = part.get("text").and_then(Value::as_str) {
+                text.push_str(chunk);
+            }
+        }
+    }
+    text
+}
+
+#[derive(Clone, Copy)]
+struct ClaudeOpenBlock {
+    // 0 = text, 1 = thinking, 2 = tool_use
+    kind: u8,
+    index: usize,
+    args_streamed: bool,
 }
 
 struct StreamState {
@@ -826,6 +942,14 @@ struct StreamState {
     output_protocol: OutputProtocol,
     include_usage: bool,
     responses: ResponsesOutputState,
+    // Anthropic (Claude) SSE output state.
+    claude_thinking: bool,
+    claude_message_id: String,
+    claude_next_index: usize,
+    claude_open: HashMap<u64, ClaudeOpenBlock>,
+    claude_rendered: HashSet<u64>,
+    claude_rendered_ids: HashSet<String>,
+    claude_has_tool_use: bool,
 }
 
 impl StreamState {
@@ -834,6 +958,10 @@ impl StreamState {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         Self {
             id: format!("chatcmpl-{created}"),
             model: model.to_owned(),
@@ -849,12 +977,33 @@ impl StreamState {
             output_protocol,
             include_usage,
             responses: ResponsesOutputState::new(model, created),
+            claude_thinking: false,
+            claude_message_id: format!("msg_{unique:x}"),
+            claude_next_index: 0,
+            claude_open: HashMap::new(),
+            claude_rendered: HashSet::new(),
+            claude_rendered_ids: HashSet::new(),
+            claude_has_tool_use: false,
         }
     }
 
     fn start_chunks(&mut self) -> Vec<Value> {
         if self.output_protocol == OutputProtocol::Responses {
             self.responses.start_chunks()
+        } else if self.output_protocol == OutputProtocol::Claude {
+            vec![json!({
+                "type":"message_start",
+                "message":{
+                    "id":self.claude_message_id,
+                    "type":"message",
+                    "role":"assistant",
+                    "model":self.model,
+                    "content":[],
+                    "stop_reason":Value::Null,
+                    "stop_sequence":Value::Null,
+                    "usage":{"input_tokens":0,"output_tokens":0},
+                },
+            })]
         } else {
             Vec::new()
         }
@@ -863,6 +1012,9 @@ impl StreamState {
     fn convert(&mut self, protocol: Protocol, value: &Value) -> Vec<Value> {
         let chunks = match protocol {
             Protocol::Chat => self.chat(value),
+            Protocol::Responses if self.output_protocol == OutputProtocol::Claude => {
+                self.responses_to_anthropic(value)
+            }
             Protocol::Responses => self.responses(value),
             Protocol::Gemini => self.gemini(value),
             Protocol::Claude => self.claude(value),
@@ -889,11 +1041,136 @@ impl StreamState {
         {
             self.terminal = true;
         }
+        if self.output_protocol == OutputProtocol::Claude {
+            return self.chat_to_anthropic(value);
+        }
         vec![value.clone()]
     }
 
+    fn claude_ensure_block(&mut self, key: u64, kind: u8, start: Value) -> Vec<Value> {
+        if self.claude_open.contains_key(&key) {
+            return Vec::new();
+        }
+        let index = self.claude_alloc_index();
+        self.claude_open.insert(
+            key,
+            ClaudeOpenBlock {
+                kind,
+                index,
+                args_streamed: false,
+            },
+        );
+        vec![anthropic_content_block_start(index, start)]
+    }
+
+    /// Incrementally translate chat/completions SSE chunks into Anthropic SSE
+    /// frames for a `/v1/messages` caller.
+    fn chat_to_anthropic(&mut self, value: &Value) -> Vec<Value> {
+        let delta = value.pointer("/choices/0/delta");
+        let mut out = Vec::new();
+        let reasoning = delta
+            .and_then(|item| item.get("reasoning_content"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let text = delta
+            .and_then(|item| item.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tool_calls = delta
+            .and_then(|item| item.get("tool_calls"))
+            .and_then(Value::as_array);
+        if (!text.is_empty() || tool_calls.is_some())
+            && matches!(self.claude_open.get(&1).map(|block| block.kind), Some(1))
+        {
+            out.extend(self.claude_close_open(1));
+        }
+        if self.claude_thinking && !reasoning.is_empty() {
+            out.extend(self.claude_ensure_block(1, 1, json!({"type":"thinking","thinking":""})));
+            if let Some(block) = self.claude_open.get(&1) {
+                out.push(anthropic_content_block_delta(
+                    block.index,
+                    json!({"type":"thinking_delta","thinking":reasoning}),
+                ));
+            }
+        }
+        if !text.is_empty() {
+            out.extend(self.claude_ensure_block(0, 0, json!({"type":"text","text":""})));
+            if let Some(block) = self.claude_open.get(&0) {
+                out.push(anthropic_content_block_delta(
+                    block.index,
+                    json!({"type":"text_delta","text":text}),
+                ));
+            }
+        }
+        for call in tool_calls.into_iter().flatten() {
+            let tool_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let key = 1000 + tool_index;
+            if !self.claude_open.contains_key(&key) {
+                let call_id = call.get("id").and_then(Value::as_str).unwrap_or("call");
+                let name = call
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                self.claude_has_tool_use = true;
+                out.extend(self.claude_ensure_block(
+                    key,
+                    2,
+                    json!({"type":"tool_use","id":call_id,"name":name,"input":{}}),
+                ));
+            }
+            if let Some(partial) = call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .filter(|partial| !partial.is_empty())
+            {
+                if let Some(block) = self.claude_open.get_mut(&key) {
+                    block.args_streamed = true;
+                    out.push(anthropic_content_block_delta(
+                        block.index,
+                        json!({"type":"input_json_delta","partial_json":partial}),
+                    ));
+                }
+            }
+        }
+        if self.terminal {
+            let mut open_keys = self.claude_open.keys().copied().collect::<Vec<_>>();
+            open_keys.sort_unstable();
+            for key in open_keys {
+                if let Some(stop) = self.claude_close_open(key) {
+                    out.push(stop);
+                }
+            }
+            let finish_reason = value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let stop_reason = if self.claude_has_tool_use {
+                "tool_use"
+            } else {
+                match finish_reason {
+                    "length" => "max_tokens",
+                    "content_filter" => "refusal",
+                    _ => "end_turn",
+                }
+            };
+            let usage = anthropic_usage_from_responses(self.chat_usage.as_ref());
+            out.push(json!({
+                "type":"message_delta",
+                "delta":{"stop_reason":stop_reason},
+                "usage":usage,
+            }));
+            out.push(json!({"type":"message_stop"}));
+        }
+        out
+    }
+
     fn encode_chunks(&mut self, chunks: Vec<Value>) -> Vec<Value> {
-        if self.output_protocol == OutputProtocol::Chat {
+        if self.output_protocol == OutputProtocol::Chat
+            || self.output_protocol == OutputProtocol::Claude
+        {
             chunks
         } else {
             chunks
@@ -979,6 +1256,432 @@ impl StreamState {
             "code":value.pointer("/response/error/code").or_else(|| value.pointer("/error/code")).cloned().unwrap_or(Value::Null),
             "status_code":status_code,
         }})]
+    }
+
+    fn claude_alloc_index(&mut self) -> usize {
+        let index = self.claude_next_index;
+        self.claude_next_index += 1;
+        index
+    }
+
+    fn claude_item_id_rendered(&self, item: &Value) -> bool {
+        item.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| self.claude_rendered_ids.contains(id))
+    }
+
+    fn claude_mark_rendered(&mut self, item: &Value) {
+        if let Some(id) = item.get("id").and_then(Value::as_str) {
+            self.claude_rendered_ids.insert(id.to_owned());
+        }
+    }
+
+    fn claude_synthesize_item(&mut self, item: &Value) -> Vec<Value> {
+        if self.claude_item_id_rendered(item) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() {
+                    return out;
+                }
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("call");
+                let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                let index = self.claude_alloc_index();
+                out.push(anthropic_content_block_start(
+                    index,
+                    json!({"type":"tool_use","id":call_id,"name":name,"input":{}}),
+                ));
+                if !arguments.is_empty() {
+                    out.push(anthropic_content_block_delta(
+                        index,
+                        json!({"type":"input_json_delta","partial_json":arguments}),
+                    ));
+                }
+                out.push(anthropic_content_block_stop(index));
+                self.claude_has_tool_use = true;
+                self.claude_mark_rendered(item);
+            }
+            Some("message") => {
+                let text = anthropic_message_item_text(item);
+                if !text.is_empty() {
+                    let index = self.claude_alloc_index();
+                    out.push(anthropic_content_block_start(
+                        index,
+                        json!({"type":"text","text":""}),
+                    ));
+                    out.push(anthropic_content_block_delta(
+                        index,
+                        json!({"type":"text_delta","text":text}),
+                    ));
+                    out.push(anthropic_content_block_stop(index));
+                    self.claude_mark_rendered(item);
+                }
+            }
+            Some("reasoning") if self.claude_thinking => {
+                let text = anthropic_reasoning_item_text(item);
+                if !text.is_empty() {
+                    let index = self.claude_alloc_index();
+                    out.push(anthropic_content_block_start(
+                        index,
+                        json!({"type":"thinking","thinking":""}),
+                    ));
+                    out.push(anthropic_content_block_delta(
+                        index,
+                        json!({"type":"thinking_delta","thinking":text}),
+                    ));
+                    out.push(anthropic_content_block_stop(index));
+                    self.claude_mark_rendered(item);
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn claude_close_open(&mut self, output_index: u64) -> Option<Value> {
+        let block = self.claude_open.remove(&output_index)?;
+        self.claude_rendered.insert(output_index);
+        Some(anthropic_content_block_stop(block.index))
+    }
+
+    fn claude_anthropic_stop_reason(&self, response: &Value, has_tool_use: bool) -> &'static str {
+        if has_tool_use {
+            return "tool_use";
+        }
+        let status = response
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let incomplete = response
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if status == "incomplete" || !incomplete.is_empty() {
+            if matches!(incomplete.as_str(), "content_filter" | "safety") {
+                "refusal"
+            } else {
+                "max_tokens"
+            }
+        } else {
+            "end_turn"
+        }
+    }
+
+    fn claude_terminal(&mut self, payload: &Value) -> Vec<Value> {
+        let response = payload.get("response").filter(|value| value.is_object());
+        let response = response.unwrap_or(payload);
+        let mut out = Vec::new();
+        for output_index in self.claude_open.keys().copied().collect::<Vec<_>>() {
+            if let Some(stop) = self.claude_close_open(output_index) {
+                out.push(stop);
+            }
+        }
+        let output_items = response
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for item in &output_items {
+            out.extend(self.claude_synthesize_item(item));
+        }
+        let mut has_tool_use = self.claude_has_tool_use;
+        if !has_tool_use {
+            has_tool_use = output_items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
+        }
+        if let Some(usage) = response.get("usage").filter(|usage| usage.is_object()) {
+            self.prompt_tokens = number(
+                usage
+                    .get("input_tokens")
+                    .or_else(|| usage.get("prompt_tokens")),
+            );
+            self.completion_tokens = number(
+                usage
+                    .get("output_tokens")
+                    .or_else(|| usage.get("completion_tokens")),
+            );
+        }
+        let usage = anthropic_usage_from_responses(response.get("usage"));
+        let stop_reason = self.claude_anthropic_stop_reason(response, has_tool_use);
+        out.push(json!({
+            "type":"message_delta",
+            "delta":{"stop_reason":stop_reason},
+            "usage":usage,
+        }));
+        out.push(json!({"type":"message_stop"}));
+        self.terminal = true;
+        out
+    }
+
+    /// Incrementally translate Responses SSE events into Anthropic SSE frames for
+    /// a ``/v1/messages`` caller (mirrors the Python ``anthropic_events`` stream
+    /// state machine).
+    fn responses_to_anthropic(&mut self, value: &Value) -> Vec<Value> {
+        let event = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match event {
+            "response.output_text.delta" => {
+                let text = value.get("delta").and_then(Value::as_str).unwrap_or("");
+                if text.is_empty() {
+                    return Vec::new();
+                }
+                let output_index = value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let mut out = Vec::new();
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.claude_open.entry(output_index)
+                {
+                    let index = self.claude_next_index;
+                    self.claude_next_index += 1;
+                    entry.insert(ClaudeOpenBlock {
+                        kind: 0,
+                        index,
+                        args_streamed: false,
+                    });
+                    out.push(anthropic_content_block_start(
+                        index,
+                        json!({"type":"text","text":""}),
+                    ));
+                }
+                if let Some(block) = self.claude_open.get(&output_index) {
+                    if block.kind == 0 {
+                        out.push(anthropic_content_block_delta(
+                            block.index,
+                            json!({"type":"text_delta","text":text}),
+                        ));
+                    }
+                }
+                out
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if !self.claude_thinking {
+                    return Vec::new();
+                }
+                let text = value.get("delta").and_then(Value::as_str).unwrap_or("");
+                if text.is_empty() {
+                    return Vec::new();
+                }
+                let output_index = value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let mut out = Vec::new();
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.claude_open.entry(output_index)
+                {
+                    let index = self.claude_next_index;
+                    self.claude_next_index += 1;
+                    entry.insert(ClaudeOpenBlock {
+                        kind: 1,
+                        index,
+                        args_streamed: false,
+                    });
+                    out.push(anthropic_content_block_start(
+                        index,
+                        json!({"type":"thinking","thinking":""}),
+                    ));
+                }
+                if let Some(block) = self.claude_open.get(&output_index) {
+                    if block.kind == 1 {
+                        out.push(anthropic_content_block_delta(
+                            block.index,
+                            json!({"type":"thinking_delta","thinking":text}),
+                        ));
+                    }
+                }
+                out
+            }
+            "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
+                let output_index = value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                match self.claude_open.get(&output_index).map(|block| block.kind) {
+                    Some(1) => self
+                        .claude_close_open(output_index)
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let partial = value.get("delta").and_then(Value::as_str).unwrap_or("");
+                if partial.is_empty() {
+                    return Vec::new();
+                }
+                let output_index = value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let mut out = Vec::new();
+                if let Some(block) = self.claude_open.get_mut(&output_index) {
+                    if block.kind == 2 {
+                        block.args_streamed = true;
+                        out.push(anthropic_content_block_delta(
+                            block.index,
+                            json!({"type":"input_json_delta","partial_json":partial}),
+                        ));
+                    }
+                }
+                out
+            }
+            "response.output_item.added"
+                if value.pointer("/item/type").and_then(Value::as_str) == Some("function_call") =>
+            {
+                let output_index = value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if self.claude_open.contains_key(&output_index) {
+                    return Vec::new();
+                }
+                let call_id = value
+                    .pointer("/item/call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("call");
+                let name = value
+                    .pointer("/item/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if name.is_empty() {
+                    return Vec::new();
+                }
+                let index = self.claude_alloc_index();
+                self.claude_open.insert(
+                    output_index,
+                    ClaudeOpenBlock {
+                        kind: 2,
+                        index,
+                        args_streamed: false,
+                    },
+                );
+                self.claude_has_tool_use = true;
+                vec![anthropic_content_block_start(
+                    index,
+                    json!({"type":"tool_use","id":call_id,"name":name,"input":{}}),
+                )]
+            }
+            "response.output_item.done" => {
+                let Some(item) = value.get("item") else {
+                    return Vec::new();
+                };
+                let output_index = value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let mut out = Vec::new();
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                match item_type {
+                    "function_call" => {
+                        let open_kind = self.claude_open.get(&output_index).map(|block| block.kind);
+                        if open_kind == Some(2) {
+                            let arguments =
+                                item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                            if !arguments.is_empty() {
+                                let args_streamed = self
+                                    .claude_open
+                                    .get(&output_index)
+                                    .map(|block| block.args_streamed)
+                                    .unwrap_or(true);
+                                if !args_streamed {
+                                    let index = self
+                                        .claude_open
+                                        .get(&output_index)
+                                        .map(|block| block.index)
+                                        .unwrap_or(0);
+                                    out.push(anthropic_content_block_delta(
+                                        index,
+                                        json!({"type":"input_json_delta","partial_json":arguments}),
+                                    ));
+                                }
+                            }
+                            if let Some(stop) = self.claude_close_open(output_index) {
+                                out.push(stop);
+                            }
+                            self.claude_mark_rendered(item);
+                        } else {
+                            out.extend(self.claude_synthesize_item(item));
+                        }
+                    }
+                    "message" => {
+                        let open_kind = self.claude_open.get(&output_index).map(|block| block.kind);
+                        if open_kind == Some(0) {
+                            if let Some(stop) = self.claude_close_open(output_index) {
+                                out.push(stop);
+                            }
+                            self.claude_mark_rendered(item);
+                        } else {
+                            out.extend(self.claude_synthesize_item(item));
+                        }
+                    }
+                    "reasoning" => {
+                        let open_kind = self.claude_open.get(&output_index).map(|block| block.kind);
+                        if open_kind == Some(1) {
+                            if let Some(stop) = self.claude_close_open(output_index) {
+                                out.push(stop);
+                            }
+                            self.claude_mark_rendered(item);
+                        } else if self.claude_thinking {
+                            out.extend(self.claude_synthesize_item(item));
+                        }
+                    }
+                    _ => {
+                        if let Some(stop) = self.claude_close_open(output_index) {
+                            out.push(stop);
+                        }
+                    }
+                }
+                out
+            }
+            "response.incomplete"
+                if value
+                    .get("response")
+                    .filter(|value| value.is_object())
+                    .is_some() =>
+            {
+                self.claude_terminal(value)
+            }
+            "response.completed"
+                if value
+                    .get("response")
+                    .filter(|value| value.is_object())
+                    .is_some() =>
+            {
+                self.claude_terminal(value)
+            }
+            "response.completed" | "response.failed" | "error" => {
+                let (status_code, detail) =
+                    crate::responses::responses_semantic_error(value, event);
+                self.terminal = true;
+                self.failure = Some(PrecommitFailure {
+                    status_code,
+                    detail: detail.clone(),
+                });
+                let error_type = value
+                    .pointer("/response/error/type")
+                    .or_else(|| value.pointer("/error/type"))
+                    .cloned()
+                    .unwrap_or_else(|| json!("stream_error"));
+                vec![json!({
+                    "type":"error",
+                    "error":{"type":error_type,"message":detail,"status_code":status_code},
+                })]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn gemini(&mut self, value: &Value) -> Vec<Value> {
@@ -1343,6 +2046,29 @@ impl StreamState {
     ) -> Result<(), String> {
         if self.output_protocol == OutputProtocol::Responses {
             for chunk in self.responses.finish() {
+                send_wire(tx, &chunk, self.output_protocol).await?;
+            }
+            return Ok(());
+        }
+        if self.output_protocol == OutputProtocol::Claude {
+            if self.terminal {
+                return Ok(());
+            }
+            for output_index in self.claude_open.keys().copied().collect::<Vec<_>>() {
+                if let Some(stop) = self.claude_close_open(output_index) {
+                    send_wire(tx, &stop, self.output_protocol).await?;
+                }
+            }
+            let mut terminal = vec![
+                json!({
+                    "type":"message_delta",
+                    "delta":{"stop_reason":"end_turn"},
+                    "usage":{"input_tokens":0,"output_tokens":0},
+                }),
+                json!({"type":"message_stop"}),
+            ];
+            self.terminal = true;
+            for chunk in terminal.drain(..) {
                 send_wire(tx, &chunk, self.output_protocol).await?;
             }
             return Ok(());
@@ -2274,6 +3000,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         );
         let body = axum::body::to_bytes(translation.response.into_body(), usize::MAX)
             .await
@@ -2598,5 +3325,165 @@ mod tests {
             serde_json::from_slice::<Value>(&frames[1]).unwrap(),
             json!({"b":{"c":2}})
         );
+    }
+
+    #[test]
+    fn responses_stream_maps_to_anthropic_sse_frames() {
+        let mut state =
+            StreamState::new_with_options("public-model", OutputProtocol::Claude, false);
+        state.claude_thinking = true;
+        let start = state.start_chunks();
+        assert_eq!(start.len(), 1);
+        assert_eq!(start[0]["type"], json!("message_start"));
+
+        let text = state.convert(
+            Protocol::Responses,
+            &json!({"type":"response.output_text.delta","output_index":0,"delta":"hello"}),
+        );
+        assert!(text
+            .iter()
+            .any(|frame| frame["type"] == "content_block_delta"));
+        assert!(text
+            .iter()
+            .any(|frame| frame.pointer("/delta/type") == Some(&json!("text_delta"))));
+
+        let completed = state.convert(
+            Protocol::Responses,
+            &json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "model":"gpt-5.2",
+                    "output":[{
+                        "id":"m0","type":"message","content":[{"type":"output_text","text":"hello"}]
+                    }],
+                    "usage":{"input_tokens":3,"output_tokens":4},
+                }
+            }),
+        );
+        assert!(completed
+            .iter()
+            .any(|frame| frame["type"] == "message_delta"));
+        assert!(completed
+            .iter()
+            .any(|frame| frame["type"] == "message_stop"));
+        assert!(state.terminal);
+
+        let mut thinking_state =
+            StreamState::new_with_options("public-model", OutputProtocol::Claude, false);
+        thinking_state.claude_thinking = true;
+        let reasoning = thinking_state.convert(
+            Protocol::Responses,
+            &json!({
+                "type":"response.completed",
+                "response":{
+                    "status":"completed",
+                    "model":"gpt-5.2",
+                    "output":[
+                        {"id":"m0","type":"message","content":[{"type":"output_text","text":"hi"}]},
+                        {"id":"rs0","type":"reasoning","summary":[{"type":"summary_text","text":"think"}]}
+                    ],
+                    "usage":{"input_tokens":1,"output_tokens":1},
+                }
+            }),
+        );
+        assert!(reasoning
+            .iter()
+            .any(|frame| frame.pointer("/content_block/type") == Some(&json!("thinking"))));
+    }
+
+    #[test]
+    fn chat_stream_maps_to_anthropic_sse_frames() {
+        let mut state =
+            StreamState::new_with_options("public-model", OutputProtocol::Claude, false);
+        state.claude_thinking = true;
+        let start = state.start_chunks();
+        assert_eq!(start.len(), 1);
+        assert_eq!(start[0]["type"], json!("message_start"));
+
+        let reasoning = state.convert(
+            Protocol::Chat,
+            &json!({
+                "id":"chatcmpl-1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"reasoning_content":"think"},"finish_reason":null}]
+            }),
+        );
+        assert!(reasoning
+            .iter()
+            .any(|frame| frame.pointer("/content_block/type") == Some(&json!("thinking"))));
+        assert!(reasoning
+            .iter()
+            .any(|frame| frame.pointer("/delta/type") == Some(&json!("thinking_delta"))));
+
+        let text = state.convert(
+            Protocol::Chat,
+            &json!({
+                "id":"chatcmpl-1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]
+            }),
+        );
+        assert!(text
+            .iter()
+            .any(|frame| frame.pointer("/content_block/type") == Some(&json!("text"))));
+        assert!(text
+            .iter()
+            .any(|frame| frame.pointer("/delta/type") == Some(&json!("text_delta"))));
+
+        let tools = state.convert(
+            Protocol::Chat,
+            &json!({
+                "id":"chatcmpl-1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"lookup","arguments":"{\"q\":"}}]},"finish_reason":null}]
+            }),
+        );
+        assert!(tools
+            .iter()
+            .any(|frame| frame.pointer("/content_block/type") == Some(&json!("tool_use"))));
+        assert!(tools
+            .iter()
+            .any(|frame| frame.pointer("/delta/type") == Some(&json!("input_json_delta"))));
+
+        let finish = state.convert(
+            Protocol::Chat,
+            &json!({
+                "id":"chatcmpl-1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":3,"completion_tokens":4}
+            }),
+        );
+        let delta = finish
+            .iter()
+            .find(|frame| frame["type"] == "message_delta")
+            .expect("message_delta");
+        assert_eq!(delta["delta"]["stop_reason"], json!("tool_use"));
+        assert_eq!(delta["usage"]["input_tokens"], json!(3));
+        assert_eq!(delta["usage"]["output_tokens"], json!(4));
+        assert!(finish.iter().any(|frame| frame["type"] == "message_stop"));
+        assert!(state.terminal);
+    }
+
+    #[test]
+    fn chat_stream_maps_length_finish_reason_to_max_tokens() {
+        let mut state =
+            StreamState::new_with_options("public-model", OutputProtocol::Claude, false);
+        state.convert(
+            Protocol::Chat,
+            &json!({
+                "id":"chatcmpl-1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]
+            }),
+        );
+        let finish = state.convert(
+            Protocol::Chat,
+            &json!({
+                "id":"chatcmpl-1","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{},"finish_reason":"length"}]
+            }),
+        );
+        let delta = finish
+            .iter()
+            .find(|frame| frame["type"] == "message_delta")
+            .expect("message_delta");
+        assert_eq!(delta["delta"]["stop_reason"], json!("max_tokens"));
     }
 }

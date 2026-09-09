@@ -68,6 +68,8 @@ enum ResponseAdapter {
     Passthrough,
     Search,
     ResponsesToChat,
+    ResponsesToClaude,
+    ChatToClaude,
     GeminiToChat,
     ClaudeToChat,
     CohereToChat,
@@ -94,6 +96,7 @@ struct PreparedAttempt {
     original_model: String,
     downstream_protocol: DownstreamProtocol,
     chat_stream_include_usage: bool,
+    anthropic_thinking: bool,
     provider_key: String,
     estimated_video_tokens: Option<i64>,
 }
@@ -2076,6 +2079,13 @@ fn build_attempt(
             .and_then(|payload| payload.pointer("/stream_options/include_usage"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+    let anthropic_thinking = path == "/v1/messages"
+        && input
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.pointer("/thinking/type"))
+            .and_then(Value::as_str)
+            == Some("enabled");
     let is_search = matches!(path, "/search" | "/v1/search");
     let jina_search = is_search
         && (provider.name.eq_ignore_ascii_case("jina")
@@ -2147,6 +2157,7 @@ fn build_attempt(
             original_model: original_model.to_owned(),
             downstream_protocol,
             chat_stream_include_usage,
+            anthropic_thinking,
             provider_key: provider_key.to_owned(),
             estimated_video_tokens: None,
         });
@@ -2184,6 +2195,28 @@ fn build_attempt(
             (
                 responses_url(provider.base_url.as_ref()),
                 ResponseAdapter::ResponsesToChat,
+                provider_stream,
+            )
+        }
+        "codex" if path == "/v1/messages" => {
+            payload = claude_to_responses(&payload, original_model, &engine)?;
+            (
+                responses_url(provider.base_url.as_ref()),
+                ResponseAdapter::ResponsesToClaude,
+                provider_stream,
+            )
+        }
+        "gpt" | "openrouter" | "azure" | "azure-databricks" | "cloudflare"
+            if path == "/v1/messages"
+                && provider
+                    .base_url
+                    .to_ascii_lowercase()
+                    .contains("/responses") =>
+        {
+            payload = claude_to_responses(&payload, original_model, &engine)?;
+            (
+                responses_url(provider.base_url.as_ref()),
+                ResponseAdapter::ResponsesToClaude,
                 provider_stream,
             )
         }
@@ -2285,6 +2318,24 @@ fn build_attempt(
                 ResponseAdapter::Passthrough,
                 provider_stream,
             )
+        }
+        _ if path == "/v1/messages" => {
+            payload = claude_to_chat_request(&payload)?;
+            set_model(&mut payload, original_model)?;
+            if engine.eq_ignore_ascii_case("azure") {
+                normalize_azure_token_limit(&mut payload, original_model);
+                (
+                    azure_chat_url(provider.base_url.as_ref(), original_model)?,
+                    ResponseAdapter::ChatToClaude,
+                    provider_stream,
+                )
+            } else {
+                (
+                    endpoint_url(provider.base_url.as_ref(), "/v1/chat/completions", method, uri)?,
+                    ResponseAdapter::ChatToClaude,
+                    provider_stream,
+                )
+            }
         }
         "lingjing" if path == "/v1/video/tasks" => {
             payload = content_generation_to_lingjing(&payload, original_model)?;
@@ -2454,6 +2505,7 @@ fn build_attempt(
         original_model: original_model.to_owned(),
         downstream_protocol,
         chat_stream_include_usage,
+        anthropic_thinking,
         provider_key: provider_key.to_owned(),
         estimated_video_tokens,
     })
@@ -3032,9 +3084,19 @@ async fn send_attempt(
                 .to_string(),
             )
         });
-        let mut output = Response::new(Body::from(body));
+        let response_body = if outputs_claude(prepared.adapter) {
+            anthropic_error_body_from_bytes(&body, status.as_u16())
+        } else {
+            body
+        };
+        let mut output = Response::new(Body::from(response_body));
         *output.status_mut() = status;
         *output.headers_mut() = headers;
+        if outputs_claude(prepared.adapter) {
+            output
+                .headers_mut()
+                .insert("content-type", HeaderValue::from_static("application/json"));
+        }
         output
             .headers_mut()
             .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
@@ -3072,6 +3134,8 @@ async fn send_attempt(
     if prepared.upstream_stream {
         let protocol = match prepared.adapter {
             ResponseAdapter::ResponsesToChat => StreamProtocol::Responses,
+            ResponseAdapter::ResponsesToClaude => StreamProtocol::Responses,
+            ResponseAdapter::ChatToClaude => StreamProtocol::Chat,
             ResponseAdapter::GeminiToChat => StreamProtocol::Gemini,
             ResponseAdapter::ClaudeToChat
                 if provider.engine.eq_ignore_ascii_case("vertex-claude") =>
@@ -3086,8 +3150,9 @@ async fn send_attempt(
             ResponseAdapter::Passthrough => StreamProtocol::Chat,
             ResponseAdapter::Search => unreachable!(),
         };
-        let output_protocol = if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat
-        {
+        let output_protocol = if outputs_claude(prepared.adapter) {
+            StreamOutputProtocol::Claude
+        } else if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
             StreamOutputProtocol::Responses
         } else {
             StreamOutputProtocol::Chat
@@ -3112,14 +3177,20 @@ async fn send_attempt(
                 response: None,
             })?
         } else {
+            let translate_model = if outputs_claude(prepared.adapter) {
+                &prepared.original_model
+            } else {
+                &prepared.request_model
+            };
             provider_stream::translate(
                 response,
                 protocol,
                 output_protocol,
-                prepared.request_model.clone(),
+                translate_model.clone(),
                 prepared.chat_stream_include_usage,
                 timeouts.idle,
                 timeouts.total,
+                prepared.anthropic_thinking,
             )
         };
         translation
@@ -3220,6 +3291,16 @@ async fn send_attempt(
     let normalized = match prepared.adapter {
         ResponseAdapter::Search => normalize_search_response(&prepared.url, &upstream),
         ResponseAdapter::ResponsesToChat => responses_to_chat(&upstream, &prepared.original_model),
+        ResponseAdapter::ResponsesToClaude => claude_message_from_responses(
+            &upstream,
+            &prepared.original_model,
+            prepared.anthropic_thinking,
+        ),
+        ResponseAdapter::ChatToClaude => claude_message_from_chat(
+            &upstream,
+            &prepared.original_model,
+            prepared.anthropic_thinking,
+        ),
         ResponseAdapter::GeminiToChat => gemini_to_chat(&upstream, &prepared.original_model),
         ResponseAdapter::ClaudeToChat => claude_to_chat(&upstream, &prepared.original_model),
         ResponseAdapter::CohereToChat => cohere_to_chat(&upstream, &prepared.original_model),
@@ -3253,7 +3334,9 @@ async fn send_attempt(
     }
     let usage = usage(&normalized);
     let mut output = if prepared.downstream_stream {
-        if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
+        if outputs_claude(prepared.adapter) {
+            synthetic_claude_stream(&normalized)
+        } else if prepared.downstream_protocol == DownstreamProtocol::ResponsesCompat {
             synthetic_responses_stream(normalized)
         } else {
             synthetic_chat_stream(normalized)
@@ -4786,6 +4869,730 @@ fn gemini_to_chat(value: &Value, model: &str) -> Value {
             "total_tokens":usage.get("totalTokenCount").cloned().unwrap_or(json!(0)),
         },
     })
+}
+
+fn claude_thinking_effort(budget: Option<&Value>) -> &'static str {
+    match budget.and_then(Value::as_i64) {
+        Some(budget) if budget >= 16000 => "high",
+        Some(budget) if budget >= 4000 => "medium",
+        Some(_) => "low",
+        None => "medium",
+    }
+}
+
+fn claude_media_data_url(source: &Map<String, Value>) -> Option<String> {
+    match source.get("type").and_then(Value::as_str).unwrap_or("") {
+        "base64" => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
+            let data = source.get("data").and_then(Value::as_str).unwrap_or("");
+            Some(format!("data:{media_type};base64,{data}"))
+        }
+        "url" | "http" | "https" => source.get("url").and_then(Value::as_str).map(str::to_owned),
+        _ => None,
+    }
+}
+
+fn claude_block_output_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                if item.get("type").and_then(Value::as_str) == Some("text") {
+                    item.get("text").and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn claude_tools_to_chat(tools: &Value) -> Value {
+    Value::Array(
+        tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| {
+                let tool = tool.as_object()?;
+                let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() {
+                    return None;
+                }
+                let mut function = Map::new();
+                function.insert("name".into(), Value::String(name.to_owned()));
+                if let Some(description) = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    function.insert("description".into(), Value::String(description.to_owned()));
+                }
+                function.insert(
+                    "parameters".into(),
+                    tool.get("input_schema")
+                        .cloned()
+                        .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                );
+                Some(json!({"type":"function","function":Value::Object(function)}))
+            })
+            .collect(),
+    )
+}
+
+fn claude_tool_choice_to_chat(choice: &Value) -> Option<Value> {
+    let root = choice.as_object()?;
+    match root.get("type").and_then(Value::as_str) {
+        Some("auto") => Some(json!("auto")),
+        Some("any") => Some(json!("required")),
+        Some("none") | Some("disabled") => Some(json!("none")),
+        Some("tool") => {
+            let name = root.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() {
+                Some(json!("required"))
+            } else {
+                Some(json!({"type":"function","function":{"name":name}}))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Normalize an Anthropic ``/v1/messages`` body into the OpenAI chat shape that
+/// ``chat_to_responses`` consumes, preserving tool_use/tool_result ordering and
+/// mapping base64 images into data-URL ``image_url`` parts.
+fn claude_to_chat_request(input: &Value) -> Result<Value, String> {
+    let root = input
+        .as_object()
+        .ok_or_else(|| "messages request body must be an object".to_owned())?;
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(system) = root.get("system") {
+        let text_parts = if let Some(text) = system.as_str() {
+            if text.trim().is_empty() {
+                vec![]
+            } else {
+                vec![text.to_owned()]
+            }
+        } else if let Some(blocks) = system.as_array() {
+            blocks
+                .iter()
+                .filter_map(|block| {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        block.get("text").and_then(Value::as_str).map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        if !text_parts.is_empty() {
+            messages.push(json!({"role":"system","content":text_parts.join("\n")}));
+        }
+    }
+    for message in root
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(message) = message.as_object() else {
+            continue;
+        };
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let content = message.get("content");
+        let blocks = match content {
+            Some(Value::String(text)) if !text.is_empty() => {
+                vec![json!({"type":"text","text":text})]
+            }
+            Some(Value::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        };
+        if role == "user" {
+            let mut user_parts: Vec<Value> = Vec::new();
+            for block in blocks {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text") {
+                            user_parts.push(json!({"type":"text","text":text}));
+                        }
+                    }
+                    Some("image") => {
+                        if let Some(url) = block
+                            .get("source")
+                            .and_then(Value::as_object)
+                            .and_then(claude_media_data_url)
+                        {
+                            user_parts.push(json!({"type":"image_url","image_url":{"url":url}}));
+                        }
+                    }
+                    Some("tool_result") => {
+                        if !user_parts.is_empty() {
+                            messages.push(json!({"role":"user","content":user_parts}));
+                            user_parts = Vec::new();
+                        }
+                        let tool_use_id = block
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let mut output_value = claude_block_output_text(block.get("content"));
+                        if block
+                            .get("is_error")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            if output_value.trim().is_empty() {
+                                output_value = "Error: tool invocation failed".into();
+                            } else {
+                                output_value = format!("Error: {output_value}");
+                            }
+                        }
+                        messages.push(json!({
+                            "role":"tool",
+                            "tool_call_id":tool_use_id,
+                            "content":output_value,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            if !user_parts.is_empty() {
+                messages.push(json!({"role":"user","content":user_parts}));
+            }
+        } else if role == "assistant" {
+            let mut assistant_text: Vec<String> = Vec::new();
+            let mut tool_calls: Vec<Value> = Vec::new();
+            for block in blocks {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                assistant_text.push(text.to_owned());
+                            }
+                        }
+                    }
+                    Some("tool_use") => tool_calls.push(json!({
+                        "id":block.get("id").cloned().unwrap_or(Value::Null),
+                        "type":"function",
+                        "function":{
+                            "name":block.get("name").cloned().unwrap_or(Value::Null),
+                            "arguments":serde_json::to_string(
+                                block.get("input").unwrap_or(&json!({})),
+                            )
+                            .unwrap_or_else(|_| "{}".into()),
+                        }
+                    })),
+                    _ => {}
+                }
+            }
+            let mut assistant = Map::new();
+            assistant.insert("role".into(), Value::String("assistant".into()));
+            let content_value = if assistant_text.is_empty() {
+                Value::Null
+            } else {
+                Value::String(assistant_text.join("\n"))
+            };
+            assistant.insert("content".into(), content_value);
+            if !tool_calls.is_empty() {
+                assistant.insert("tool_calls".into(), Value::Array(tool_calls));
+            }
+            messages.push(Value::Object(assistant));
+        }
+    }
+    let mut output = Map::new();
+    output.insert("messages".into(), Value::Array(messages));
+    if let Some(tools) = root.get("tools") {
+        output.insert("tools".into(), claude_tools_to_chat(tools));
+    }
+    if let Some(choice) = root.get("tool_choice") {
+        if let Some(converted) = claude_tool_choice_to_chat(choice) {
+            output.insert("tool_choice".into(), converted);
+        }
+    }
+    for name in ["max_tokens", "temperature", "top_p", "stream"] {
+        if let Some(value) = root.get(name) {
+            output.insert(name.into(), value.clone());
+        }
+    }
+    Ok(Value::Object(output))
+}
+
+/// Compile an Anthropic ``/v1/messages`` request into the upstream Responses
+/// body for a ``gpt``-Responses or ``codex`` provider (mirrors the Python
+/// messages-to-responses translator).
+fn claude_to_responses(input: &Value, original_model: &str, engine: &str) -> Result<Value, String> {
+    let chat = claude_to_chat_request(input)?;
+    let mut output = chat_to_responses(&chat, original_model)?;
+    let Some(map) = output.as_object_mut() else {
+        return Ok(output);
+    };
+    let thinking_enabled =
+        input.pointer("/thinking/type").and_then(Value::as_str) == Some("enabled");
+    let is_codex = engine.eq_ignore_ascii_case("codex");
+    if thinking_enabled || is_codex {
+        let effort = claude_thinking_effort(input.pointer("/thinking/budget_tokens")).to_owned();
+        let reasoning = if is_codex {
+            json!({"effort":effort,"summary":"auto"})
+        } else {
+            json!({"effort":effort})
+        };
+        map.insert("reasoning".into(), reasoning);
+        let include = if is_codex {
+            vec!["reasoning.encrypted_content".to_owned()]
+        } else {
+            vec!["reasoning.summary_text".to_owned()]
+        };
+        map.insert(
+            "include".into(),
+            Value::Array(include.into_iter().map(Value::String).collect()),
+        );
+    }
+    if is_codex {
+        map.insert("parallel_tool_calls".into(), Value::Bool(true));
+    }
+    Ok(output)
+}
+
+fn reasoning_item_text(item: &Value) -> String {
+    match item.get("summary") {
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Value::String(text)) => text.clone(),
+        _ => String::new(),
+    }
+}
+
+fn claude_usage_from_responses(usage: Option<&Value>) -> Value {
+    let Some(usage) = usage else {
+        return json!({"input_tokens":0,"output_tokens":0});
+    };
+    let input_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let cached_tokens = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let mut out = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    });
+    if cached_tokens > 0 {
+        out.as_object_mut()
+            .expect("usage object")
+            .insert("cache_read_input_tokens".into(), json!(cached_tokens));
+    }
+    if reasoning_tokens > 0 {
+        out.as_object_mut().expect("usage object").insert(
+            "output_tokens_details".into(),
+            json!({"thinking_tokens":reasoning_tokens}),
+        );
+    }
+    out
+}
+
+/// Build a non-streaming Anthropic message object from a Responses response.
+fn claude_message_from_responses(value: &Value, model: &str, thinking_enabled: bool) -> Value {
+    let response = value
+        .get("response")
+        .filter(|item| item.is_object())
+        .unwrap_or(value);
+    let output_items = response
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut content: Vec<Value> = Vec::new();
+    let mut has_tool_use = false;
+    for item in &output_items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for part in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if !matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some("output_text") | Some("text")
+                    ) {
+                        continue;
+                    }
+                    if let Some(text) = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|t| !t.is_empty())
+                    {
+                        content.push(json!({"type":"text","text":text}));
+                    }
+                }
+            }
+            Some("function_call") => {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                has_tool_use = true;
+                let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                let input = serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({}));
+                content.push(json!({"type":"tool_use","id":call_id,"name":name,"input":input}));
+            }
+            Some("reasoning") if thinking_enabled => {
+                let text = reasoning_item_text(item);
+                if !text.is_empty() {
+                    content.push(json!({"type":"thinking","thinking":text}));
+                }
+            }
+            _ => {}
+        }
+    }
+    let status = response
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let incomplete = response
+        .pointer("/incomplete_details/reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let stop_reason = if has_tool_use {
+        "tool_use"
+    } else if status == "incomplete" || !incomplete.is_empty() {
+        if matches!(incomplete.as_str(), "content_filter" | "safety") {
+            "refusal"
+        } else {
+            "max_tokens"
+        }
+    } else {
+        "end_turn"
+    };
+    let usage = claude_usage_from_responses(response.get("usage"));
+    let id = format!(
+        "msg_{:x}",
+        Sha256::digest(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_le_bytes()
+        )
+    );
+    let response_model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(model);
+    json!({
+        "id": id,
+        "type":"message",
+        "role":"assistant",
+        "model":response_model,
+        "content":content,
+        "stop_reason":stop_reason,
+        "stop_sequence":Value::Null,
+        "usage":usage,
+    })
+}
+
+fn outputs_claude(adapter: ResponseAdapter) -> bool {
+    matches!(
+        adapter,
+        ResponseAdapter::ResponsesToClaude | ResponseAdapter::ChatToClaude
+    )
+}
+
+/// Build a non-streaming Anthropic message object from a chat/completions response.
+fn claude_message_from_chat(value: &Value, model: &str, thinking_enabled: bool) -> Value {
+    let message = value
+        .pointer("/choices/0/message")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut content: Vec<Value> = Vec::new();
+    if thinking_enabled {
+        if let Some(text) = message
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            content.push(json!({"type":"thinking","thinking":text}));
+        }
+    }
+    if let Some(text) = message
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        content.push(json!({"type":"text","text":text}));
+    }
+    let mut has_tool_use = false;
+    for call in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = call
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        has_tool_use = true;
+        let call_id = call.get("id").and_then(Value::as_str).unwrap_or("");
+        let arguments = call
+            .pointer("/function/arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+        let input = serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({}));
+        content.push(json!({"type":"tool_use","id":call_id,"name":name,"input":input}));
+    }
+    let finish_reason = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let stop_reason = if has_tool_use {
+        "tool_use"
+    } else {
+        match finish_reason {
+            "length" => "max_tokens",
+            "content_filter" => "refusal",
+            _ => "end_turn",
+        }
+    };
+    let usage = claude_usage_from_responses(value.get("usage"));
+    let id = format!(
+        "msg_{:x}",
+        Sha256::digest(
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .as_bytes()
+        )
+    );
+    let response_model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(model);
+    json!({
+        "id": id,
+        "type":"message",
+        "role":"assistant",
+        "model":response_model,
+        "content":content,
+        "stop_reason":stop_reason,
+        "stop_sequence":Value::Null,
+        "usage":usage,
+    })
+}
+
+fn anthropic_error_type_from_openai(error_type: Option<&str>, status: u16) -> &'static str {
+    match error_type {
+        Some("invalid_request_error") | Some("bad_request") => "invalid_request_error",
+        Some("authentication_error") => "authentication_error",
+        Some("permission_error") => "permission_error",
+        Some("not_found_error") => "not_found_error",
+        Some("rate_limit_error") => "rate_limit_error",
+        Some("overloaded_error") => "overloaded_error",
+        Some("timeout_error") | Some("server_error") | Some("api_error") => "api_error",
+        _ if status == 401 || status == 403 => "authentication_error",
+        _ if status == 404 => "not_found_error",
+        _ if status == 429 => "rate_limit_error",
+        _ if status >= 500 => "api_error",
+        _ => "invalid_request_error",
+    }
+}
+
+fn anthropic_error_from_openai(raw: &Value, status: u16) -> Value {
+    let error_object = raw.get("error").filter(|value| value.is_object()).cloned();
+    let error_object = error_object.unwrap_or_else(|| json!({}));
+    let message = error_object
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|message| {
+            let param = error_object.get("param").and_then(Value::as_str);
+            match param {
+                Some(param) if !param.trim().is_empty() => {
+                    format!("{message} (parameter: {param})")
+                }
+                _ => message.to_owned(),
+            }
+        })
+        .unwrap_or_else(|| format!("Upstream provider error (status {status})"));
+    let error_type =
+        anthropic_error_type_from_openai(error_object.get("type").and_then(Value::as_str), status);
+    json!({
+        "type":"error",
+        "error":{"type":error_type,"message":message},
+    })
+}
+
+fn anthropic_error_body_from_bytes(body: &[u8], status: u16) -> Bytes {
+    let parsed = serde_json::from_slice::<Value>(body).unwrap_or_else(|_| json!({}));
+    let error = anthropic_error_from_openai(&parsed, status);
+    let wire = serde_json::to_vec(&error).unwrap_or_else(|_| b"{}".to_vec());
+    Bytes::from(wire)
+}
+
+fn push_anthropic_frame(wire: &mut String, value: &Value) {
+    if let Some(event) = value.get("type").and_then(Value::as_str) {
+        if !event.is_empty() {
+            wire.push_str("event: ");
+            wire.push_str(event);
+            wire.push('\n');
+        }
+    }
+    wire.push_str("data: ");
+    if let Ok(serialized) = serde_json::to_string(value) {
+        wire.push_str(&serialized);
+    }
+    wire.push_str("\n\n");
+}
+
+/// Stream a single translated Anthropic message object as a complete Anthropic
+/// SSE sequence (used when a streamed request was answered non-streaming).
+fn synthetic_claude_stream(message: &Value) -> Response<Body> {
+    let mut wire = String::new();
+    let id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("msg_{}", unix_seconds()));
+    let model = message.get("model").cloned().unwrap_or(Value::Null);
+    let usage = message
+        .get("usage")
+        .cloned()
+        .unwrap_or_else(|| json!({"input_tokens":0,"output_tokens":0}));
+    push_anthropic_frame(
+        &mut wire,
+        &json!({
+            "type":"message_start",
+            "message":{
+                "id":id,
+                "type":"message",
+                "role":"assistant",
+                "model":model,
+                "content":[],
+                "stop_reason":Value::Null,
+                "stop_sequence":Value::Null,
+                "usage":{"input_tokens":0,"output_tokens":0},
+            },
+        }),
+    );
+    let content = message
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for (index, block) in content.iter().enumerate() {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                push_anthropic_frame(
+                    &mut wire,
+                    &json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
+                );
+                push_anthropic_frame(
+                    &mut wire,
+                    &json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":text}}),
+                );
+                push_anthropic_frame(
+                    &mut wire,
+                    &json!({"type":"content_block_stop","index":index}),
+                );
+            }
+            Some("tool_use") => {
+                let call_id = block.get("id").and_then(Value::as_str).unwrap_or("");
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                let input = serde_json::to_string(block.get("input").unwrap_or(&json!({})))
+                    .unwrap_or_else(|_| "{}".into());
+                push_anthropic_frame(
+                    &mut wire,
+                    &json!({
+                        "type":"content_block_start",
+                        "index":index,
+                        "content_block":{"type":"tool_use","id":call_id,"name":name,"input":{}},
+                    }),
+                );
+                push_anthropic_frame(
+                    &mut wire,
+                    &json!({
+                        "type":"content_block_delta",
+                        "index":index,
+                        "delta":{"type":"input_json_delta","partial_json":input},
+                    }),
+                );
+                push_anthropic_frame(
+                    &mut wire,
+                    &json!({"type":"content_block_stop","index":index}),
+                );
+            }
+            Some("thinking") => {
+                let thinking = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+                push_anthropic_frame(
+                    &mut wire,
+                    &json!({"type":"content_block_start","index":index,"content_block":{"type":"thinking","thinking":""}}),
+                );
+                push_anthropic_frame(
+                    &mut wire,
+                    &json!({"type":"content_block_delta","index":index,"delta":{"type":"thinking_delta","thinking":thinking}}),
+                );
+                push_anthropic_frame(
+                    &mut wire,
+                    &json!({"type":"content_block_stop","index":index}),
+                );
+            }
+            _ => {}
+        }
+    }
+    let stop_reason = message
+        .get("stop_reason")
+        .cloned()
+        .unwrap_or_else(|| json!("end_turn"));
+    push_anthropic_frame(
+        &mut wire,
+        &json!({"type":"message_delta","delta":{"stop_reason":stop_reason},"usage":usage}),
+    );
+    push_anthropic_frame(&mut wire, &json!({"type":"message_stop"}));
+    let mut response = Response::new(Body::from(wire));
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
 }
 
 fn claude_to_chat(value: &Value, model: &str) -> Value {
@@ -7035,5 +7842,127 @@ mod tests {
             .as_deref(),
             Some("last")
         );
+    }
+
+    #[test]
+    fn claude_to_responses_gpt_maps_anthropic_body() {
+        let body = json!({
+            "model":"claude-alias",
+            "system":"You are helpful.",
+            "max_tokens":2048,
+            "messages":[
+                {"role":"user","content":"what is this?"},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"Let me check"},
+                    {"type":"tool_use","id":"tu_1","name":"lookup","input":{"q":"x"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"tu_1","content":"found 42"}
+                ]}
+            ],
+            "tools":[{"name":"lookup","description":"find things","input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}],
+            "tool_choice":{"type":"auto"},
+            "thinking":{"type":"enabled","budget_tokens":8000},
+            "stream":true,
+        });
+        let responses = claude_to_responses(&body, "gpt-5.2", "gpt").unwrap();
+        assert_eq!(responses["model"], json!("gpt-5.2"));
+        assert_eq!(responses["reasoning"]["effort"], json!("medium"));
+        assert_eq!(responses["include"], json!(["reasoning.summary_text"]));
+        let input = responses["input"].as_array().unwrap();
+        // role/tool ordering: system -> user -> assistant(text+function_call) -> function_call_output
+        assert_eq!(input[2]["role"], json!("assistant"));
+        // assistant text must be a typed output_text item, never a bare string element
+        assert_eq!(
+            input[2]["content"],
+            json!([{"type":"output_text","text":"Let me check"}])
+        );
+        assert_eq!(input[3]["type"], json!("function_call"));
+        assert_eq!(input[4]["type"], json!("function_call_output"));
+        assert_eq!(responses["tools"][0]["name"], json!("lookup"));
+        assert_eq!(responses["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn claude_message_from_responses_maps_output_and_thinking() {
+        let payload = json!({
+            "id":"resp_1","status":"completed","model":"gpt-5.2",
+            "output":[
+                {"id":"m0","type":"message","role":"assistant","content":[{"type":"output_text","text":"Sure"}]},
+                {"id":"fc0","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}"}
+            ],
+            "usage":{"input_tokens":5,"output_tokens":9,"output_tokens_details":{"reasoning_tokens":2}}
+        });
+        let message = claude_message_from_responses(&payload, "gpt-5.2", false);
+        assert_eq!(message["type"], json!("message"));
+        assert_eq!(message["role"], json!("assistant"));
+        assert_eq!(message["stop_reason"], json!("tool_use"));
+        assert_eq!(message["content"][0]["type"], json!("text"));
+        assert_eq!(message["content"][1]["type"], json!("tool_use"));
+        assert_eq!(message["content"][1]["input"], json!({"q":1}));
+        assert_eq!(message["usage"]["input_tokens"], json!(5));
+        assert_eq!(
+            message["usage"]["output_tokens_details"]["thinking_tokens"],
+            json!(2)
+        );
+
+        let reasoning_payload = json!({
+            "id":"resp_2","status":"completed","model":"gpt-5.2",
+            "output":[
+                {"id":"rs0","type":"reasoning","summary":[{"type":"summary_text","text":"I thought"}]},
+                {"id":"m1","type":"message","content":[{"type":"output_text","text":"done"}]}
+            ],
+            "usage":{"input_tokens":1,"output_tokens":1}
+        });
+        assert!(
+            claude_message_from_responses(&reasoning_payload, "m", false)["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "thinking")
+        );
+        let with_thinking = claude_message_from_responses(&reasoning_payload, "m", true);
+        assert_eq!(with_thinking["content"][0]["type"], json!("thinking"));
+    }
+
+    #[test]
+    fn anthropic_error_translation_maps_openai_types() {
+        let error = anthropic_error_from_openai(
+            &json!({"error":{"message":"slow","type":"rate_limit_error","param":"q"}}),
+            429,
+        );
+        assert_eq!(error["type"], json!("error"));
+        assert_eq!(error["error"]["type"], json!("rate_limit_error"));
+        assert_eq!(error["error"]["message"], json!("slow (parameter: q)"));
+        let fallback = anthropic_error_from_openai(&json!({"foo":1}), 503);
+        assert_eq!(fallback["error"]["type"], json!("api_error"));
+    }
+
+    #[tokio::test]
+    async fn synthetic_claude_stream_emits_anthropic_events() {
+        let message = json!({
+            "id":"msg_1","type":"message","role":"assistant","model":"gpt-5.2",
+            "content":[
+                {"type":"text","text":"hello"},
+                {"type":"tool_use","id":"call_1","name":"lookup","input":{"q":1}}
+            ],
+            "stop_reason":"tool_use",
+            "usage":{"input_tokens":1,"output_tokens":2},
+        });
+        let response = synthetic_claude_stream(&message);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let wire = String::from_utf8(body.to_vec()).unwrap();
+        for token in [
+            "event: message_start",
+            "event: content_block_start",
+            "text_delta",
+            "input_json_delta",
+            "event: message_delta",
+            "event: message_stop",
+        ] {
+            assert!(wire.contains(token), "missing {token} in {wire}");
+        }
     }
 }
