@@ -27,6 +27,7 @@ export interface ApiKeyItem {
   model?: any[]
   role?: string
   preferences?: any
+  enabled?: boolean
   [key: string]: any
 }
 
@@ -87,6 +88,17 @@ export function ApiKeyDialog({
         <div className="flex-1 overflow-y-auto pl-1.5 pr-4">
           <div className="space-y-4 py-2">
             {/* ---------- 基础字段 ---------- */}
+            <SelectField
+              id="enabled"
+              label="enabled"
+              description="是否启用该 API Key，默认启用"
+              value={item.enabled !== false ? "true" : "false"}
+              onChange={(v) => update({ enabled: v === "true" })}
+              options={[
+                { value: "true", label: "启用" },
+                { value: "false", label: "禁用" },
+              ]}
+            />
             <FieldRow id="key-api" label="api" required description="API Key，用户请求 uni-api 需要 API key，必填">
               <div className="flex gap-1.5">
                 <Input

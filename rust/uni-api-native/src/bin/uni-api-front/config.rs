@@ -604,7 +604,12 @@ fn compile_provider(value: &Value) -> Option<Value> {
     if name.is_empty() {
         return None;
     }
-    // Keep the configured URL byte-for-byte.  The Python runtime also keeps
+    // Check if provider is enabled
+    let enabled = item.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+    // Keep the configured URL byte-for-byte. The Python runtime also keeps
     // proxy/gateway URLs here and derives the provider protocol separately.
     // Replacing a project-backed URL with the public Google endpoint would
     // silently bypass an operator-configured gateway.
@@ -820,6 +825,11 @@ fn compile_api_key(value: &Value, _database_disabled: bool) -> Option<Value> {
     let item = value.as_object()?;
     let token = scalar_string(item.get("api")?).trim().to_owned();
     if token.is_empty() {
+        return None;
+    }
+    // Check if api key is enabled
+    let enabled = item.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    if !enabled {
         return None;
     }
     let configured_rules = item

@@ -3246,12 +3246,32 @@ fn terminal_error_sha256(success: bool, detail: &str) -> Option<String> {
 fn provider_api_keys(value: &Value) -> Vec<String> {
     match value {
         Value::String(value) if !value.trim().is_empty() => vec![value.trim().to_owned()],
+        Value::Object(item) => {
+            let enabled = item.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            if enabled {
+                if let Some(key) = item.get("key").and_then(Value::as_str) {
+                    vec![key.trim().to_owned()]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        }
         Value::Array(values) => values
             .iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
+            .filter_map(|value| match value {
+                Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+                Value::Object(item) => {
+                    let enabled = item.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                    if enabled {
+                        item.get("key").and_then(Value::as_str).map(str::trim).map(str::to_owned)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
             .collect(),
         _ => Vec::new(),
     }

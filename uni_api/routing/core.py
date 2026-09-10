@@ -46,6 +46,8 @@ def build_routing_index(config: dict, api_list: list[str]) -> RoutingIndex:
         provider_name = provider.get("provider")
         if not provider_name:
             continue
+        if not provider.get("enabled", True):
+            continue
         model_dict = _provider_model_dict(provider)
         model_names = tuple(model_dict.keys())
         provider_by_name[provider_name] = provider

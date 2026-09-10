@@ -18,6 +18,7 @@ class ProviderConfig(BaseModel):
     only_request_types: Any = None
     exclude_request_types: Any = None
     exclude_request_rules: Any = None
+    enabled: bool = True
 
 
 class ApiKeyConfig(BaseModel):
@@ -27,6 +28,7 @@ class ApiKeyConfig(BaseModel):
     model: list[Any] = Field(default_factory=lambda: ["all"])
     preferences: dict[str, Any] = Field(default_factory=dict)
     weights: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
 
 
 class UniApiConfig(BaseModel):

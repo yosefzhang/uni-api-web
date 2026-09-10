@@ -379,13 +379,14 @@ export function OnlineConfig({ apiKey }: OnlineConfigProps) {
               </Card>
             ) : (
               providers.map((p, i) => (
-                <Card key={i} className="border">
+                <Card key={i} className={`border ${p.enabled === false ? "opacity-60" : ""}`}>
                   <CardContent className="p-0">
                     <div className="flex items-center justify-between gap-3 px-4 py-3 border-b">
                       <div className="flex items-center gap-2 flex-wrap min-w-0">
                         <Badge variant="outline">#{i + 1}</Badge>
                         <span className="font-medium">{p.provider || "未命名"}</span>
                         {p.engine && <Badge variant="secondary">{p.engine}</Badge>}
+                        {p.enabled === false && <Badge variant="destructive">已禁用</Badge>}
                       </div>
                       <div className="flex gap-1 shrink-0">
                         <Tooltip>
@@ -425,13 +426,14 @@ export function OnlineConfig({ apiKey }: OnlineConfigProps) {
               </Card>
             ) : (
               apiKeys.map((k, i) => (
-                <Card key={i} className="border">
+                <Card key={i} className={`border ${k.enabled === false ? "opacity-60" : ""}`}>
                   <CardContent className="p-0">
                     <div className="flex items-center justify-between gap-3 px-4 py-3 border-b">
                       <div className="flex items-center gap-2 flex-wrap min-w-0">
                         <Badge variant="outline">#{i + 1}</Badge>
                         <span className="font-mono text-sm break-all">{k.api || "未设置"}</span>
                         {k.role === "admin" && <Badge>admin</Badge>}
+                        {k.enabled === false && <Badge variant="destructive">已禁用</Badge>}
                         {k.preferences?.SCHEDULING_ALGORITHM && (
                           <Badge variant="secondary">{k.preferences.SCHEDULING_ALGORITHM}</Badge>
                         )}

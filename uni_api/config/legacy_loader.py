@@ -37,6 +37,14 @@ async def update_config(config_data: dict[str, Any], use_config_url: bool = Fals
     validate_config_data(config_data)
     config_data.setdefault("providers", [])
     config_data.setdefault("api_keys", [])
+    
+    # 先筛选出启用的 providers
+    enabled_providers = []
+    for provider in config_data["providers"]:
+        if provider.get("enabled", True):
+            enabled_providers.append(provider)
+    config_data["providers"] = enabled_providers
+    
     for index, provider in enumerate(config_data["providers"]):
         if provider.get("project_id"):
             if "google-vertex-ai" not in provider.get("base_url", ""):
@@ -49,18 +57,30 @@ async def update_config(config_data: dict[str, Any], use_config_url: bool = Fals
 
         provider_api = provider.get("api", None)
         if provider_api:
+            # 处理 provider api，支持字符串、列表、对象或对象列表
+            api_keys_list = []
             if isinstance(provider_api, int):
-                provider_api = str(provider_api)
-            if isinstance(provider_api, str):
+                api_keys_list = [str(provider_api)]
+            elif isinstance(provider_api, str):
+                api_keys_list = [provider_api]
+            elif isinstance(provider_api, list):
+                for key_item in provider_api:
+                    if isinstance(key_item, str):
+                        api_keys_list.append(key_item)
+                    elif isinstance(key_item, dict):
+                        if key_item.get("enabled", True):
+                            key = key_item.get("key")
+                            if key:
+                                api_keys_list.append(key)
+            elif isinstance(provider_api, dict):
+                if provider_api.get("enabled", True):
+                    key = provider_api.get("key")
+                    if key:
+                        api_keys_list = [key]
+            
+            if api_keys_list:
                 provider_api_circular_list[provider["provider"]] = ThreadSafeCircularList(
-                    items=[provider_api],
-                    rate_limit=safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
-                    schedule_algorithm=safe_get(provider, "preferences", "api_key_schedule_algorithm", default="round_robin"),
-                    provider_name=provider["provider"],
-                )
-            if isinstance(provider_api, list):
-                provider_api_circular_list[provider["provider"]] = ThreadSafeCircularList(
-                    items=provider_api,
+                    items=api_keys_list,
                     rate_limit=safe_get(provider, "preferences", "api_key_rate_limit", default={"default": "999999/min"}),
                     schedule_algorithm=safe_get(provider, "preferences", "api_key_schedule_algorithm", default="round_robin"),
                     provider_name=provider["provider"],
@@ -91,6 +111,13 @@ async def update_config(config_data: dict[str, Any], use_config_url: bool = Fals
 
         config_data["providers"][index] = provider
 
+    # 筛选启用的 api_keys
+    enabled_api_keys = []
+    for api_key in config_data["api_keys"]:
+        if api_key.get("enabled", True):
+            enabled_api_keys.append(api_key)
+    config_data["api_keys"] = enabled_api_keys
+    
     for index, api_key in enumerate(config_data["api_keys"]):
         if "api" in api_key:
             config_data["api_keys"][index]["api"] = str(api_key["api"])

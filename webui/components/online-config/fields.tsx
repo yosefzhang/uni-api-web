@@ -115,8 +115,11 @@ export function SelectField({
   )
 }
 
+// API Key 列表项类型（支持 key + enabled）
+export type ApiKeyItemType = string | { key: string; enabled?: boolean }
+
 // 字符串列表字段（动态增删 Input 行）
-// 每项是纯字符串，用于 api（Key 列表）、model（模型列表）、error_triggers 等
+// 每项是纯字符串，用于 model（模型列表）、error_triggers 等
 export function StringListField({
   label,
   required,
@@ -179,6 +182,116 @@ export function StringListField({
             variant="outline"
             size="sm"
             onClick={() => onChange([...items, ""])}
+          >
+            <Plus className="h-3.5 w-3.5 mr-1" />
+            添加一行
+          </Button>
+          {onAction && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onAction}
+              disabled={actionLoading}
+            >
+              {actionLoading ? (
+                <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+              ) : (
+                <RefreshCw className="h-3.5 w-3.5 mr-1" />
+              )}
+              {actionLabel}
+            </Button>
+          )}
+        </div>
+      </div>
+    </FieldRow>
+  )
+}
+
+// API Key 列表字段（支持 key + enabled 开关）
+// 用于 provider 的 api 字段
+export function ApiKeyListField({
+  label,
+  required,
+  description,
+  values,
+  onChange,
+  placeholder,
+  mono,
+  actionLabel,
+  onAction,
+  actionLoading,
+}: {
+  label: string
+  required?: boolean
+  description?: string
+  values: ApiKeyItemType[]
+  onChange: (next: ApiKeyItemType[]) => void
+  placeholder?: string
+  mono?: boolean
+  actionLabel?: string
+  onAction?: () => void
+  actionLoading?: boolean
+}) {
+  // 标准化为对象格式
+  const normalizeItem = (item: ApiKeyItemType): { key: string; enabled: boolean } => {
+    if (typeof item === "string") {
+      return { key: item, enabled: true }
+    }
+    return { key: item.key || "", enabled: item.enabled !== false }
+  }
+  
+  const items = values.length > 0 ? values.map(normalizeItem) : [{ key: "", enabled: true }]
+  
+  const updateItem = (index: number, updates: Partial<{ key: string; enabled: boolean }>) => {
+    const next = items.slice()
+    next[index] = { ...next[index], ...updates }
+    onChange(next)
+  }
+  
+  return (
+    <FieldRow label={label} required={required} description={description}>
+      <div className="space-y-1.5">
+        {items.map((item, i) => (
+          <div key={i} className="flex gap-1.5 items-center">
+            <div className="flex items-center gap-2 px-2 border rounded-md h-9 bg-muted/50">
+              <input
+                type="checkbox"
+                checked={item.enabled}
+                onChange={(e) => updateItem(i, { enabled: e.target.checked })}
+                className="w-4 h-4 rounded"
+              />
+              <span className="text-xs text-muted-foreground">启用</span>
+            </div>
+            <Input
+              value={item.key}
+              onChange={(e) => updateItem(i, { key: e.target.value })}
+              placeholder={placeholder}
+              className={`h-9 flex-1 ${mono ? "font-mono text-xs" : ""}`}
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-9 w-9 shrink-0 text-destructive hover:text-destructive"
+              onClick={() => {
+                if (items.length === 1) {
+                  onChange([{ key: "", enabled: true }])
+                } else {
+                  onChange(items.filter((_, idx) => idx !== i))
+                }
+              }}
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </div>
+        ))}
+        <div className="flex flex-wrap gap-1.5">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => onChange([...items, { key: "", enabled: true }])}
           >
             <Plus className="h-3.5 w-3.5 mr-1" />
             添加一行
@@ -423,19 +536,47 @@ export function KeyValueField({
 
 // ---------- 数据转换工具函数 ----------
 
-// api 字段：string | string[] → string[]
-export function apiToList(api: unknown): string[] {
+// api 字段：string | string[] | (string | { key: string; enabled?: boolean })[] → ApiKeyItemType[]
+export function apiToList(api: unknown): ApiKeyItemType[] {
   if (!api) return []
-  if (Array.isArray(api)) return api.map(String)
+  if (Array.isArray(api)) {
+    return api.map((item) => {
+      if (typeof item === "string") return item
+      if (item && typeof item === "object" && "key" in item) {
+        return item as { key: string; enabled?: boolean }
+      }
+      return String(item)
+    })
+  }
   return [String(api)]
 }
 
-// string[] → string | string[]（单元素返回 string，多元素返回数组）
-export function listToApi(list: string[]): string | string[] {
-  const filtered = list.map((s) => s.trim()).filter(Boolean)
-  if (filtered.length === 0) return ""
-  if (filtered.length === 1) return filtered[0]
-  return filtered
+// ApiKeyItemType[] → 配置格式（保留对象格式或字符串格式）
+export function listToApi(list: ApiKeyItemType[]): string | string[] | (string | { key: string; enabled?: boolean })[] {
+  // 过滤空 key
+  const filtered = list.filter((item) => {
+    if (typeof item === "string") return item.trim().length > 0
+    return item.key && item.key.trim().length > 0
+  })
+  
+  // 如果所有都是启用的对象，也可以简化为字符串，否则保留对象
+  const processed = filtered.map((item) => {
+    if (typeof item === "string") return item
+    if (item.enabled !== false) {
+      // 默认启用可以简化为字符串
+      return item.key
+    } else {
+      // 禁用的保留对象格式
+      return { key: item.key, enabled: false }
+    }
+  })
+  
+  if (processed.length === 0) return ""
+  if (processed.length === 1) {
+    const item = processed[0]
+    return typeof item === "string" ? item : item
+  }
+  return processed
 }
 
 // model 字段：(string | {key: value})[] → string[]（对象转 "key: value" 字符串）

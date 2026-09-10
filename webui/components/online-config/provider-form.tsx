@@ -18,23 +18,26 @@ import {
   StringListField,
   ModelListField,
   KeyValueField,
+  ApiKeyListField,
   apiToList,
   listToApi,
   modelToRows,
   rowsToModel,
   objectToPairs,
   pairsToObject,
+  type ApiKeyItemType,
 } from "./fields"
 
 export interface ProviderItem {
   provider?: string
   base_url?: string
-  api?: string | string[]
+  api?: string | string[] | (string | { key: string; enabled?: boolean })[]
   model?: any[]
   tools?: boolean
   notes?: string
   engine?: string
   preferences?: any
+  enabled?: boolean
   [key: string]: any
 }
 
@@ -53,7 +56,7 @@ export function ProviderDialog({
 }) {
   const { toast } = useToast()
   const [item, setItem] = useState<ProviderItem>({})
-  const [apiList, setApiList] = useState<string[]>([])
+  const [apiList, setApiList] = useState<ApiKeyItemType[]>([])
   const [modelList, setModelList] = useState<{ upstream: string; alias: string }[]>([])
   const [modelTimeoutPairs, setModelTimeoutPairs] = useState<{ key: string; value: string }[]>([])
   const [keepalivePairs, setKeepalivePairs] = useState<{ key: string; value: string }[]>([])
@@ -88,9 +91,16 @@ export function ProviderDialog({
       toast({ title: "无法获取", description: "请先填写 base_url", variant: "destructive" })
       return
     }
-    const channelApi = apiList.map((s) => s.trim()).filter(Boolean)
+    // 提取启用的 key
+    const channelApi = apiList
+      .map((item) => {
+        if (typeof item === "string") return item.trim()
+        if (item.enabled !== false) return item.key.trim()
+        return ""
+      })
+      .filter(Boolean)
     if (channelApi.length === 0) {
-      toast({ title: "无法获取", description: "请先填写 api Key", variant: "destructive" })
+      toast({ title: "无法获取", description: "请先填写并启用至少一个 api Key", variant: "destructive" })
       return
     }
     setFetchingModels(true)
@@ -160,6 +170,17 @@ export function ProviderDialog({
         <div className="flex-1 overflow-y-auto pl-1.5 pr-4">
           <div className="space-y-4 py-2">
             {/* ---------- 基础字段 ---------- */}
+            <SelectField
+              id="enabled"
+              label="enabled"
+              description="是否启用该渠道，默认启用"
+              value={item.enabled !== false ? "true" : "false"}
+              onChange={(v) => update({ enabled: v === "true" })}
+              options={[
+                { value: "true", label: "启用" },
+                { value: "false", label: "禁用" },
+              ]}
+            />
             <TextField
               id="provider"
               label="provider"
@@ -179,7 +200,7 @@ export function ProviderDialog({
               placeholder="https://api.xxx.com/v1"
               mono
             />
-            <StringListField
+            <ApiKeyListField
               label="api"
               required
               description="提供商的 API Key，必填。支持多个 Key，多个 key 自动开启轮训负载均衡。至少一个 key"
