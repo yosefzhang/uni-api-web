@@ -13,7 +13,7 @@ Base = declarative_base()
 class RequestStat(Base):
     __tablename__ = 'request_stats'
     id = Column(Integer, primary_key=True)
-    request_id = Column(String)
+    request_id = Column(String, index=True)
     trace_id = Column(String, index=True)
     endpoint = Column(String)
     client_ip = Column(String)
@@ -35,7 +35,7 @@ class RequestStat(Base):
 class ChannelStat(Base):
     __tablename__ = 'channel_stats'
     id = Column(Integer, primary_key=True)
-    request_id = Column(String)
+    request_id = Column(String, index=True)
     provider = Column(String, index=True)
     model = Column(String, index=True)
     api_key = Column(String)

@@ -765,6 +765,7 @@ CREATE TABLE IF NOT EXISTS request_stats (
     timing_spans TEXT,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS ix_request_stats_request_id ON request_stats(request_id);
 CREATE INDEX IF NOT EXISTS ix_request_stats_trace_id ON request_stats(trace_id);
 CREATE INDEX IF NOT EXISTS ix_request_stats_provider ON request_stats(provider);
 CREATE INDEX IF NOT EXISTS ix_request_stats_model ON request_stats(model);
@@ -780,6 +781,7 @@ CREATE TABLE IF NOT EXISTS channel_stats (
     success INTEGER DEFAULT 0,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS ix_channel_stats_request_id ON channel_stats(request_id);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_provider ON channel_stats(provider);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_model ON channel_stats(model);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_provider_api_key ON channel_stats(provider_api_key);
@@ -808,6 +810,7 @@ CREATE TABLE IF NOT EXISTS request_stats (
     timing_spans TEXT,
     timestamp TIMESTAMPTZ DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS ix_request_stats_request_id ON request_stats(request_id);
 CREATE INDEX IF NOT EXISTS ix_request_stats_trace_id ON request_stats(trace_id);
 CREATE INDEX IF NOT EXISTS ix_request_stats_provider ON request_stats(provider);
 CREATE INDEX IF NOT EXISTS ix_request_stats_model ON request_stats(model);
@@ -823,6 +826,7 @@ CREATE TABLE IF NOT EXISTS channel_stats (
     success BOOLEAN DEFAULT FALSE,
     timestamp TIMESTAMPTZ DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS ix_channel_stats_request_id ON channel_stats(request_id);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_provider ON channel_stats(provider);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_model ON channel_stats(model);
 CREATE INDEX IF NOT EXISTS ix_channel_stats_provider_api_key ON channel_stats(provider_api_key);

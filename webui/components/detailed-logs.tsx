@@ -44,7 +44,7 @@ interface Filters {
 
 // --- Constants ---
 
-const LOGS_PER_PAGE = 30
+const LOGS_PER_PAGE = 20
 
 // --- Component ---
 
