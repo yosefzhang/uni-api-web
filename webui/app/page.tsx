@@ -7,20 +7,21 @@ import { useState, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { Settings, BarChart3, FileEdit, Menu, Zap, SlidersHorizontal, Database } from "lucide-react"
+import { Settings, BarChart3, FileEdit, Menu, Zap, SlidersHorizontal, Database, ScrollText } from "lucide-react"
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet"
 import { ApiKeyModal } from "@/components/api-key-modal"
 import { ConfigEditor } from "@/components/config-editor"
 import { OnlineConfig } from "@/components/online-config"
 import { ModelContextEditor } from "@/components/model-context-editor"
 import { StatsViewer } from "@/components/stats-viewer"
+import { DetailedLogs } from "@/components/detailed-logs"
 import { useToast } from "@/hooks/use-toast"
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card"
 import { Separator } from "@/components/ui/separator"
 import { ChannelTester } from "@/components/channel-tester"
 
 export default function HomePage() {
-  const [currentPage, setCurrentPage] = useState<"stats" | "config" | "online-config" | "model-context" | "test">("stats")
+  const [currentPage, setCurrentPage] = useState<"stats" | "logs" | "config" | "online-config" | "model-context" | "test">("stats")
   const [showApiKeyModal, setShowApiKeyModal] = useState(false)
   const [apiKey, setApiKey] = useState<string>("")
   const [userRole, setUserRole] = useState<string>("")
@@ -244,24 +245,19 @@ export default function HomePage() {
                     >
                       渠道统计
                     </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="w-full justify-start px-2 py-1.5"
-                      onClick={() => {
-                        if (currentPage !== 'stats') {
-                            setCurrentPage('stats');
-                            setTimeout(() => scrollToSection("logs"), 50);
-                        } else {
-                            scrollToSection("logs");
-                        }
-                      }}
-                    >
-                      详细日志
-                    </Button>
                   </div>
                 </HoverCardContent>
               </HoverCard>
+
+              {/* Detailed Logs Button */}
+              <Button
+                variant={currentPage === "logs" ? "secondary" : "ghost"}
+                onClick={() => setCurrentPage("logs")}
+                size="sm"
+              >
+                <ScrollText className="w-4 h-4 mr-2" />
+                详细日志
+              </Button>
 
               {/* Channel Tester Button */}
               <Button
@@ -350,6 +346,14 @@ export default function HomePage() {
                           统计信息
                         </Button>
                         <Button
+                          variant={currentPage === "logs" ? "secondary" : "ghost"}
+                          onClick={() => { setCurrentPage("logs"); setMobileMenuOpen(false); }}
+                          className="w-full justify-start"
+                        >
+                          <ScrollText className="w-4 h-4 mr-2" />
+                          详细日志
+                        </Button>
+                        <Button
                           variant={currentPage === "test" ? "secondary" : "ghost"}
                           onClick={() => { setCurrentPage("test"); setMobileMenuOpen(false); }}
                           className="w-full justify-start"
@@ -398,7 +402,6 @@ export default function HomePage() {
                             <Button variant="ghost" size="sm" onClick={() => scrollToSection("overview")} className="w-full justify-start text-muted-foreground hover:text-primary">概览统计</Button>
                             <Button variant="ghost" size="sm" onClick={() => scrollToSection("models")} className="w-full justify-start text-muted-foreground hover:text-primary">模型统计</Button>
                             <Button variant="ghost" size="sm" onClick={() => scrollToSection("channels")} className="w-full justify-start text-muted-foreground hover:text-primary">渠道统计</Button>
-                            <Button variant="ghost" size="sm" onClick={() => scrollToSection("logs")} className="w-full justify-start text-muted-foreground hover:text-primary">详细日志</Button>
                           </div>
                         </>
                       )}
@@ -414,6 +417,7 @@ export default function HomePage() {
       <main className="container mx-auto px-4 py-8">
         {/* Conditional Rendering of Pages */}
         {currentPage === "stats" && <StatsViewer apiKey={viewingKey} />}
+        {currentPage === "logs" && <DetailedLogs apiKey={viewingKey} />}
         {currentPage === "test" && <ChannelTester apiKey={apiKey} />}
         {currentPage === "config" && canAccessConfig && <ConfigEditor apiKey={apiKey} />}
         {currentPage === "config" && !canAccessConfig && (

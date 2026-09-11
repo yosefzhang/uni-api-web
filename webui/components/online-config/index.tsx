@@ -1,4 +1,4 @@
-// 在线配置主组件：三大分类（API 密钥 / Providers / 全局配置）列表 + 弹窗编辑
+// 在线配置主组件：三大分类（API 密钥 / 渠道 / 全局配置）列表 + 弹窗编辑
 "use client"
 
 import { useState, useEffect, useCallback } from "react"
@@ -39,54 +39,51 @@ interface OnlineConfigProps {
   apiKey: string
 }
 
-const MODEL_COLLAPSE_LIMIT = 5
+const MODEL_COLLAPSE_LIMIT = 3
 
-// model 列表单元格：渠道模型ID / 映射模型ID 两列表格，默认最多展示 5 行，超出可展开/收起
-function ModelListCell({ model }: { model?: any[] }) {
-  const [expanded, setExpanded] = useState(false)
+interface ModelListCellProps {
+  model?: any[]
+  expanded: boolean
+}
+
+// model 列表单元格：两列无标题表格，每格展示 "渠道模型ID --> 映射模型ID"
+function ModelListCell({ model, expanded }: ModelListCellProps) {
   const rows = modelToRows(model)
-  if (rows.length === 0) {
-    return <span className="text-xs text-muted-foreground">（自动获取全部模型）</span>
+  const COLUMNS = 2
+  const maxCells = MODEL_COLLAPSE_LIMIT * COLUMNS
+  const hasRows = rows.length > 0
+  const showAll = expanded || rows.length <= maxCells
+  const visible = hasRows ? (showAll ? rows : rows.slice(0, maxCells)) : []
+  const groups: typeof rows[] = []
+  for (let i = 0; i < visible.length; i += COLUMNS) {
+    groups.push(visible.slice(i, i + COLUMNS))
   }
-  const showAll = expanded || rows.length <= MODEL_COLLAPSE_LIMIT
-  const visible = showAll ? rows : rows.slice(0, MODEL_COLLAPSE_LIMIT)
+  if (!hasRows) {
+    return (
+      <div className="min-h-[88px]">
+        <span className="text-xs text-muted-foreground">（自动获取全部模型）</span>
+      </div>
+    )
+  }
   return (
-    <div className="space-y-1">
+    <div className="min-h-[88px]">
       <Table>
-        <TableHeader>
-          <TableRow className="hover:bg-transparent">
-            <TableHead className="h-auto bg-muted px-3 py-2 text-xs font-bold text-foreground whitespace-nowrap">
-              渠道模型ID
-            </TableHead>
-            <TableHead className="h-auto bg-muted px-3 py-2 text-xs font-bold text-foreground whitespace-nowrap">
-              映射模型ID
-            </TableHead>
-          </TableRow>
-        </TableHeader>
         <TableBody>
-          {visible.map((r, idx) => (
-            <TableRow key={idx} className="hover:bg-transparent">
-              <TableCell className="border-t px-3 py-1.5 text-xs break-all align-top">
-                {r.upstream}
-              </TableCell>
-              <TableCell className="border-t px-3 py-1.5 text-xs break-all align-top text-muted-foreground">
-                {r.alias || "—"}
-              </TableCell>
+          {groups.map((group, rowIdx) => (
+            <TableRow key={rowIdx} className="hover:bg-transparent">
+              {group.map((r, colIdx) => (
+                <TableCell
+                  key={colIdx}
+                  className="px-3 py-1.5 text-xs whitespace-nowrap overflow-hidden text-ellipsis align-top"
+                  title={r.alias ? `${r.upstream} --> ${r.alias}` : r.upstream}
+                >
+                  {r.alias ? `${r.upstream} --> ${r.alias}` : r.upstream}
+                </TableCell>
+              ))}
             </TableRow>
           ))}
         </TableBody>
       </Table>
-      {rows.length > MODEL_COLLAPSE_LIMIT && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="h-6 px-2 text-xs text-muted-foreground"
-          onClick={() => setExpanded((v) => !v)}
-        >
-          {expanded ? `收起（共 ${rows.length} 项）` : `展开（共 ${rows.length} 项）`}
-        </Button>
-      )}
     </div>
   )
 }
@@ -96,6 +93,7 @@ export function OnlineConfig({ apiKey }: OnlineConfigProps) {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [activeTab, setActiveTab] = useState("providers")
+  const [expandedProviders, setExpandedProviders] = useState<Record<number, boolean>>({})
   const { toast } = useToast()
 
   // 弹窗状态
@@ -336,7 +334,7 @@ export function OnlineConfig({ apiKey }: OnlineConfigProps) {
             <TabsList className="bg-transparent p-0 h-auto">
               <TabsTrigger value="providers" className="flex-1 md:flex-none">
                 <Server className="w-4 h-4 mr-2" />
-                Providers
+                渠道
                 <Badge variant="secondary" className="ml-2">{providers.length}</Badge>
               </TabsTrigger>
               <TabsTrigger value="api_keys" className="flex-1 md:flex-none">
@@ -374,45 +372,62 @@ export function OnlineConfig({ apiKey }: OnlineConfigProps) {
             {providers.length === 0 ? (
               <Card className="border-dashed">
                 <CardContent className="p-8 text-center text-muted-foreground">
-                  暂无 providers，点击右上角【新增渠道】开始配置。
+                  暂无渠道，点击右上角【新增渠道】开始配置。
                 </CardContent>
               </Card>
             ) : (
-              providers.map((p, i) => (
-                <Card key={i} className={`border ${p.enabled === false ? "opacity-60" : ""}`}>
-                  <CardContent className="p-0">
-                    <div className="flex items-center justify-between gap-3 px-4 py-3 border-b">
-                      <div className="flex items-center gap-2 flex-wrap min-w-0">
-                        <Badge variant="outline">#{i + 1}</Badge>
-                        <span className="font-medium">{p.provider || "未命名"}</span>
-                        {p.engine && <Badge variant="secondary">{p.engine}</Badge>}
-                        {p.enabled === false && <Badge variant="destructive">已禁用</Badge>}
-                      </div>
-                      <div className="flex gap-1 shrink-0">
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => openEditProvider(p, i)}>
-                              <Pencil className="h-4 w-4" />
+              providers.map((p, i) => {
+                const providerRows = modelToRows(p.model)
+                const providerMaxCells = MODEL_COLLAPSE_LIMIT * 2
+                const providerExpanded = !!expandedProviders[i]
+                const providerCanExpand = providerRows.length > providerMaxCells
+                return (
+                  <Card key={i} className={`border ${p.enabled === false ? "opacity-60" : ""}`}>
+                    <CardContent className="p-0">
+                      <div className="flex items-center justify-between gap-3 px-4 py-3 border-b">
+                        <div className="flex items-center gap-2 flex-wrap min-w-0">
+                          <Badge variant="outline">#{i + 1}</Badge>
+                          <span className="font-medium">{p.provider || "未命名"}</span>
+                          {p.engine && <Badge variant="secondary">{p.engine}</Badge>}
+                          {p.enabled === false && <Badge variant="destructive">已禁用</Badge>}
+                        </div>
+                        <div className="flex gap-1 shrink-0 items-center">
+                          {providerCanExpand && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="h-8 px-2 text-xs text-muted-foreground"
+                              onClick={() => setExpandedProviders((prev) => ({ ...prev, [i]: !prev[i] }))}
+                            >
+                              {providerExpanded ? `收起（共 ${providerRows.length} 项）` : `展开（共 ${providerRows.length} 项）`}
                             </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>编辑</TooltipContent>
-                        </Tooltip>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button variant="ghost" size="icon" className="h-8 w-8 text-destructive hover:text-destructive" onClick={() => handleProviderDelete(i)}>
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent>删除</TooltipContent>
-                        </Tooltip>
+                          )}
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => openEditProvider(p, i)}>
+                                <Pencil className="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>编辑</TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button variant="ghost" size="icon" className="h-8 w-8 text-destructive hover:text-destructive" onClick={() => handleProviderDelete(i)}>
+                                <Trash2 className="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>删除</TooltipContent>
+                          </Tooltip>
+                        </div>
                       </div>
-                    </div>
-                    <div className="px-4 py-3">
-                      <ModelListCell model={p.model} />
-                    </div>
-                  </CardContent>
-                </Card>
-              ))
+                      <div className="px-4 py-3">
+                        <ModelListCell model={p.model} expanded={providerExpanded} />
+                      </div>
+                    </CardContent>
+                  </Card>
+                )
+              })
             )}
           </TabsContent>
 
