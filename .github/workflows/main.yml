@@ -9,6 +9,7 @@ on:
       - webui/**
       - webui
       - Dockerfile
+      - VERSION
       - .dockerignore
       - rust/**
       - docker-compose.yml
