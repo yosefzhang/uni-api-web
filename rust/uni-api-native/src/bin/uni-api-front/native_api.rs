@@ -538,7 +538,9 @@ fn unix_seconds() -> i64 {
 }
 
 fn app_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    // 产品版本来自仓库根 VERSION（由 build.rs 注入），与上游 tag 对齐；
+    // 不是 Cargo.toml 的 crate 版本（上游已把它重置为 0.1.x）。
+    env!("UNI_API_VERSION")
 }
 
 #[cfg(test)]
@@ -547,7 +549,8 @@ mod tests {
 
     #[test]
     fn project_version_is_embedded() {
-        assert_eq!(app_version(), env!("CARGO_PKG_VERSION"));
+        assert!(app_version().starts_with("1."));
+        assert!(!app_version().is_empty());
     }
 
     #[test]

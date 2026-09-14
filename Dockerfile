@@ -2,8 +2,9 @@ FROM lukemathwalker/cargo-chef:0.1.71-rust-1.84-bullseye@sha256:e372d5aae4166598
 WORKDIR /workspace
 COPY rust/uni-api-native/Cargo.toml rust/uni-api-native/Cargo.lock ./rust/uni-api-native/
 COPY rust/uni-api-native/.cargo ./rust/uni-api-native/.cargo
-# build.rs 读取 webui/package.json 注入 UNI_API_WEB_VERSION，cook 阶段即需要
+# build.rs 需要 webui/package.json（UNI_API_WEB_VERSION）与 VERSION（UNI_API_VERSION）
 COPY webui/package.json ./webui/package.json
+COPY VERSION ./VERSION
 RUN mkdir -p rust/uni-api-native/src/bin/uni-api-front && printf 'fn main() {}\n' > rust/uni-api-native/src/bin/uni-api-front/main.rs && cd rust/uni-api-native && cargo chef prepare --recipe-path recipe.json
 FROM chef AS planner
 RUN cd rust/uni-api-native && cargo chef cook --release --locked --recipe-path recipe.json
@@ -12,6 +13,7 @@ COPY README.md ./README.md
 COPY static ./static
 COPY uni_api/api/codex_models_pro_0_153_2.json ./uni_api/api/codex_models_pro_0_153_2.json
 COPY webui/package.json ./webui/package.json
+COPY VERSION ./VERSION
 COPY rust/uni-api-native ./rust/uni-api-native
 WORKDIR /workspace/rust/uni-api-native
 RUN cargo build --release --locked && cp target/release/uni-api-front /tmp/uni-api-front
@@ -24,9 +26,9 @@ WORKDIR /build
 COPY webui/package.json webui/pnpm-lock.yaml ./
 RUN pnpm fetch
 COPY webui ./
-# 面板页头要显示后端版本号：next.config.mjs 会按仓库布局读 ../rust/uni-api-native/Cargo.toml，
-# 故此阶段把该文件放到同一相对位置（否则会显示 unknown）
-COPY rust/uni-api-native/Cargo.toml /rust/uni-api-native/Cargo.toml
+# 面板页头要显示后端产品版本：next.config.mjs 按仓库布局读 ../VERSION，
+# 故把该文件放到同一相对位置（否则会显示 unknown）
+COPY VERSION /VERSION
 # next/font 会去 fonts.googleapis.com 取 Inter：pnpm 需要代理，但代理到不了 Google Fonts
 # （实测经 10.0.0.10:9132 取 fonts.googleapis.com 直接 ECONNRESET），故构建时临时摘掉代理走直连。
 RUN pnpm install --offline --frozen-lockfile && \

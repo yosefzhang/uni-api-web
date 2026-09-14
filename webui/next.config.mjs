@@ -1,28 +1,24 @@
 import fs from 'fs'
 import path from 'path'
 
-function readCargoVersion() {
-  // 上游 1.7.276 起仓库转为纯 Rust，后端版本号来源是 rust crate 的 Cargo.toml。
-  // 依次尝试几种相对位置：本地仓库布局、Docker 构建阶段布局，均失败则回落 unknown。
+function readUniApiVersion() {
+  if (process.env.NEXT_PUBLIC_UNI_API_VERSION) return process.env.NEXT_PUBLIC_UNI_API_VERSION
+  // 产品版本单一来源：仓库根 VERSION（1.7.x，与上游 tag 对齐）。
+  // 兼容几种相对位置：本地仓库布局、Docker 构建阶段布局、上两级。
   const candidates = [
-    path.join(process.cwd(), '..', 'rust', 'uni-api-native', 'Cargo.toml'),
-    path.join(process.cwd(), 'rust', 'uni-api-native', 'Cargo.toml'),
-    path.join(process.cwd(), '..', '..', 'rust', 'uni-api-native', 'Cargo.toml'),
+    path.join(process.cwd(), '..', 'VERSION'),
+    path.join(process.cwd(), 'VERSION'),
+    path.join(process.cwd(), '..', '..', 'VERSION'),
   ]
   for (const candidate of candidates) {
     try {
-      const content = fs.readFileSync(candidate, 'utf-8')
-      const match = content.match(/^version\s*=\s*"([^"]+)"/m)
-      if (match) return match[1]
+      const value = fs.readFileSync(candidate, 'utf-8').trim()
+      if (value) return value
     } catch {
       // 继续尝试下一个候选路径
     }
   }
   return 'unknown'
-}
-
-function readUniApiVersion() {
-  return process.env.NEXT_PUBLIC_UNI_API_VERSION || readCargoVersion()
 }
 
 function readUniApiWebVersion() {

@@ -49,9 +49,9 @@ is_running() {
   port_listening "$1"
 }
 
-# 读取后端版本号（上游转纯 Rust 后来自 rust/uni-api-native/Cargo.toml）
+# 读取后端产品版本号（仓库根 VERSION，与上游 tag 对齐；crate 版本另在 Cargo.toml）
 backend_version() {
-  grep '^version = ' "$PROJECT_ROOT/rust/uni-api-native/Cargo.toml" 2>/dev/null | head -n 1 | awk -F'"' '{print $2}'
+  head -n 1 "$PROJECT_ROOT/VERSION" 2>/dev/null | tr -d '[:space:]'
 }
 
 # 读取前端版本号（来自 webui/package.json）
