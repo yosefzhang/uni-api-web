@@ -5,16 +5,13 @@ __pycache__
 .vscode
 node_modules
 .wrangler
-.pytest_cache
-.venv/
 .git
-uni_api/_uni_api_native*.so
 *.jpg
 *.json
 !vercel.json
 !uni_api/
 !uni_api/api/
-!uni_api/api/codex_models_pro_0_144_0.json
+!uni_api/api/codex_models_pro_0_153_2.json
 !webui/package.json
 !webui/pnpm-lock.yaml
 !webui/tsconfig.json
@@ -41,8 +38,7 @@ Dockerfile.debug
 *.md
 !README.md
 *.toml
-!pyproject.toml
-!rust/
+!!rust/
 rust/**
 !rust/uni-api-native/
 !rust/uni-api-native/Cargo.toml

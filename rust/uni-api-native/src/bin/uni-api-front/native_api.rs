@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
@@ -76,7 +75,7 @@ pub async fn handle(
                 StatusCode::OK,
                 json!({
                     "runtime": "rust",
-                    "python_compat_enabled": state.python_compat_enabled,
+                    "request_body_limits": crate::request_decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.native_responses_config.is_ready().await,
                     "database_disabled": state.persistence.disabled(),
                     "persistence": if state.persistence.disabled() { "disabled" } else { "rust" },
@@ -539,17 +538,7 @@ fn unix_seconds() -> i64 {
 }
 
 fn app_version() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION
-        .get_or_init(|| {
-            let project = include_str!("../../../../../pyproject.toml");
-            project
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("version = \"")?.strip_suffix('"'))
-                .unwrap_or("unknown")
-                .to_owned()
-        })
-        .as_str()
+    env!("CARGO_PKG_VERSION")
 }
 
 #[cfg(test)]
@@ -558,7 +547,7 @@ mod tests {
 
     #[test]
     fn project_version_is_embedded() {
-        assert!(app_version().starts_with("1.7."));
+        assert_eq!(app_version(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

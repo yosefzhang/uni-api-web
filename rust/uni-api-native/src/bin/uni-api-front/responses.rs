@@ -1617,28 +1617,44 @@ async fn run_raw_committed(
         match next {
             Ok(Some(Ok(chunk))) => {
                 active.stats.observe_upstream(&chunk);
+                let already_forwarded_bytes = active.decoder.buffer.len();
                 let inspection = match active.decoder.feed(&chunk) {
-                    Ok(frames) => inspect_raw_frames(frames, &mut active.stats),
+                    Ok(frames) => {
+                        raw_terminal_prefix(frames, &mut active.stats, already_forwarded_bytes)
+                    }
                     Err(error) => Err(error),
                 };
-                active.stats.observe_wire(&chunk);
-                if output.send_wire(chunk).await.is_err() {
-                    complete_disconnect(
-                        state,
-                        coordinator,
-                        active.plan.attempt_id.clone(),
-                        active.status,
-                        &mut active.stats,
-                    )
-                    .await;
-                    return false;
-                }
                 match inspection {
-                    Ok(Some(terminal)) => {
+                    Ok(Some((prefix, terminal))) => {
+                        active.stats.observe_wire(&prefix);
+                        if output.send_wire(prefix).await.is_err() {
+                            complete_disconnect(
+                                state,
+                                coordinator,
+                                active.plan.attempt_id.clone(),
+                                active.status,
+                                &mut active.stats,
+                            )
+                            .await;
+                            return false;
+                        }
                         finish_observed_terminal(state, coordinator, active, terminal).await;
                         return true;
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        active.stats.observe_wire(&chunk);
+                        if output.send_wire(chunk).await.is_err() {
+                            complete_disconnect(
+                                state,
+                                coordinator,
+                                active.plan.attempt_id.clone(),
+                                active.status,
+                                &mut active.stats,
+                            )
+                            .await;
+                            return false;
+                        }
+                    }
                     Err(error) => {
                         complete_failure(
                             state,
@@ -1655,12 +1671,27 @@ async fn run_raw_committed(
                 }
             }
             Ok(None) => {
+                let already_forwarded_bytes = active.decoder.buffer.len();
                 let inspection = match active.decoder.finish() {
-                    Ok(frames) => inspect_raw_frames(frames, &mut active.stats),
+                    Ok(frames) => {
+                        raw_terminal_prefix(frames, &mut active.stats, already_forwarded_bytes)
+                    }
                     Err(error) => Err(error),
                 };
                 match inspection {
-                    Ok(Some(terminal)) => {
+                    Ok(Some((prefix, terminal))) => {
+                        active.stats.observe_wire(&prefix);
+                        if output.send_wire(prefix).await.is_err() {
+                            complete_disconnect(
+                                state,
+                                coordinator,
+                                active.plan.attempt_id.clone(),
+                                active.status,
+                                &mut active.stats,
+                            )
+                            .await;
+                            return false;
+                        }
                         finish_observed_terminal(state, coordinator, active, terminal).await;
                         return true;
                     }
@@ -1721,13 +1752,27 @@ async fn run_raw_committed(
     }
 }
 
-fn inspect_raw_frames(
+/// Return only the wire prefix through the first terminal event.
+///
+/// Upstream providers sometimes append heartbeats or unrelated bytes after
+/// `response.completed` in the same HTTP chunk. Raw forwarding must stop at
+/// the semantic terminal instead of sending that suffix first.
+fn raw_terminal_prefix(
     frames: Vec<SseFrame>,
     stats: &mut StreamStats,
-) -> Result<Option<Terminal>, String> {
+    already_forwarded_bytes: usize,
+) -> Result<Option<(Bytes, Terminal)>, String> {
+    let mut prefix = BytesMut::new();
     for frame in frames {
-        if let Some(terminal) = inspect_terminal_frame(&frame, stats)? {
-            return Ok(Some(terminal));
+        let wire = frame.wire.clone();
+        let terminal = inspect_terminal_frame(&frame, stats)?;
+        prefix.extend_from_slice(&wire);
+        if let Some(terminal) = terminal {
+            let already_forwarded_bytes = already_forwarded_bytes.min(prefix.len());
+            return Ok(Some((
+                prefix.freeze().slice(already_forwarded_bytes..),
+                terminal,
+            )));
         }
     }
     Ok(None)
@@ -3309,11 +3354,50 @@ mod tests {
             )
             .unwrap();
         let mut stats = StreamStats::new("raw-terminal-test");
-        let terminal = inspect_raw_frames(frames, &mut stats).unwrap();
-        assert!(matches!(terminal, Some(Terminal::Completed)));
+        let (_prefix, terminal) = raw_terminal_prefix(frames, &mut stats, 0)
+            .unwrap()
+            .expect("completed terminal expected");
+        assert!(matches!(terminal, Terminal::Completed));
         assert_eq!(stats.event_count, 2);
         assert_eq!(stats.delta_events, 1);
         assert_eq!(stats.usage.as_ref().unwrap()["total_tokens"], 3);
+    }
+
+    #[test]
+    fn raw_mode_stops_at_completed_with_same_chunk_suffix() {
+        let mut decoder = SseDecoder::new(4096);
+        let frames = decoder
+            .feed(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+                  event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n\
+                  : provider heartbeat after completed\n\n",
+            )
+            .unwrap();
+        let mut stats = StreamStats::new("raw-terminal-prefix-test");
+        let (prefix, terminal) = raw_terminal_prefix(frames, &mut stats, 0)
+            .unwrap()
+            .expect("completed must terminate raw forwarding");
+        let wire = String::from_utf8(prefix.to_vec()).unwrap();
+        assert!(matches!(terminal, Terminal::Completed));
+        assert!(wire.contains("event: response.completed"));
+        assert!(!wire.contains("provider heartbeat after completed"));
+    }
+
+    #[test]
+    fn raw_mode_does_not_repeat_fragmented_terminal_prefix() {
+        let mut decoder = SseDecoder::new(4096);
+        let first = b"event: response.completed\ndata: {\"type\":\"response.com";
+        assert!(decoder.feed(first).unwrap().is_empty());
+        let already_forwarded_bytes = decoder.buffer.len();
+        let second = b"pleted\",\"response\":{\"status\":\"completed\"}}\n\n";
+        let frames = decoder.feed(second).unwrap();
+        let mut stats = StreamStats::new("raw-terminal-fragment-test");
+        let (new_bytes, terminal) =
+            raw_terminal_prefix(frames, &mut stats, already_forwarded_bytes)
+                .unwrap()
+                .expect("completed terminal expected");
+        assert!(matches!(terminal, Terminal::Completed));
+        assert_eq!(new_bytes.as_ref(), second);
     }
 
     #[test]

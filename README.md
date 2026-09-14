@@ -14,10 +14,13 @@ uni-api-web 同时提供两部分能力：
 
 | 组件 | 版本 | 来源 |
 | --- | --- | --- |
-| uni-api（后端） | `1.7.259` | `pyproject.toml` |
-| uni-api-web（前端） | `0.1.0` | `webui/package.json` |
+| uni-api（后端） | `0.1.2` | `rust/uni-api-native/Cargo.toml` |
+| uni-api-web（前端） | `0.5.0` | `webui/package.json` |
 
 > 版本号会随发布更新，本地部署时可运行 `./deploy.sh status` 查看当前前后端版本。
+>
+> ⚠️ 上游自 `1.7.276` 起转为**纯 Rust 运行时**（移除 Python 实现），后端版本号改由
+> `rust/uni-api-native/Cargo.toml` 维护，前端版本号仍由 `webui/package.json` 决定镜像 Tag。
 
 ## 管理面板功能
 

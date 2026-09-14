@@ -1,31 +1,18 @@
-name: Docker Build and Publish Docker Image
+name: Rust Docker Build and Publish
 
 on:
   push:
     branches:
       - main
     paths:
-      - main.py
-      - fugue_observability.py
-      - db.py
-      - routing.py
-      - upstream.py
-      - utils.py
-      - core/**
-      - core
-      - uni_api/**
-      - uni_api
       - static/**
       - webui/**
       - webui
       - Dockerfile
       - .dockerignore
       - rust/**
-      - pyproject.toml
-      - uv.lock
       - docker-compose.yml
       - .github/workflows/main.yml
-      - .github/workflows/release.yml
       - .gitmodules
   workflow_dispatch:
 

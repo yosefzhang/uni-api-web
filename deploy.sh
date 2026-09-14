@@ -2,6 +2,7 @@
 # deploy.sh - uni-api-web 本地开发部署脚本
 # 用法:
 #   ./deploy.sh dev      启动前后端开发服务
+#   ./deploy.sh build    本地编译产物（Rust 后端 + 前端静态导出），不依赖 Docker
 #   ./deploy.sh stop     停止前后端服务
 #   ./deploy.sh restart  重启前后端服务
 #   ./deploy.sh status   查看运行状态
@@ -10,6 +11,8 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEBUI_DIR="$PROJECT_ROOT/webui"
+RUST_DIR="$PROJECT_ROOT/rust/uni-api-native"
+RUST_BIN="$RUST_DIR/target/release/uni-api-front"
 BACKEND_PIDFILE="$PROJECT_ROOT/.run/backend.pid"
 FRONTEND_PIDFILE="$PROJECT_ROOT/.run/frontend.pid"
 BACKEND_PORT="${PORT:-8000}"
@@ -46,9 +49,9 @@ is_running() {
   port_listening "$1"
 }
 
-# 读取后端版本号（来自 pyproject.toml）
+# 读取后端版本号（上游转纯 Rust 后来自 rust/uni-api-native/Cargo.toml）
 backend_version() {
-  grep '^version = ' "$PROJECT_ROOT/pyproject.toml" 2>/dev/null | head -n 1 | awk -F'"' '{print $2}'
+  grep '^version = ' "$PROJECT_ROOT/rust/uni-api-native/Cargo.toml" 2>/dev/null | head -n 1 | awk -F'"' '{print $2}'
 }
 
 # 读取前端版本号（来自 webui/package.json）
@@ -121,12 +124,13 @@ start_backend() {
   fi
   echo "启动后端 (端口 $BACKEND_PORT) ..."
   cd "$PROJECT_ROOT"
-  nohup .venv/bin/uvicorn uni_api.runtime:app \
-    --host 0.0.0.0 --port "$BACKEND_PORT" \
-    --reload --reload-dir . \
-    --reload-exclude '.venv/*' \
-    --reload-exclude 'webui/node_modules/*' \
-    --reload-exclude 'data/*' \
+  if ! command -v cargo &>/dev/null; then
+    echo "未找到 cargo，后端已转为纯 Rust（上游 1.7.276 起移除 Python 运行时）。"
+    echo "请先安装 Rust 工具链：curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    return 1
+  fi
+  cargo build --release --manifest-path rust/uni-api-native/Cargo.toml --bin uni-api-front || return 1
+  nohup "$PROJECT_ROOT/rust/uni-api-native/target/release/uni-api-front" \
     > "$PROJECT_ROOT/.run/backend.log" 2>&1 &
   echo $! > "$BACKEND_PIDFILE"
   echo "后端已启动 (PID $!)"
@@ -144,6 +148,37 @@ start_frontend() {
     > "$PROJECT_ROOT/.run/frontend.log" 2>&1 &
   echo $! > "$FRONTEND_PIDFILE"
   echo "前端已启动 (PID $!)"
+}
+
+build_backend() {
+  export PATH="$HOME/.cargo/bin:$PATH"
+  if ! command -v cargo &>/dev/null; then
+    echo "未找到 cargo（应在 ~/.cargo/bin），请先安装 Rust 工具链"
+    return 1
+  fi
+  echo "构建后端 (cargo build --release) ..."
+  ( cd "$RUST_DIR" && cargo build --release --locked ) || return 1
+  echo "  后端产物: $RUST_BIN ($(du -h "$RUST_BIN" | cut -f1))"
+}
+
+build_frontend() {
+  # next/font 构建期要直连 fonts.googleapis.com 取字体，走代理会 ECONNRESET，故此处临时摘掉代理
+  echo "构建前端 (next build) ..."
+  if [ ! -x "$WEBUI_DIR/node_modules/.bin/next" ]; then
+    echo "  缺少 webui 依赖，请先执行: (cd webui && pnpm install --frozen-lockfile)" >&2
+    return 1
+  fi
+  ( cd "$WEBUI_DIR" && \
+    env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy \
+      ./node_modules/.bin/next build ) || return 1
+  echo "  前端产物: $WEBUI_DIR/out/"
+}
+
+build_all() {
+  build_backend && build_frontend || return 1
+  echo ""
+  echo "版本: 后端 v$(backend_version) · 前端 v$(frontend_version)"
+  echo "运行: PORT=8000 UNI_API_STATUS_UI=$WEBUI_DIR/out $RUST_BIN"
 }
 
 show_status() {
@@ -170,6 +205,9 @@ case "${1:-}" in
     echo "后端: http://localhost:$BACKEND_PORT (v$(backend_version))"
     echo "日志: $PROJECT_ROOT/.run/{backend,frontend}.log"
     ;;
+  build)
+    build_all
+    ;;
   stop)
     stop_service "前端" "$FRONTEND_PORT" "$FRONTEND_PIDFILE"
     stop_service "后端" "$BACKEND_PORT" "$BACKEND_PIDFILE"
@@ -192,7 +230,7 @@ case "${1:-}" in
     echo "版本: 后端 v$(backend_version) · 前端 v$(frontend_version)"
     ;;
   *)
-    echo "用法: $0 {dev|stop|restart|status}"
+    echo "用法: $0 {dev|build|stop|restart|status}"
     exit 1
     ;;
 esac
