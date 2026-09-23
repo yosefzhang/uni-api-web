@@ -11,6 +11,7 @@ const DEFAULT_WRITE_QUEUE: usize = 4096;
 
 #[derive(Clone)]
 pub struct Persistence {
+    fact_writer: Option<crate::facts_s3::FactWriter>,
     backend: Arc<Backend>,
     writer: Option<mpsc::Sender<WriteEvent>>,
 }
@@ -23,6 +24,13 @@ enum Backend {
 
 #[derive(Clone, Debug, Default)]
 pub struct RequestStat {
+    pub fact_usage: crate::fact_usage::FactUsage,
+    pub stream: bool,
+    pub upstream_model: String,
+    pub status: u16,
+    pub first_output_ms: Option<f64>,
+    pub response_created_ms: Option<f64>,
+    pub first_text_ms: Option<f64>,
     pub request_id: String,
     pub trace_id: String,
     pub endpoint: String,
@@ -44,12 +52,20 @@ pub struct RequestStat {
 
 #[derive(Clone, Debug, Default)]
 pub struct ChannelStat {
+    pub duration_ms: Option<f64>,
+    pub first_output_ms: Option<f64>,
+    pub response_created_ms: Option<f64>,
+    pub first_text_ms: Option<f64>,
     pub request_id: String,
+    pub attempt_id: String,
     pub provider: String,
     pub model: String,
+    pub upstream_model: String,
     pub api_key: String,
     pub provider_api_key: String,
     pub success: bool,
+    pub endpoint: String,
+    pub stream: bool,
 }
 
 enum WriteEvent {
@@ -61,10 +77,12 @@ impl Persistence {
     pub async fn initialize(disabled: bool) -> Result<Self, String> {
         if disabled {
             return Ok(Self {
+                fact_writer: crate::facts_s3::global(),
                 backend: Arc::new(Backend::Disabled),
                 writer: None,
             });
         }
+        let fact_writer = crate::facts_s3::global();
         let backend = match std::env::var("DB_TYPE")
             .unwrap_or_else(|_| "sqlite".into())
             .trim()
@@ -123,6 +141,7 @@ impl Persistence {
         let (writer, receiver) = mpsc::channel(queue_capacity);
         spawn_writer(backend.clone(), receiver);
         Ok(Self {
+            fact_writer,
             backend,
             writer: Some(writer),
         })
@@ -133,32 +152,25 @@ impl Persistence {
     }
 
     pub fn record_request(&self, stat: RequestStat) {
+        if let Some(writer) = &self.fact_writer {
+            writer.enqueue(crate::facts_s3::request_event(&stat));
+        }
         let Some(writer) = &self.writer else {
             return;
         };
         if writer.try_send(WriteEvent::Request(stat)).is_err() {
-            eprintln!(
-                "{}",
-                json!({
-                    "event_type": "rust_persistence_write_dropped",
-                    "record_type": "request_stat",
-                })
-            );
+            eprintln!("rust_persistence_write_dropped record_type=request_stat");
         }
     }
-
     pub fn record_channel(&self, stat: ChannelStat) {
+        if let Some(writer) = &self.fact_writer {
+            writer.enqueue(crate::facts_s3::attempt_event(&stat));
+        }
         let Some(writer) = &self.writer else {
             return;
         };
         if writer.try_send(WriteEvent::Channel(stat)).is_err() {
-            eprintln!(
-                "{}",
-                json!({
-                    "event_type": "rust_persistence_write_dropped",
-                    "record_type": "channel_stat",
-                })
-            );
+            eprintln!("rust_persistence_write_dropped record_type=channel_stat");
         }
     }
 

@@ -1,17 +1,29 @@
+mod billing_observation;
+mod channel_balances;
+mod channel_catalog;
+mod channel_controls;
+mod channel_metrics;
+mod channel_settings;
+mod chat_stream;
 mod codex_oauth;
 mod config;
 mod cors;
+mod fact_usage;
+mod facts_s3;
 mod generic_api;
 mod hedging;
 mod idempotency;
 mod native_api;
+mod passthrough_observation;
 mod persistence;
 mod provider_stream;
 mod proxy;
 mod request_decompression;
 mod request_spool;
+mod request_timing;
 mod resources;
 mod responses;
+mod responses_heartbeat;
 mod responses_item_ids;
 mod responses_native;
 mod status;
@@ -36,6 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::new(String::new(), String::new(), false, persistence, publisher)?;
     let _ = state.native_responses_config.refresh().await;
     state.native_responses_config.start_watcher();
+
+    state
+        .native_responses_config
+        .restore_controls_on_start()
+        .await?;
 
     let app = Router::new()
         .fallback(any(proxy::handler))

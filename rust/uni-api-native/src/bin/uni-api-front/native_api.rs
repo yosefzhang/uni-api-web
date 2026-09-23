@@ -62,6 +62,83 @@ pub async fn handle(
 ) -> Option<Response<Body>> {
     let path = request_path.trim_end_matches('/');
     let path = if path.is_empty() { "/" } else { path };
+    if *method == Method::GET && path.starts_with("/v1/channel-settings") {
+        if let Err(response) = require_admin(state, headers).await {
+            return Some(response);
+        }
+        let result = match path {
+            "/v1/channel-settings/schema" => Ok(crate::channel_settings::schema()),
+            "/v1/channel-settings/secrets" => {
+                state
+                    .native_responses_config
+                    .settings_secrets(
+                        &query_value(uri, "provider").unwrap_or_default(),
+                        &query_value(uri, "revision").unwrap_or_default(),
+                    )
+                    .await
+            }
+            "/v1/channel-settings" => {
+                state
+                    .native_responses_config
+                    .settings_view(&query_value(uri, "provider").unwrap_or_default())
+                    .await
+            }
+            "/v1/channel-settings/providers" => {
+                state.native_responses_config.settings_providers().await
+            }
+            "/v1/channel-settings/export" => state.native_responses_config.settings_export().await,
+            _ => {
+                state
+                    .native_responses_config
+                    .settings_operation(
+                        path.strip_prefix("/v1/channel-settings/operations/")
+                            .unwrap_or(""),
+                    )
+                    .await
+            }
+        };
+        let mut response = match result {
+            Ok(v) => json_response(StatusCode::OK, v),
+            Err((status, message)) => json_error(status, &message),
+        };
+        response
+            .headers_mut()
+            .insert("cache-control", HeaderValue::from_static("no-store"));
+        return Some(response);
+    }
+    if *method == Method::GET
+        && matches!(
+            path,
+            "/v1/observability/runtime"
+                | "/v1/channel-controls"
+                | "/v1/api-keys"
+                | "/v1/model-channels"
+                | "/v1/channel-metrics"
+                | "/v1/channel-metrics/timeseries"
+                | "/v1/channel-balances"
+                | "/v1/stats"
+                | "/v1/token_usage"
+                | "/v1/channel_key_rankings"
+                | "/v1/api_keys_states"
+                | "/v1/api_config"
+                | "/v1/generate-api-key"
+        )
+    {
+        if let Err(status) = state
+            .native_responses_config
+            .authorize_catalog(headers)
+            .await
+        {
+            return Some(json_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                if status == 503 {
+                    "Runtime configuration is not ready"
+                } else {
+                    "Platform API requires the first configured key or an admin key"
+                },
+            ));
+        }
+    }
     let mut response = match (method, path) {
         (&Method::GET, "/healthz") => Some(json_response(
             StatusCode::OK,
@@ -75,6 +152,9 @@ pub async fn handle(
                 StatusCode::OK,
                 json!({
                     "runtime": "rust",
+                    "native_version": env!("CARGO_PKG_VERSION"),
+                    "source_commit": std::env::var("SOURCE_COMMIT").unwrap_or_else(|_| "unknown".into()),
+                    "capabilities": {"targeted_responses": true,"billing_receipt_correlation":true,"billing_error_evidence":true,"temporary_channel_controls":true,"temporary_channel_import":true},
                     "request_body_limits": crate::request_decompression::RequestBodyLimits::from_env(),
                     "configuration_ready": state.native_responses_config.is_ready().await,
                     "database_disabled": state.persistence.disabled(),
@@ -88,7 +168,29 @@ pub async fn handle(
                 }),
             ))
         }
+        (&Method::GET, "/v1/channel-controls") => Some(
+            match state.native_responses_config.controls_view(headers).await {
+                Ok(value) => json_response(StatusCode::OK, value),
+                Err(status) => json_error(
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                    "Channel controls unavailable",
+                ),
+            },
+        ),
         (&Method::GET, "/v1/models") => Some(models_response(state, uri, headers).await),
+        (&Method::GET, "/v1/model-channels") => {
+            Some(model_channels_response(state, uri, headers).await)
+        }
+        (&Method::GET, "/v1/api-keys") => Some(api_keys_response(state, headers).await),
+        (&Method::GET, "/v1/channel-balances") => {
+            Some(channel_balances_response(state, uri, headers).await)
+        }
+        (&Method::GET, "/v1/channel-metrics") => {
+            Some(channel_metrics_response(state, uri, headers).await)
+        }
+        (&Method::GET, "/v1/channel-metrics/timeseries") => {
+            Some(channel_metrics_timeseries_response(state, uri, headers).await)
+        }
         (&Method::GET, "/v1/generate-api-key") => {
             if let Err(error) = state.native_responses_config.authorize(headers).await {
                 Some(json_error(error.status, &error.message))
@@ -135,6 +237,11 @@ pub async fn handle(
         _ => None,
     };
     if let Some(response) = response.as_mut() {
+        if path.starts_with("/v1/") {
+            response
+                .headers_mut()
+                .insert("cache-control", HeaderValue::from_static("no-store"));
+        }
         insert_request_id(response.headers_mut(), headers);
         response
             .headers_mut()
@@ -143,13 +250,351 @@ pub async fn handle(
     response
 }
 
+async fn model_channels_response(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let model = query_value(uri, "model");
+    let endpoint = query_value(uri, "endpoint").unwrap_or_else(|| "/v1/responses".into());
+    let stream = query_value(uri, "stream")
+        .map(|v| v != "false" && v != "all")
+        .unwrap_or(true);
+    let selected_key = query_value(uri, "api_key_id");
+    let (rows, revision, selected_key_id) = match state
+        .native_responses_config
+        .channel_catalog(headers, &endpoint, stream, selected_key.as_deref())
+        .await
+    {
+        Ok(v) => v,
+        Err(403) => {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "Invalid API key or catalog access denied",
+            )
+        }
+        Err(404) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "Selected API key no longer exists; refresh the key list",
+            )
+        }
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runtime configuration is not ready",
+            )
+        }
+    };
+    let all_streams = query_value(uri, "stream").as_deref() == Some("all");
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .filter(|row| {
+            model
+                .as_deref()
+                .is_none_or(|m| row.get("model").and_then(Value::as_str) == Some(m))
+        })
+        .map(|mut row| {
+            if all_streams {
+                row["stream"] = Value::Null;
+            }
+            row
+        })
+        .collect();
+    json_response(
+        StatusCode::OK,
+        json!({"data":rows,"snapshot_revision":revision,"order":if selected_key_id.is_empty() { "provider_config" } else { "api_key_config" },"api_key_id":selected_key_id,"generated_at":unix_seconds()}),
+    )
+}
+
+async fn channel_balances_response(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let Some(name) = query_value(uri, "provider").filter(|name| !name.is_empty()) else {
+        return json_error(StatusCode::BAD_REQUEST, "provider is required");
+    };
+    let today = crate::channel_balances::today_utc();
+    let start_date = query_value(uri, "start_date").unwrap_or_else(|| today.clone());
+    let end_date = query_value(uri, "end_date").unwrap_or_else(|| today.clone());
+    if !crate::channel_balances::valid_date(&start_date)
+        || !crate::channel_balances::valid_date(&end_date)
+        || start_date > end_date
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "start_date and end_date must be valid ascending YYYY-MM-DD values",
+        );
+    }
+    let model = query_value(uri, "model");
+    match state
+        .native_responses_config
+        .balance_provider(headers, &name)
+        .await
+    {
+        Ok((provider, proxy)) => json_response(
+            StatusCode::OK,
+            crate::channel_balances::query(
+                &provider,
+                proxy.as_deref(),
+                &start_date,
+                &end_date,
+                model.as_deref(),
+            )
+            .await,
+        ),
+        Err(status) => json_error(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            if status == 404 {
+                "Unknown provider"
+            } else {
+                "Balance access denied or configuration unavailable"
+            },
+        ),
+    }
+}
+
+async fn channel_metrics_response(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    channel_metrics_response_inner(state, uri, headers, false).await
+}
+
+async fn channel_metrics_response_inner(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+    timeseries: bool,
+) -> Response<Body> {
+    let endpoint = query_value(uri, "endpoint").unwrap_or_else(|| "/v1/responses".into());
+    let stream = query_value(uri, "stream")
+        .map(|v| v != "false" && v != "all")
+        .unwrap_or(true);
+    let model = query_value(uri, "model");
+    let window = crate::channel_metrics::parse_window(
+        query_value(uri, "window").as_deref(),
+        std::time::Duration::from_secs(900),
+    );
+    let selected_key = query_value(uri, "api_key_id");
+    let (rows, revision, selected_key_id) = match state
+        .native_responses_config
+        .channel_catalog(headers, &endpoint, stream, selected_key.as_deref())
+        .await
+    {
+        Ok(v) => v,
+        Err(403) => {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "Invalid API key or catalog access denied",
+            )
+        }
+        Err(404) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "Selected API key no longer exists; refresh the key list",
+            )
+        }
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runtime configuration is not ready",
+            )
+        }
+    };
+    let all_streams = query_value(uri, "stream").as_deref() == Some("all");
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .filter(|row| {
+            model
+                .as_deref()
+                .is_none_or(|m| row.get("model").and_then(Value::as_str) == Some(m))
+        })
+        .map(|mut row| {
+            if all_streams {
+                row["stream"] = Value::Null;
+            }
+            row
+        })
+        .collect();
+    let mut response = state.channel_metrics.query(
+        rows,
+        &revision,
+        (window.as_secs().saturating_add(59) / 60).clamp(1, 60),
+        timeseries,
+    );
+    response["order"] = json!(if selected_key_id.is_empty() {
+        "provider_config"
+    } else {
+        "api_key_config"
+    });
+    response["statistics_scope"] = json!("channel_all_requests");
+    response["filters"] = json!({"endpoint":endpoint,"stream":if all_streams { "all" } else if stream { "true" } else { "false" }});
+    response["api_key_id"] = Value::String(selected_key_id);
+    json_response(StatusCode::OK, response)
+}
+
+async fn api_keys_response(state: &AppState, headers: &HeaderMap) -> Response<Body> {
+    match state.native_responses_config.api_key_catalog(headers).await {
+        Ok(data) => json_response(StatusCode::OK, data),
+        Err(403) => json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
+        Err(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Runtime configuration is not ready",
+        ),
+    }
+}
+
+async fn channel_metrics_timeseries_response(
+    state: &AppState,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    channel_metrics_response_inner(state, uri, headers, true).await
+}
+
 pub fn supports_mutation(method: &Method, path: &str) -> bool {
-    *method == Method::POST && matches!(path, "/v1/api_config/update" | "/v1/add_credits")
+    ((*method == Method::PATCH || *method == Method::POST)
+        && matches!(
+            path,
+            "/v1/channel-settings"
+                | "/v1/channel-settings/validate"
+                | "/v1/channel-settings/discover"
+        ))
+        || *method == Method::POST
+            && matches!(
+                path,
+                "/v1/api_config/update"
+                    | "/v1/add_credits"
+                    | "/v1/channel-controls"
+                    | "/v1/channel-controls/restore"
+                    | "/v1/temporary-channels"
+            )
 }
 
 pub async fn handle_mutation(state: &AppState, request: Request) -> Response<Body> {
     let path = request.uri().path().trim_end_matches('/').to_owned();
     let headers = request.headers().clone();
+    if path == "/v1/channel-settings"
+        || path == "/v1/channel-settings/validate"
+        || path == "/v1/channel-settings/discover"
+    {
+        if let Err(response) = require_admin(state, &headers).await {
+            return response;
+        }
+        let raw = match to_bytes(request.into_body(), 2 * 1024 * 1024).await {
+            Ok(v) => v,
+            Err(_) => {
+                return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Settings request too large")
+            }
+        };
+        let input = match serde_json::from_slice::<crate::channel_settings::Mutation>(&raw) {
+            Ok(v) => v,
+            Err(_) => return json_error(StatusCode::BAD_REQUEST, "Invalid settings request"),
+        };
+        let result = if path == "/v1/channel-settings/discover" {
+            state.native_responses_config.settings_discover(input).await
+        } else {
+            state
+                .native_responses_config
+                .settings_change(input, path == "/v1/channel-settings")
+                .await
+        };
+        return match result {
+            Ok(v) => json_response(StatusCode::OK, v),
+            Err((status, message)) => json_error(status, &message),
+        };
+    }
+    if path == "/v1/channel-controls"
+        || path == "/v1/temporary-channels"
+        || path == "/v1/channel-controls/restore"
+    {
+        if let Err(status) = state
+            .native_responses_config
+            .authorize_catalog(&headers)
+            .await
+        {
+            return json_error(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                "Platform administrator key required",
+            );
+        }
+        let limit = if path == "/v1/channel-controls/restore" {
+            2 * 1024 * 1024
+        } else {
+            64 * 1024
+        };
+        let body = match to_bytes(request.into_body(), limit).await {
+            Ok(body) => body,
+            Err(_) => {
+                return json_error(StatusCode::PAYLOAD_TOO_LARGE, "Control request too large")
+            }
+        };
+        if path == "/v1/channel-controls/restore" {
+            let input =
+                match serde_json::from_slice::<crate::channel_controls::RestoreMutation>(&body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            "Invalid retained configuration",
+                        )
+                    }
+                };
+            if !input.snapshot.channel_settings.is_empty()
+                || input
+                    .snapshot
+                    .temporary_channels
+                    .iter()
+                    .any(|p| p.definition.is_some())
+            {
+                if let Err(response) = require_admin(state, &headers).await {
+                    return response;
+                }
+            }
+            return match state
+                .native_responses_config
+                .restore_controls(&headers, input)
+                .await
+            {
+                Ok(v) => json_response(StatusCode::OK, v),
+                Err((code, msg)) => json_error(code, &msg),
+            };
+        }
+        if path == "/v1/temporary-channels" {
+            let input =
+                match serde_json::from_slice::<crate::channel_controls::ImportMutation>(&body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return json_error(StatusCode::BAD_REQUEST, "Invalid temporary channel")
+                    }
+                };
+            return match state
+                .native_responses_config
+                .import_temporary_channel(&headers, input)
+                .await
+            {
+                Ok(v) => json_response(StatusCode::OK, v),
+                Err((code, message)) => json_error(code, &message),
+            };
+        }
+        let input = match serde_json::from_slice::<crate::channel_controls::Mutation>(&body) {
+            Ok(input) => input,
+            Err(_) => {
+                return json_error(StatusCode::BAD_REQUEST, "Invalid channel control request")
+            }
+        };
+        return match state
+            .native_responses_config
+            .mutate_controls(&headers, input)
+            .await
+        {
+            Ok(value) => json_response(StatusCode::OK, value),
+            Err((status, message)) => json_error(status, &message),
+        };
+    }
     if let Err(response) = require_admin(state, &headers).await {
         return response;
     }
@@ -250,34 +695,50 @@ async fn models_response(state: &AppState, uri: &Uri, headers: &HeaderMap) -> Re
         );
         return response;
     }
+    let systemone_models = match state
+        .native_responses_config
+        .models_for_endpoint(headers, "/v1/systemone")
+        .await
+    {
+        Ok(models) => models,
+        Err(403) => return json_error(StatusCode::FORBIDDEN, "Invalid or missing API Key"),
+        Err(_) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runtime configuration is not ready",
+            )
+        }
+    };
     let caps_map = model_caps_map();
-    let mut data: Vec<Value> = models
+    let data: Vec<Value> = models
         .into_iter()
         .map(|model| {
             let caps = model_caps_for_in(&caps_map, &model);
-            json!({
-                "id": model,
+            let mut item = json!({
+                "id": model.clone(),
                 "object": "model",
                 "created": MODEL_CREATED,
                 "owned_by": "uni-api",
                 "context_window": cap_get(caps.as_ref(), "context_window"),
                 "max_output_tokens": cap_get(caps.as_ref(), "max_output_tokens"),
                 "supports_vision": cap_get(caps.as_ref(), "supports_vision"),
-            })
+            });
+            if model == "gpt-6-astra" {
+                item["context_window"] = json!(600000);
+                item["max_context_window"] = json!(872000);
+            }
+            item
         })
         .collect();
-    // Keep the regular OpenAI-compatible response consistent for Codex callers:
-    // gpt-6-astra metadata must match even when the client_version snapshot is absent.
-    for item in &mut data {
-        if item.get("id").and_then(Value::as_str) == Some("gpt-6-astra") {
-            item["context_window"] = json!(600000);
-            item["max_context_window"] = json!(872000);
-        }
-    }
     json_response(
         StatusCode::OK,
         json!({
             "object": "list",
+            // The TypeSafe SDK reads `models`; OpenAI clients continue reading
+            // `data`. These are configured names, not fabricated release dates.
+            "models": systemone_models.iter().map(|model| json!({
+                "name": model, "description": "Configured uni-api model", "release_date": ""
+            })).collect::<Vec<_>>(),
             "data": data,
         }),
     )
@@ -446,7 +907,13 @@ fn openapi_document() -> Value {
         ("post", "/v1/responses"),
         ("post", "/v1/responses/compact"),
         ("post", "/v1/messages"),
+        ("post", "/v1/systemone"),
         ("get", "/v1/models"),
+        ("get", "/v1/model-channels"),
+        ("get", "/v1/api-keys"),
+        ("get", "/v1/channel-balances"),
+        ("get", "/v1/channel-metrics"),
+        ("get", "/v1/channel-metrics/timeseries"),
         ("post", "/v1/images/generations"),
         ("post", "/v1/images/edits"),
         ("post", "/v1/embeddings"),

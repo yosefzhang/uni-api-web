@@ -1,0 +1,36 @@
+name: Rust Unit Tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.84.0"
+          components: rustfmt, clippy
+      - name: Check Rust
+        run: |
+          cargo fmt --check --manifest-path rust/uni-api-native/Cargo.toml
+          cargo clippy --manifest-path rust/uni-api-native/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path rust/uni-api-native/Cargo.toml --locked
+      - name: Verify arrival-to-dispatch timing with isolated upstreams
+        run: |
+          cargo build --manifest-path rust/uni-api-native/Cargo.toml --locked
+          python3 scripts/verify_dispatch_timing.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_channel_targeting.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_chat_keepalive.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_channel_controls.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_settings_reveal.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_codex_defaults.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_minimum_input_retry.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_heartbeat_retry.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_nonstream_timeouts.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_settlement_attribution.py rust/uni-api-native/target/debug/uni-api-front
+          python3 scripts/verify_typesafe.py rust/uni-api-native/target/debug/uni-api-front

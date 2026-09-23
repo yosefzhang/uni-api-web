@@ -48,8 +48,9 @@ struct SnapshotStamp {
 
 #[derive(Clone)]
 pub struct NativeConfigStore {
+    pub(crate) channel_controls: Arc<RwLock<crate::channel_controls::Controls>>,
     path: Arc<PathBuf>,
-    current: Arc<RwLock<Option<Arc<Snapshot>>>>,
+    pub(crate) current: Arc<RwLock<Option<Arc<Snapshot>>>>,
     snapshot_stamp: Arc<Mutex<Option<SnapshotStamp>>>,
     provider_cursors: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
     key_cooldowns: Arc<Mutex<HashMap<(String, String), tokio::time::Instant>>>,
@@ -88,7 +89,7 @@ struct RawApiKey {
 }
 
 #[derive(Debug, Deserialize)]
-struct RawProvider {
+pub(crate) struct RawProvider {
     name: String,
     base_url: String,
     engine: Option<String>,
@@ -128,6 +129,7 @@ pub(crate) struct Snapshot {
     pub(crate) revision: Arc<str>,
     pub(crate) preferences: Arc<Map<String, Value>>,
     pub(crate) api_keys: Arc<HashMap<String, Arc<ApiKey>>>,
+    pub(crate) api_key_order: Arc<Vec<String>>,
     pub(crate) providers: Arc<Vec<Arc<Provider>>>,
     pub(crate) providers_by_name: Arc<HashMap<String, Arc<Provider>>>,
     pub(crate) api_config: Arc<Value>,
@@ -164,6 +166,56 @@ pub(crate) struct Provider {
     pub(crate) excluded_request_types: Arc<Vec<String>>,
     pub(crate) excluded_request_rules: Arc<Vec<Value>>,
     pub(crate) cursor: Arc<AtomicUsize>,
+}
+
+pub(crate) fn runtime_provider(item: RawProvider, cursor: Arc<AtomicUsize>) -> Arc<Provider> {
+    let name = item.name.trim().to_owned();
+    Arc::new(Provider {
+        name: name.clone().into(),
+        base_url: item.base_url.trim().to_owned().into(),
+        engine: item.engine.unwrap_or_else(|| "gpt".into()).into(),
+        api_keys: Arc::new(provider_api_keys(&item.api)),
+        project_id: item
+            .project_id
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        private_key: item
+            .private_key
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        client_email: item
+            .client_email
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        aws_access_key: item
+            .aws_access_key
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        aws_secret_key: item
+            .aws_secret_key
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        aws_session_token: item
+            .aws_session_token
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        cf_account_id: item
+            .cf_account_id
+            .filter(|value| !value.trim().is_empty())
+            .map(Into::into),
+        region: item
+            .region
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "global".into())
+            .into(),
+        models: Arc::new(item.models),
+        preferences: Arc::new(item.preferences),
+        excluded_endpoints: Arc::new(endpoint_values(&item.exclude_endpoints)),
+        only_request_types: Arc::new(request_type_values(&item.only_request_types)),
+        excluded_request_types: Arc::new(request_type_values(&item.exclude_request_types)),
+        excluded_request_rules: Arc::new(request_rule_values(&item.exclude_request_rules)),
+        cursor,
+    })
 }
 
 pub(crate) struct FailedRoute<'a> {
@@ -269,6 +321,8 @@ pub struct NativeRoute {
     max_attempts: usize,
     hedging: HedgingConfig,
     attempt_contexts: HashMap<String, NativeAttemptObservation>,
+    heartbeat_repair_attempted: bool,
+    pending_heartbeat_repair: Option<Plan>,
     hedge_trigger_count: usize,
     hedge_cancelled_attempt_count: usize,
     last_provider: Option<Arc<Provider>>,
@@ -286,6 +340,7 @@ pub struct NativeRoute {
     upstream_duration_ms: u64,
     routing_ledger: Vec<Value>,
     upstream_ledger: Vec<Value>,
+    arrival: Option<crate::request_timing::RequestArrival>,
     started_at: tokio::time::Instant,
     final_emitted: bool,
     _memory_reservation: MemoryReservation,
@@ -296,6 +351,7 @@ impl NativeConfigStore {
         let path = std::env::var("RUST_RESPONSES_CONFIG_SNAPSHOT_PATH")
             .unwrap_or_else(|_| "/tmp/uni-api-rust-responses-config-v1.json".into());
         Self {
+            channel_controls: Arc::new(RwLock::new(crate::channel_controls::Controls::default())),
             path: Arc::new(PathBuf::from(path)),
             current: Arc::new(RwLock::new(None)),
             snapshot_stamp: Arc::new(Mutex::new(None)),
@@ -385,57 +441,18 @@ impl NativeConfigStore {
                 .entry(name.clone())
                 .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
                 .clone();
-            let provider = Arc::new(Provider {
-                name: name.clone().into(),
-                base_url: item.base_url.trim().to_owned().into(),
-                engine: item.engine.unwrap_or_else(|| "gpt".into()).into(),
-                api_keys: Arc::new(provider_api_keys(&item.api)),
-                project_id: item
-                    .project_id
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                private_key: item
-                    .private_key
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                client_email: item
-                    .client_email
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                aws_access_key: item
-                    .aws_access_key
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                aws_secret_key: item
-                    .aws_secret_key
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                aws_session_token: item
-                    .aws_session_token
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                cf_account_id: item
-                    .cf_account_id
-                    .filter(|value| !value.trim().is_empty())
-                    .map(Into::into),
-                region: item
-                    .region
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| "global".into())
-                    .into(),
-                models: Arc::new(item.models),
-                preferences: Arc::new(item.preferences),
-                excluded_endpoints: Arc::new(endpoint_values(&item.exclude_endpoints)),
-                only_request_types: Arc::new(request_type_values(&item.only_request_types)),
-                excluded_request_types: Arc::new(request_type_values(&item.exclude_request_types)),
-                excluded_request_rules: Arc::new(request_rule_values(&item.exclude_request_rules)),
-                cursor,
-            });
+            let provider = runtime_provider(item, cursor);
             providers_by_name.insert(name, provider.clone());
             providers.push(provider);
         }
         drop(cursors);
 
+        let api_key_order = raw
+            .api_keys
+            .iter()
+            .map(|item| item.token.trim().to_owned())
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
         let api_keys = raw
             .api_keys
             .into_iter()
@@ -467,6 +484,7 @@ impl NativeConfigStore {
             revision: raw.revision.into(),
             preferences: Arc::new(raw.preferences),
             api_keys: Arc::new(api_keys),
+            api_key_order: Arc::new(api_key_order),
             providers: Arc::new(providers),
             providers_by_name: Arc::new(providers_by_name),
             api_config: Arc::new(raw.api_config),
@@ -484,8 +502,13 @@ impl NativeConfigStore {
         Ok(true)
     }
 
-    pub(crate) async fn snapshot(&self) -> Option<Arc<Snapshot>> {
+    pub(crate) async fn base_snapshot(&self) -> Option<Arc<Snapshot>> {
         self.current.read().await.clone()
+    }
+
+    pub(crate) async fn snapshot(&self) -> Option<Arc<Snapshot>> {
+        let base = self.current.read().await.clone()?;
+        Some(self.channel_controls.read().await.overlay(base))
     }
 
     pub async fn is_ready(&self) -> bool {
@@ -493,13 +516,25 @@ impl NativeConfigStore {
     }
 
     pub async fn models_for_headers(&self, headers: &HeaderMap) -> Result<Vec<String>, u16> {
+        self.models_for_endpoint(headers, "all").await
+    }
+
+    pub(crate) async fn models_for_endpoint(
+        &self,
+        headers: &HeaderMap,
+        endpoint: &str,
+    ) -> Result<Vec<String>, u16> {
         let token = extract_api_key(headers).ok_or(403u16)?;
         let snapshot = self.snapshot().await.ok_or(503u16)?;
         let api_key = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        let allowed = |p: &Arc<Provider>| {
+            crate::channel_controls::temporary_allowed(p, api_key)
+                && provider_accepts_endpoint(p, endpoint)
+        };
         let mut models = BTreeSet::new();
         for rule in api_key.model_rules.iter() {
             if rule == "all" {
-                for provider in snapshot.providers.iter() {
+                for provider in snapshot.providers.iter().filter(|p| allowed(p)) {
                     models.extend(provider.models.keys().cloned());
                 }
                 continue;
@@ -509,6 +544,7 @@ impl NativeConfigStore {
                 if snapshot
                     .providers
                     .iter()
+                    .filter(|p| allowed(p))
                     .any(|provider| provider.models.contains_key(&model))
                 {
                     models.insert(model);
@@ -516,7 +552,11 @@ impl NativeConfigStore {
                 continue;
             }
             if let Some((provider_name, model_rule)) = rule.split_once('/') {
-                if let Some(provider) = snapshot.providers_by_name.get(provider_name) {
+                if let Some(provider) = snapshot
+                    .providers_by_name
+                    .get(provider_name)
+                    .filter(|p| allowed(p))
+                {
                     if model_rule == "*" {
                         models.extend(provider.models.keys().cloned());
                     } else if provider.models.contains_key(model_rule) {
@@ -528,6 +568,7 @@ impl NativeConfigStore {
             if snapshot
                 .providers
                 .iter()
+                .filter(|p| allowed(p))
                 .any(|provider| provider.models.contains_key(rule))
             {
                 models.insert(rule.clone());
@@ -594,11 +635,120 @@ impl NativeConfigStore {
         )
     }
 
+    pub(crate) async fn channel_catalog(
+        &self,
+        headers: &HeaderMap,
+        endpoint: &str,
+        stream: bool,
+        selected_key_id: Option<&str>,
+    ) -> Result<(Vec<Value>, String, String), u16> {
+        let token = extract_api_key(headers).ok_or(403u16)?;
+        let snapshot = self.snapshot().await.ok_or(503u16)?;
+        let caller = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        let selected_id = selected_key_id.unwrap_or_default();
+        let entries = crate::channel_catalog::entries(&snapshot, caller, Some(selected_id))?;
+        let cooldowns = self.channel_cooldowns.lock().await.clone();
+        let now = tokio::time::Instant::now();
+        let controls = self.channel_controls.read().await.routing_rules();
+        let mut rows: Vec<Value> = entries.into_iter().filter_map(|(provider, model)| {
+            if !provider_accepts_endpoint(&provider, endpoint) || (provider.engine.eq_ignore_ascii_case("typesafe") && stream) || provider.excluded_endpoints.iter().any(|v| v.trim_end_matches('/').eq_ignore_ascii_case(endpoint)) {
+                return None;
+            }
+            let upstream = provider.models.get(&model)?;
+            let route_cooling = cooldowns.get(&(provider.name.to_string(), upstream.clone())).is_some_and(|until| *until > now);
+            let (eligible, reason) = if controls.disabled(selected_id,&model,&provider.name) {
+                (false,"temporarily_disabled")
+            } else if provider.api_keys.is_empty() && provider.client_email.is_none() {
+                (false, "no_provider_key")
+            } else if route_cooling { (false, "channel_cooldown") } else { (true, "eligible") };
+            Some(json!({"provider":provider.name.as_ref(),"model":model,"upstream_model":upstream,"engine":provider.engine.as_ref(),"endpoint":endpoint,"stream":stream,"eligible":eligible,"reason":reason}))
+        }).collect();
+        rows.sort_by_key(|row| {
+            controls
+                .order(selected_id, row["model"].as_str().unwrap_or_default())
+                .and_then(|order| {
+                    order
+                        .iter()
+                        .position(|p| Some(p.as_str()) == row["provider"].as_str())
+                })
+                .unwrap_or(usize::MAX)
+        });
+        Ok((rows, snapshot.revision.to_string(), selected_id.to_owned()))
+    }
+
+    pub(crate) async fn authorize_catalog(&self, headers: &HeaderMap) -> Result<(), u16> {
+        let token = extract_api_key(headers).ok_or(403u16)?;
+        let snapshot = self.snapshot().await.ok_or(503u16)?;
+        let caller = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        if !crate::channel_catalog::can_inspect_all(&snapshot, caller) {
+            return Err(403);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn balance_provider(
+        &self,
+        headers: &HeaderMap,
+        name: &str,
+    ) -> Result<(Arc<Provider>, Option<String>), u16> {
+        let token = extract_api_key(headers).ok_or(403u16)?;
+        let snapshot = self.snapshot().await.ok_or(503u16)?;
+        let caller = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        if !crate::channel_catalog::can_inspect_all(&snapshot, caller) {
+            return Err(403);
+        }
+        let provider = snapshot
+            .providers_by_name
+            .get(name)
+            .cloned()
+            .ok_or(404u16)?;
+        let proxy = preference_string(&provider.preferences, "proxy")
+            .or_else(|| preference_string(&snapshot.preferences, "proxy"));
+        Ok((provider, proxy))
+    }
+
+    pub(crate) async fn api_key_catalog(&self, headers: &HeaderMap) -> Result<Value, u16> {
+        let token = extract_api_key(headers).ok_or(403u16)?;
+        let snapshot = self.snapshot().await.ok_or(503u16)?;
+        let caller = snapshot.api_keys.get(&token).ok_or(403u16)?;
+        if !crate::channel_catalog::can_inspect_all(&snapshot, caller) {
+            return Err(403);
+        }
+        Ok(
+            json!({"data":crate::channel_catalog::keys(&snapshot, caller),"snapshot_revision":snapshot.revision.as_ref(),"can_inspect_all":true}),
+        )
+    }
+
     pub(crate) async fn prices_for_model(&self, model: &str) -> (f64, f64) {
         self.snapshot()
             .await
             .map(|snapshot| model_prices(&snapshot.preferences, model))
             .unwrap_or((0.3, 1.0))
+    }
+
+    pub(crate) async fn keepalive_interval(
+        &self,
+        provider: &Provider,
+        request_model: &str,
+        original_model: &str,
+    ) -> Option<Duration> {
+        let snapshot = self.snapshot().await?;
+        let interval = model_preference(
+            provider,
+            &snapshot.preferences,
+            request_model,
+            original_model,
+            "keepalive_interval",
+        )
+        .unwrap_or(99999.0);
+        let timeout = model_timeout(
+            provider,
+            &snapshot.preferences,
+            request_model,
+            original_model,
+        );
+        (interval.is_finite() && interval > 0.0 && interval <= timeout)
+            .then(|| Duration::from_secs_f64(interval))
     }
 
     pub(crate) async fn auto_retry_enabled(&self, headers: &HeaderMap) -> bool {
@@ -799,9 +949,10 @@ impl NativeConfigStore {
                 message: "Too many requests".into(),
             });
         }
+        let route_key = diagnostic_key(&snapshot, &api_key, headers, endpoint)?;
         let providers = matching_providers(
             &snapshot,
-            &api_key,
+            &route_key,
             request_model,
             request_body_bytes,
             request_type,
@@ -821,7 +972,17 @@ impl NativeConfigStore {
         let providers = self
             .schedule_providers(&api_key, request_model, providers)
             .await;
-        let hedging = parse_hedging(&snapshot.preferences);
+        if providers.is_empty() {
+            return Err(RouteResolutionError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "All matching channels are temporarily disabled".into(),
+            });
+        }
+        let hedging = if headers.contains_key(TARGET_PROVIDER_HEADER) {
+            HedgingConfig::default()
+        } else {
+            parse_hedging(&snapshot.preferences)
+        };
         Ok(ResolvedRoute { providers, hedging })
     }
 
@@ -862,6 +1023,27 @@ impl NativeConfigStore {
     }
 
     pub(crate) async fn schedule_providers(
+        &self,
+        api_key: &ApiKey,
+        request_model: &str,
+        providers: Vec<Arc<Provider>>,
+    ) -> Vec<Arc<Provider>> {
+        let controls = self.channel_controls.read().await.routing_rules();
+        let key = crate::channel_catalog::key_id(&api_key.token);
+        if controls.order(&key, request_model).is_some() {
+            return controls.apply(&key, request_model, providers);
+        }
+        let scheduled = self
+            .schedule_configured_providers(api_key, request_model, providers)
+            .await;
+        if controls.is_empty() {
+            scheduled
+        } else {
+            controls.apply(&key, request_model, scheduled)
+        }
+    }
+
+    async fn schedule_configured_providers(
         &self,
         api_key: &ApiKey,
         request_model: &str,
@@ -1184,9 +1366,72 @@ impl NativeRoute {
         }
     }
 
-    pub(crate) async fn record_failure_for(&mut self, plan: &Plan, outcome: &Value) -> bool {
-        self.set_current_plan(plan);
-        self.record_failure(outcome).await
+    pub(crate) async fn record_plan_failure(&mut self, mut plan: Plan, outcome: &Value) -> bool {
+        self.set_current_plan(&plan);
+        let retryable = self.record_failure(outcome).await;
+        if self.heartbeat_repair_attempted
+            || !self.auto_retry()
+            || self.request_headers.contains_key(TARGET_PROVIDER_HEADER)
+            || self.endpoint != "/v1/responses"
+        {
+            return retryable;
+        }
+        let Some((body, changed)) = crate::responses_heartbeat::repair(&plan.body, outcome) else {
+            return retryable;
+        };
+        let Some(mut observation) = self.last_attempt.clone() else {
+            return retryable;
+        };
+        self.heartbeat_repair_attempted = true;
+        let original_attempt_id = plan.attempt_id.clone();
+        plan.body = body;
+        plan.attempt_id = native_attempt_id(&self.request_id, self.routing_attempts);
+        for (name, value) in &mut plan.headers {
+            if name.eq_ignore_ascii_case("x-oaix-routing-attempt-id") {
+                *value = plan.attempt_id.clone();
+            }
+        }
+        self.routing_attempts = self.routing_attempts.saturating_add(1);
+        self.upstream_attempts = self.upstream_attempts.saturating_add(1);
+        observation.attempt_id = plan.attempt_id.clone();
+        observation.attempt_index = self.routing_attempts;
+        observation.started_at = tokio::time::Instant::now();
+        self.attempt_contexts
+            .insert(plan.attempt_id.clone(), observation.clone());
+        plan.dispatch = self.arrival.map(|arrival| {
+            arrival.attempt(
+                crate::channel_metrics::MetricKey::new(
+                    &observation.provider,
+                    &self.request_model,
+                    &observation.actual_model,
+                    &self.endpoint,
+                    self.stream,
+                ),
+                self.request_id.clone(),
+                plan.attempt_id.clone(),
+                &self.api_key.token,
+            )
+        });
+        crate::channel_metrics::global().start(
+            &observation.provider,
+            &self.request_model,
+            &observation.actual_model,
+            &self.endpoint,
+            self.stream,
+        );
+        eprintln!(
+            "{}",
+            json!({
+                "kind":"log", "event":"responses_heartbeat_repair",
+                "event_type":"responses_heartbeat_repair", "severity":"info",
+                "source":"uni-api-ember", "fugue_table":"app_events",
+                "request_id":self.request_id, "original_attempt_id":original_attempt_id,
+                "attempt_id":plan.attempt_id, "provider":observation.provider,
+                "model":self.request_model, "heartbeat_items_converted":changed,
+            })
+        );
+        self.pending_heartbeat_repair = Some(plan);
+        true
     }
 
     pub fn request_id(&self) -> &str {
@@ -1213,9 +1458,13 @@ impl NativeRoute {
     }
 
     pub async fn next_plan(&mut self) -> Result<Option<Plan>, String> {
+        if let Some(plan) = self.pending_heartbeat_repair.take() {
+            self.set_current_plan(&plan);
+            return Ok(Some(plan));
+        }
         while self.cursor < self.max_attempts {
-            let attempt_number = self.cursor;
-            let provider = self.providers[attempt_number % self.providers.len()].clone();
+            let attempt_number = self.routing_attempts;
+            let provider = self.providers[self.cursor % self.providers.len()].clone();
             self.cursor += 1;
             self.routing_attempts = self.routing_attempts.saturating_add(1);
             let original_model = provider
@@ -1338,7 +1587,28 @@ impl NativeRoute {
             self.last_attempt = Some(observation.clone());
             self.attempt_contexts
                 .insert(attempt_id.clone(), observation);
+            crate::channel_metrics::global().start(
+                provider.name.as_ref(),
+                self.request_model.as_str(),
+                original_model.as_str(),
+                self.endpoint.as_str(),
+                self.stream,
+            );
             return Ok(Some(Plan {
+                dispatch: self.arrival.map(|arrival| {
+                    arrival.attempt(
+                        crate::channel_metrics::MetricKey::new(
+                            provider.name.as_ref(),
+                            &self.request_model,
+                            original_model.as_str(),
+                            &self.endpoint,
+                            self.stream,
+                        ),
+                        self.request_id.clone(),
+                        attempt_id.clone(),
+                        &self.api_key.token,
+                    )
+                }),
                 attempt_id,
                 url: normalize_upstream_url(&provider.base_url, &engine, self.wants_compact),
                 headers,
@@ -1406,7 +1676,7 @@ impl NativeRoute {
             false,
             policy.provider_model_unavailable,
         );
-        self.record_current_channel(false);
+        self.record_current_channel(false, outcome);
         if let (Some(provider), Some(original_model)) =
             (self.last_provider.clone(), self.last_original_model.clone())
         {
@@ -1465,6 +1735,13 @@ impl NativeRoute {
             .unwrap_or("completed");
         let success = matches!(kind, "completed" | "incomplete");
         let status = outcome_status(outcome, if success { 200 } else { 502 });
+        if matches!(kind, "semantic_failure" | "semantic_error") {
+            // Apply the normal failure accounting and cooldown policy, but
+            // never dispatch a retry after output has been committed.
+            let _ = self.record_failure(outcome).await;
+            self.emit_final_event(self.last_status, kind, outcome);
+            return;
+        }
         let upstream_status = outcome_status_from(outcome, "upstream_status_code", status);
         if success {
             self.record_success().await;
@@ -1473,7 +1750,7 @@ impl NativeRoute {
             self.last_failure_origin = failure_origin(outcome).to_owned();
         }
         self.emit_upstream_attempt(outcome, upstream_status, success, false);
-        self.record_current_channel(success);
+        self.record_current_channel(success, outcome);
         if let (Some(provider), Some(original_model)) =
             (self.last_provider.clone(), self.last_original_model.clone())
         {
@@ -1531,6 +1808,33 @@ impl NativeRoute {
 
     fn emit_routing_attempt(&mut self, event: RoutingAttemptEvent<'_>) {
         let status = event.status.unwrap_or_default();
+        let metrics = crate::channel_metrics::global();
+        let upstream_model = event
+            .provider
+            .models
+            .get(event.original_model)
+            .map(String::as_str)
+            .unwrap_or(event.original_model);
+        if event.outcome == "started" {
+            metrics.start(
+                event.provider.name.as_ref(),
+                self.request_model.as_str(),
+                upstream_model,
+                self.endpoint.as_str(),
+                self.stream,
+            );
+        } else if event.outcome == "skipped" {
+            metrics.finish(
+                event.provider.name.as_ref(),
+                self.request_model.as_str(),
+                upstream_model,
+                self.endpoint.as_str(),
+                self.stream,
+                "skipped",
+                None,
+                None,
+            );
+        }
         if self.routing_ledger.len() < 64 {
             self.routing_ledger.push(json!({
                 "attempt_id": event.attempt_id,
@@ -1596,6 +1900,25 @@ impl NativeRoute {
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
+        crate::channel_metrics::global().finish(
+            &attempt.provider,
+            &attempt.request_model,
+            &attempt.actual_model,
+            &self.endpoint,
+            attempt.stream,
+            if success { "success" } else { "failed" },
+            Some(duration_ms as f64),
+            outcome.get("first_output_ms").and_then(Value::as_f64),
+        );
+        crate::channel_metrics::global().response_timings(
+            &attempt.provider,
+            &attempt.request_model,
+            &attempt.actual_model,
+            &self.endpoint,
+            attempt.stream,
+            outcome.get("response_created_ms").and_then(Value::as_f64),
+            outcome.get("first_text_ms").and_then(Value::as_f64),
+        );
         self.upstream_duration_ms = self.upstream_duration_ms.saturating_add(duration_ms);
         let attempt_outcome = outcome
             .get("kind")
@@ -1727,6 +2050,13 @@ impl NativeRoute {
         let (prompt_price, completion_price) =
             model_prices(&self.snapshot.preferences, &self.request_model);
         self.persistence.record_request(RequestStat {
+            fact_usage: crate::fact_usage::FactUsage::from_usage(outcome.get("usage")),
+            stream: self.stream,
+            upstream_model: final_actual_model.unwrap_or_default().to_owned(),
+            status,
+            first_output_ms: outcome.get("first_output_ms").and_then(Value::as_f64),
+            response_created_ms: outcome.get("response_created_ms").and_then(Value::as_f64),
+            first_text_ms: outcome.get("first_text_ms").and_then(Value::as_f64),
             request_id: self.request_id.clone(),
             trace_id: trace_id(&self.request_headers, &self.request_id),
             endpoint: self.endpoint.clone(),
@@ -1796,19 +2126,34 @@ impl NativeRoute {
             .unwrap_or(true)
     }
 
-    fn record_current_channel(&self, success: bool) {
+    fn record_current_channel(&self, success: bool, outcome: &Value) {
         let (Some(provider), Some(provider_key)) =
             (self.last_provider.as_ref(), self.last_provider_key.as_ref())
         else {
             return;
         };
         self.persistence.record_channel(ChannelStat {
+            duration_ms: self
+                .last_attempt
+                .as_ref()
+                .map(|a| a.started_at.elapsed().as_secs_f64() * 1000.0),
+            first_output_ms: outcome.get("first_output_ms").and_then(Value::as_f64),
+            response_created_ms: outcome.get("response_created_ms").and_then(Value::as_f64),
+            first_text_ms: outcome.get("first_text_ms").and_then(Value::as_f64),
             request_id: self.request_id.clone(),
+            attempt_id: self
+                .last_attempt
+                .as_ref()
+                .map(|attempt| attempt.attempt_id.clone())
+                .unwrap_or_default(),
             provider: provider.name.to_string(),
             model: self.request_model.clone(),
+            upstream_model: self.last_original_model.clone().unwrap_or_default(),
             api_key: self.api_key.token.to_string(),
             provider_api_key: provider_key.clone(),
             success,
+            endpoint: self.endpoint.clone(),
+            stream: self.stream,
         });
     }
 }
@@ -2120,9 +2465,18 @@ pub async fn prepare_native_request(
             .expect("checked JSON object")
             .insert("stream".into(), Value::Bool(stream));
     }
+    let route_key = match diagnostic_key(&snapshot, &api_key, &parts.headers, normalized_endpoint) {
+        Ok(key) => key,
+        Err(error) => {
+            return NativePreparation::Response(json_response(
+                error.status,
+                json!({"error":error.message}),
+            ))
+        }
+    };
     let providers = match matching_providers(
         &snapshot,
-        &api_key,
+        &route_key,
         &request_model,
         observation.body_bytes,
         request_type,
@@ -2153,6 +2507,12 @@ pub async fn prepare_native_request(
     let providers = store
         .schedule_providers(&api_key, &request_model, providers)
         .await;
+    if providers.is_empty() {
+        return NativePreparation::Response(json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":"All matching channels are temporarily disabled"}),
+        ));
+    }
     if providers.iter().any(|provider| {
         !matches!(provider.engine.as_ref(), "gpt" | "codex")
             || provider.api_keys.is_empty()
@@ -2220,9 +2580,14 @@ pub async fn prepare_native_request(
             json!({"error": "Too many requests"}),
         ));
     }
-    let retry_count = compute_retry_count(&providers)
-        .max(api_key_retry_budget(&api_key, providers.len()))
-        .min(100);
+    let targeted = parts.headers.contains_key(TARGET_PROVIDER_HEADER);
+    let retry_count = if targeted {
+        1
+    } else {
+        compute_retry_count(&providers)
+            .max(api_key_retry_budget(&api_key, providers.len()))
+            .min(100)
+    };
     NativePreparation::Ready(NativeRoute {
         store: store.clone(),
         codex_oauth,
@@ -2241,8 +2606,14 @@ pub async fn prepare_native_request(
         request_body_bytes: observation.body_bytes,
         cursor: 0,
         max_attempts: retry_count,
-        hedging: parse_hedging(&snapshot.preferences),
+        hedging: if targeted {
+            HedgingConfig::default()
+        } else {
+            parse_hedging(&snapshot.preferences)
+        },
         attempt_contexts: HashMap::new(),
+        heartbeat_repair_attempted: false,
+        pending_heartbeat_repair: None,
         hedge_trigger_count: 0,
         hedge_cancelled_attempt_count: 0,
         last_provider: None,
@@ -2260,6 +2631,10 @@ pub async fn prepare_native_request(
         upstream_duration_ms: 0,
         routing_ledger: Vec::new(),
         upstream_ledger: Vec::new(),
+        arrival: parts
+            .extensions
+            .get::<crate::request_timing::RequestArrival>()
+            .copied(),
         started_at: tokio::time::Instant::now(),
         final_emitted: false,
         _memory_reservation: memory_reservation,
@@ -2304,6 +2679,69 @@ fn nested_keys_for_model(snapshot: &Snapshot, key: &ApiKey, model: &str) -> Vec<
         &mut std::collections::BTreeSet::new(),
     );
     out
+}
+
+// Explicit administrator-only diagnostic routing. The temporary key is never
+// written to the snapshot; normal traffic retains its configured routing graph.
+pub(crate) const TARGET_PROVIDER_HEADER: &str = "x-uni-api-provider";
+
+fn diagnostic_key(
+    snapshot: &Snapshot,
+    key: &ApiKey,
+    headers: &HeaderMap,
+    endpoint: &str,
+) -> Result<ApiKey, RouteResolutionError> {
+    let Some(value) = headers.get(TARGET_PROVIDER_HEADER) else {
+        return Ok(key.clone());
+    };
+    if !crate::channel_catalog::can_inspect_all(snapshot, key) {
+        return Err(RouteResolutionError {
+            status: StatusCode::FORBIDDEN,
+            message: "Targeted requests require a platform administrator key".into(),
+        });
+    }
+    if endpoint.trim_end_matches('/') != "/v1/responses" {
+        return Err(RouteResolutionError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Targeted requests require /v1/responses".into(),
+        });
+    }
+    let name = value
+        .to_str()
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| RouteResolutionError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Invalid target provider".into(),
+        })?;
+    if name.contains('/') || snapshot.api_keys.contains_key(name) {
+        return Err(RouteResolutionError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Ambiguous target provider name".into(),
+        });
+    }
+    if !snapshot.providers_by_name.contains_key(name) {
+        return Err(RouteResolutionError {
+            status: StatusCode::NOT_FOUND,
+            message: "Target provider not found".into(),
+        });
+    }
+    let mut diagnostic = key.clone();
+    diagnostic.model_rules = Arc::new(vec![format!("{name}/*")]);
+    let mut preferences = (*key.preferences).clone();
+    preferences.remove("__route_graph");
+    preferences.insert("__diagnostic_provider".into(), json!(name));
+    diagnostic.preferences = Arc::new(preferences);
+    Ok(diagnostic)
+}
+
+pub(crate) fn provider_accepts_endpoint(provider: &Provider, endpoint: &str) -> bool {
+    let endpoint = endpoint.trim_end_matches('/');
+    if endpoint == "all" {
+        return true;
+    }
+    let typesafe = provider.engine.trim().eq_ignore_ascii_case("typesafe");
+    typesafe == (endpoint == "/v1/systemone")
 }
 
 fn matching_providers(
@@ -2375,14 +2813,19 @@ fn matching_providers(
         &mut matches,
         &mut std::collections::BTreeSet::new(),
     );
-    matches.sort_by(|a, b| a.name.cmp(&b.name));
-    matches.dedup_by(|a, b| a.name == b.name);
+    // First occurrence defines priority, including nested key and wildcard rules.
+    // Sorting to deduplicate silently changes fixed_priority into name order.
+    let mut seen = BTreeSet::new();
+    matches.retain(|provider| seen.insert(provider.name.clone()));
     matches.retain(|provider| {
-        !provider.excluded_endpoints.iter().any(|excluded| {
-            excluded
-                .trim_end_matches('/')
-                .eq_ignore_ascii_case(endpoint)
-        }) && provider_accepts_body(provider, request_body_bytes)
+        crate::channel_controls::temporary_allowed(provider, api_key)
+            && provider_accepts_endpoint(provider, endpoint)
+            && !provider.excluded_endpoints.iter().any(|excluded| {
+                excluded
+                    .trim_end_matches('/')
+                    .eq_ignore_ascii_case(endpoint)
+            })
+            && provider_accepts_body(provider, request_body_bytes)
             && provider_accepts_request_type(provider, request_type)
             && provider_accepts_request_rules(
                 provider,
@@ -2636,7 +3079,10 @@ fn detect_request_type(payload: &Map<String, Value>) -> Option<&'static str> {
     is_compaction.then_some("compaction")
 }
 
-fn provider_accepts_request_type(provider: &Provider, request_type: Option<&str>) -> bool {
+pub(crate) fn provider_accepts_request_type(
+    provider: &Provider,
+    request_type: Option<&str>,
+) -> bool {
     if !provider.only_request_types.is_empty()
         && !request_type.is_some_and(|value| {
             provider
@@ -2686,7 +3132,7 @@ fn request_reasoning_effort(payload: &Map<String, Value>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn provider_accepts_request_rules(
+pub(crate) fn provider_accepts_request_rules(
     provider: &Provider,
     endpoint: &str,
     request_model: &str,
@@ -2827,16 +3273,23 @@ pub(crate) fn apply_overrides(
     provider: &Provider,
     request_model: &str,
 ) {
-    let Some(overrides) = provider
+    if let Some(overrides) = provider
         .preferences
         .get("post_body_parameter_overrides")
         .and_then(Value::as_object)
-    else {
-        return;
-    };
-    apply_override_section(root, overrides, provider, true);
-    if let Some(model) = overrides.get(request_model).and_then(Value::as_object) {
-        apply_override_section(root, model, provider, false);
+    {
+        apply_override_section(root, overrides, provider, true);
+        if let Some(model) = overrides.get(request_model).and_then(Value::as_object) {
+            apply_override_section(root, model, provider, false);
+        }
+    }
+    // Codex wire requirements also apply when no overrides are configured,
+    // and cannot be undone by provider-wide or model-specific overrides.
+    // Endpoint-specific sanitizers still run afterwards (e.g. compact drops store).
+    if provider.engine.trim().eq_ignore_ascii_case("codex") {
+        root.insert("store".into(), Value::Bool(false));
+        root.remove("response_format");
+        root.remove("temperature");
     }
 }
 
@@ -3112,6 +3565,12 @@ fn build_headers(
             headers.insert(name, value.to_owned());
         }
     }
+    if let Some(value) = incoming
+        .get("x-oaix-settlement-nonce")
+        .and_then(|v| v.to_str().ok())
+    {
+        headers.insert("X-OAIX-Settlement-Nonce".into(), value.to_owned());
+    }
     if provider
         .preferences
         .get("oaix_routing_attempt_id")
@@ -3171,7 +3630,7 @@ fn header_or(headers: &HeaderMap, name: &str, default: &str) -> String {
         .to_owned()
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct Timeouts {
     pub(crate) connect: Option<f64>,
     pub(crate) write: Option<f64>,
@@ -3182,7 +3641,7 @@ pub(crate) struct Timeouts {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_timeouts(
+pub(crate) fn resolve_timeouts(
     snapshot: &Snapshot,
     provider: &Provider,
     request_model: &str,
@@ -3231,6 +3690,17 @@ fn resolve_timeouts(
         first_byte: values
             .get("first_byte")
             .and_then(Value::as_f64)
+            // Non-streaming providers may withhold headers until generation is
+            // complete. Preserve the legacy total-only policy instead of
+            // silently shortening it with the model's streaming fallback.
+            // An explicitly configured first_byte (including zero) still wins.
+            .or_else(|| {
+                if stream {
+                    None
+                } else {
+                    values.get("total").and_then(Value::as_f64)
+                }
+            })
             .or(Some(base)),
         idle: values.get("idle").and_then(Value::as_f64),
         total: values.get("total").and_then(Value::as_f64),
@@ -3243,31 +3713,48 @@ fn model_timeout(
     request_model: &str,
     original_model: &str,
 ) -> f64 {
+    model_preference(
+        provider,
+        global,
+        request_model,
+        original_model,
+        "model_timeout",
+    )
+    .unwrap_or(100.0)
+}
+
+fn model_preference(
+    provider: &Provider,
+    global: &Map<String, Value>,
+    request_model: &str,
+    original_model: &str,
+    preference: &str,
+) -> Option<f64> {
     for preferences in [&provider.preferences, global] {
-        let Some(timeout) = preferences.get("model_timeout") else {
+        let Some(timeout) = preferences.get(preference) else {
             continue;
         };
         if let Some(value) = timeout.as_f64() {
-            return value;
+            return Some(value);
         }
         let Some(values) = timeout.as_object() else {
             continue;
         };
         if let Some(value) = model_timeout_value(values, request_model) {
-            return value;
+            return Some(value);
         }
         if let Some(value) = model_timeout_value(values, original_model) {
-            return value;
+            return Some(value);
         }
         if let Some(value) = values
             .iter()
             .find(|(key, value)| key.eq_ignore_ascii_case("default") && value.as_f64().is_some())
             .and_then(|(_, value)| value.as_f64())
         {
-            return value;
+            return Some(value);
         }
     }
-    100.0
+    None
 }
 
 fn model_timeout_value(values: &Map<String, Value>, model: &str) -> Option<f64> {
@@ -3551,9 +4038,14 @@ fn remap_provider_status(status: u16, detail: &str) -> u16 {
     if is_provider_model_unavailable(status, detail) {
         return 503;
     }
+    if is_provider_request_processing_failure(status, detail) {
+        return 502;
+    }
     if detail.contains("<center><h1>400 Bad Request</h1></center>")
         || detail.contains("Provider API error: bad response status code 400")
-        || status == 400 && is_model_pricing_unconfigured(detail)
+        || status == 400
+            && (is_model_pricing_unconfigured(detail)
+                || is_provider_minimum_input_restriction(detail))
     {
         return 502;
     }
@@ -3640,7 +4132,11 @@ fn is_provider_model_unavailable(status: u16, detail: &str) -> bool {
         }
         if message.is_some_and(|value| {
             let lower = value.to_ascii_lowercase();
-            MARKERS.iter().any(|marker| lower.contains(marker))
+            // Some providers report model availability as invalid_request_error
+            // without a model-specific code. Match the whole message so echoed
+            // input in an ordinary validation error does not trigger failover.
+            lower.trim() == "this model is not available."
+                || MARKERS.iter().any(|marker| lower.contains(marker))
         }) {
             return true;
         }
@@ -3649,6 +4145,63 @@ fn is_provider_model_unavailable(status: u16, detail: &str) -> bool {
             break;
         };
         candidate = nested.to_owned();
+    }
+    false
+}
+
+fn is_provider_request_processing_failure(status: u16, detail: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+
+    let mut candidate = detail.to_owned();
+    for _ in 0..3 {
+        let parsed = serde_json::from_str::<Value>(&candidate).ok();
+        if let Some(error) = parsed.as_ref().and_then(|payload| {
+            payload
+                .get("error")
+                .filter(|value| value.is_object())
+                .or_else(|| payload.get("detail").filter(|value| value.is_object()))
+        }) {
+            // Some gateways hide the original failure behind this generic 400.
+            // Require the explicit upstream type and whole message; a specific
+            // validation code or echoed input must keep its client-error policy.
+            let matches = |field: &str, expected: &str| {
+                error
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
+            };
+            let generic_code =
+                error.get("code").is_none_or(Value::is_null) || matches("code", "upstream_error");
+            if matches("type", "upstream_error")
+                && matches("message", "Upstream request failed")
+                && generic_code
+            {
+                return true;
+            }
+        }
+        let message = match parsed.as_ref() {
+            Some(payload) => payload
+                .pointer("/error/message")
+                .or_else(|| payload.pointer("/detail/message"))
+                .or_else(|| payload.get("message"))
+                .or_else(|| payload.get("error"))
+                .or_else(|| payload.get("detail"))
+                .unwrap_or(payload)
+                .as_str(),
+            None => Some(candidate.as_str()),
+        };
+        let Some(message) = message else {
+            return false;
+        };
+        if message.trim_start().starts_with('{') {
+            candidate = message.to_owned();
+            continue;
+        }
+        return message
+            .trim()
+            .eq_ignore_ascii_case("The upstream service could not process this request.");
     }
     false
 }
@@ -3682,6 +4235,50 @@ fn is_model_pricing_unconfigured(detail: &str) -> bool {
             .split_whitespace()
             .collect::<String>()
             .contains("价格尚未由管理员配置")
+}
+
+fn is_provider_minimum_input_restriction(detail: &str) -> bool {
+    // A channel key's minimum-input policy is not a malformed client request.
+    // Read only error messages (including JSON-escaped/wrapped messages), never
+    // echoed request fields. Neither the provider nor the numeric limit matters.
+    let mut candidate = detail.to_owned();
+    for _ in 0..3 {
+        let parsed = serde_json::from_str::<Value>(&candidate).ok();
+        let message = match parsed.as_ref() {
+            Some(payload) => payload
+                .pointer("/error/message")
+                .or_else(|| payload.pointer("/detail/message"))
+                .or_else(|| payload.get("message"))
+                .or_else(|| payload.get("error"))
+                .or_else(|| payload.get("detail"))
+                .unwrap_or(payload)
+                .as_str(),
+            None => Some(candidate.as_str()),
+        };
+        let Some(message) = message else {
+            return false;
+        };
+        if message.trim_start().starts_with('{') {
+            candidate = message.to_owned();
+            continue;
+        }
+        let compact = message
+            .split_whitespace()
+            .collect::<String>()
+            .to_ascii_lowercase();
+        return [
+            ("该令牌不接受输入少于", "token的请求"),
+            ("thiskeydoesnotacceptrequestswithfewerthan", "inputtokens"),
+        ]
+        .iter()
+        .any(|(prefix, suffix)| {
+            compact.split_once(prefix).is_some_and(|(_, tail)| {
+                let after_number = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+                after_number.len() < tail.len() && after_number.starts_with(suffix)
+            })
+        });
+    }
+    false
 }
 
 fn is_missing_persisted_item_error(detail: &str) -> bool {
@@ -3747,7 +4344,10 @@ fn tpr_exceeded(rules: &[(usize, u64)], estimated_tokens: usize) -> bool {
         .any(|(limit, seconds)| *seconds == 0 && estimated_tokens > *limit)
 }
 
-fn parse_rate_limits(value: Option<&Value>, model: Option<&str>) -> Option<Vec<(usize, u64)>> {
+pub(crate) fn parse_rate_limits(
+    value: Option<&Value>,
+    model: Option<&str>,
+) -> Option<Vec<(usize, u64)>> {
     let raw = match value {
         None | Some(Value::Null) => "999999/min",
         Some(Value::String(value)) => value.trim(),
@@ -3926,6 +4526,7 @@ mod tests {
             revision: Arc::from("0".repeat(64)),
             preferences: Arc::new(Map::new()),
             api_keys: Arc::new(HashMap::new()),
+            api_key_order: Arc::new(Vec::new()),
             providers: Arc::new(vec![provider.clone()]),
             providers_by_name: Arc::new(HashMap::from([(
                 provider.name.to_string(),
@@ -3965,6 +4566,8 @@ mod tests {
             max_attempts,
             hedging: HedgingConfig::default(),
             attempt_contexts: HashMap::new(),
+            heartbeat_repair_attempted: false,
+            pending_heartbeat_repair: None,
             hedge_trigger_count: 0,
             hedge_cancelled_attempt_count: 0,
             last_provider: None,
@@ -3982,20 +4585,892 @@ mod tests {
             upstream_duration_ms: 0,
             routing_ledger: Vec::new(),
             upstream_ledger: Vec::new(),
+            arrival: Some(crate::request_timing::RequestArrival::now()),
             started_at: tokio::time::Instant::now(),
             final_emitted: false,
             _memory_reservation: memory_reservation,
         }
     }
 
+    async fn catalog_fixture() -> NativeConfigStore {
+        let store = NativeConfigStore::new();
+        let mut providers = Vec::new();
+        for name in ["z-first", "a-second", "m-third", "excluded"] {
+            let mut p = provider();
+            p.name = name.into();
+            p.models = Arc::new(HashMap::from([
+                ("shared".into(), "actual-shared".into()),
+                ("extra".into(), "actual-extra".into()),
+                ("vendor/model".into(), "actual-slash".into()),
+            ]));
+            if name == "excluded" {
+                p.excluded_endpoints = Arc::new(vec!["/v1/responses".into()]);
+            }
+            providers.push(Arc::new(p));
+        }
+        let mut keys = HashMap::new();
+        for (token, role, rules) in [
+            ("dashboard-first", "user", vec!["z-first/shared"]),
+            (
+                "restricted",
+                "user",
+                vec!["m-third/shared", "a-second/*", "m-third/shared"],
+            ),
+            ("parent", "user", vec!["restricted/shared", "z-first/extra"]),
+            (
+                "mixed",
+                "user",
+                vec!["m-third/extra", "shared", "<vendor/model>", "z-first/*"],
+            ),
+            ("admin-key", "admin", vec!["all"]),
+        ] {
+            keys.insert(
+                token.to_owned(),
+                Arc::new(ApiKey {
+                    token: token.into(),
+                    model_rules: Arc::new(vec!["all".into()]),
+                    role: role.into(),
+                    preferences: Arc::new(Map::from_iter([("__route_graph".into(), json!(rules))])),
+                    weights: Arc::new(Map::new()),
+                    native_supported: true,
+                }),
+            );
+        }
+        *store.current.write().await = Some(Arc::new(Snapshot {
+            revision: "0".repeat(64).into(),
+            preferences: Arc::new(Map::new()),
+            api_keys: Arc::new(keys),
+            api_key_order: Arc::new(
+                [
+                    "dashboard-first",
+                    "restricted",
+                    "parent",
+                    "mixed",
+                    "admin-key",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            ),
+            providers_by_name: Arc::new(
+                providers
+                    .iter()
+                    .map(|p| (p.name.to_string(), p.clone()))
+                    .collect(),
+            ),
+            providers: Arc::new(providers),
+            api_config: Arc::new(json!({})),
+        }));
+        store
+    }
+    #[tokio::test]
+    async fn temporary_channel_import_scopes_routing_and_resets_without_config_writes() {
+        let store = catalog_fixture().await;
+        let admin = catalog_headers("dashboard-first");
+        let key = crate::channel_catalog::key_id("restricted");
+        let original = store.current.read().await.clone().unwrap();
+        let initial = store.controls_view(&admin).await.unwrap();
+        let input = |revision: &Value, position| crate::channel_controls::ImportMutation {
+            revision: revision.as_str().unwrap().into(),
+            action: String::new(),
+            api_key_id: key.clone(),
+            provider: "sub2api-fixture".into(),
+            base_url: "https://example.com/v1/responses".into(),
+            api_key: "secret-import-key".into(),
+            models: vec!["shared".into(), "new-model".into()],
+            position,
+        };
+        assert!(store
+            .import_temporary_channel(
+                &catalog_headers("restricted"),
+                input(&initial["revision"], 1)
+            )
+            .await
+            .is_err());
+        assert!(store
+            .import_temporary_channel(&admin, input(&initial["revision"], 999))
+            .await
+            .is_err());
+        let changed = store
+            .import_temporary_channel(&admin, input(&initial["revision"], 1))
+            .await
+            .unwrap();
+        assert!(!changed.to_string().contains("secret-import-key"));
+        assert!(store
+            .import_temporary_channel(&admin, input(&initial["revision"], 1))
+            .await
+            .is_err());
+        let snapshot = store.snapshot().await.unwrap();
+        assert!(Arc::ptr_eq(&snapshot, &store.snapshot().await.unwrap()));
+        for token in ["restricted", "parent", "admin-key", "mixed"] {
+            let api_key = &snapshot.api_keys[token];
+            let providers =
+                matching_providers(&snapshot, api_key, "shared", 0, None, None, "/v1/responses")
+                    .unwrap();
+            assert_eq!(
+                providers
+                    .iter()
+                    .any(|p| p.name.as_ref() == "sub2api-fixture"),
+                token == "restricted"
+            );
+            let ordered = store.schedule_providers(api_key, "shared", providers).await;
+            if token == "restricted" {
+                assert_eq!(ordered[0].name.as_ref(), "sub2api-fixture");
+            }
+            let rows = crate::channel_catalog::entries(
+                &snapshot,
+                &snapshot.api_keys["dashboard-first"],
+                Some(&crate::channel_catalog::key_id(token)),
+            )
+            .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .any(|(p, _)| p.name.as_ref() == "sub2api-fixture"),
+                token == "restricted"
+            );
+        }
+        assert!(!store
+            .models_for_headers(&catalog_headers("admin-key"))
+            .await
+            .unwrap()
+            .contains(&"new-model".to_string()));
+        assert!(store
+            .models_for_headers(&catalog_headers("restricted"))
+            .await
+            .unwrap()
+            .contains(&"new-model".to_string()));
+        assert!(!original.providers_by_name.contains_key("sub2api-fixture"));
+        assert!(Arc::ptr_eq(
+            &original,
+            &store.current.read().await.clone().unwrap()
+        ));
+        // Re-adding replaces this scoped provider, never creates a duplicate.
+        let changed = store
+            .import_temporary_channel(&admin, input(&changed["revision"], 1))
+            .await
+            .unwrap();
+        assert_eq!(changed["temporary_channels"].as_array().unwrap().len(), 1);
+        let reset = crate::channel_controls::Mutation {
+            revision: changed["revision"].as_str().unwrap().into(),
+            action: "reset".into(),
+            api_key_id: key,
+            model: "shared".into(),
+            order: vec![],
+            disabled: vec![],
+        };
+        let changed = store.mutate_controls(&admin, reset).await.unwrap();
+        assert!(
+            !store.snapshot().await.unwrap().providers_by_name["sub2api-fixture"]
+                .models
+                .contains_key("shared")
+        );
+        let reset = crate::channel_controls::Mutation {
+            revision: changed["revision"].as_str().unwrap().into(),
+            action: "reset_all".into(),
+            api_key_id: "".into(),
+            model: "".into(),
+            order: vec![],
+            disabled: vec![],
+        };
+        store.mutate_controls(&admin, reset).await.unwrap();
+        assert!(!store
+            .snapshot()
+            .await
+            .unwrap()
+            .providers_by_name
+            .contains_key("sub2api-fixture"));
+    }
+    #[tokio::test]
+    async fn temporary_channel_management_preserves_other_routes_and_rejects_stale_edits() {
+        let store = catalog_fixture().await;
+        let admin = catalog_headers("dashboard-first");
+        let key = crate::channel_catalog::key_id("restricted");
+        let original = store.current.read().await.clone().unwrap();
+        let mut view = store.controls_view(&admin).await.unwrap();
+        let input = |view: &Value, provider: &str, action: &str, models: Vec<&str>| {
+            crate::channel_controls::ImportMutation {
+                revision: view["revision"].as_str().unwrap().into(),
+                action: action.into(),
+                api_key_id: key.clone(),
+                provider: provider.into(),
+                base_url: "https://example.com/v1/responses".into(),
+                api_key: "fixture-secret".into(),
+                models: models.into_iter().map(String::from).collect(),
+                position: 1,
+            }
+        };
+        for p in ["sub2api-one", "sub2api-two"] {
+            view = store
+                .import_temporary_channel(&admin, input(&view, p, "", vec!["shared", "new-model"]))
+                .await
+                .unwrap();
+        }
+        view = store
+            .mutate_controls(
+                &admin,
+                crate::channel_controls::Mutation {
+                    revision: view["revision"].as_str().unwrap().into(),
+                    action: "set".into(),
+                    api_key_id: key.clone(),
+                    model: "shared".into(),
+                    order: vec!["sub2api-two".into(), "sub2api-one".into()],
+                    disabled: vec!["sub2api-two".into()],
+                },
+            )
+            .await
+            .unwrap();
+        let before = view.clone();
+        let mut wrong = input(&view, "sub2api-one", "delete", vec![]);
+        wrong.api_key_id = crate::channel_catalog::key_id("admin-key");
+        assert!(store.import_temporary_channel(&admin, wrong).await.is_err());
+        assert_eq!(view, store.controls_view(&admin).await.unwrap());
+        view = store
+            .import_temporary_channel(
+                &admin,
+                input(&view, "sub2api-one", "replace", vec!["new-model"]),
+            )
+            .await
+            .unwrap();
+        let snapshot = store.snapshot().await.unwrap();
+        assert!(!snapshot.providers_by_name["sub2api-one"]
+            .models
+            .contains_key("shared"));
+        assert!(snapshot.providers_by_name["sub2api-two"]
+            .models
+            .contains_key("shared"));
+        let rule = view["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["model"] == "shared")
+            .unwrap();
+        assert_eq!(rule["order"], json!(["sub2api-two"]));
+        assert_eq!(rule["disabled"], json!(["sub2api-two"]));
+        let rejected = store
+            .import_temporary_channel(&admin, input(&before, "sub2api-one", "delete", vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        view = store
+            .import_temporary_channel(&admin, input(&view, "sub2api-one", "delete", vec![]))
+            .await
+            .unwrap();
+        let snapshot = store.snapshot().await.unwrap();
+        assert!(!snapshot.providers_by_name.contains_key("sub2api-one"));
+        assert!(snapshot.providers_by_name.contains_key("sub2api-two"));
+        assert!(!view["rules"].to_string().contains("sub2api-one"));
+        assert!(!view.to_string().contains("fixture-secret"));
+        assert!(Arc::ptr_eq(
+            &original,
+            &store.current.read().await.clone().unwrap()
+        ));
+        assert!(store
+            .import_temporary_channel(
+                &catalog_headers("restricted"),
+                input(&view, "sub2api-two", "delete", vec![])
+            )
+            .await
+            .is_err());
+    }
+    #[tokio::test]
+    async fn retained_controls_replace_atomically_and_validate_before_serving() {
+        use crate::channel_controls::{RestoreMutation, RetainedChannel, RetainedSnapshot, Rule};
+        let store = catalog_fixture().await;
+        let admin = catalog_headers("dashboard-first");
+        let key = crate::channel_catalog::key_id("restricted");
+        let snapshot = RetainedSnapshot {
+            channel_settings: std::collections::BTreeMap::new(),
+            version: 1,
+            rules: vec![Rule {
+                api_key_id: key.clone(),
+                model: "shared".into(),
+                order: vec!["sub2api-retained".into()],
+                disabled: vec!["sub2api-retained".into()],
+            }],
+            temporary_channels: vec![RetainedChannel {
+                provider: "sub2api-retained".into(),
+                api_key_id: key,
+                base_url: "https://example.com/v1/responses".into(),
+                api_key: "restore-secret".into(),
+                definition: None,
+                models: vec!["shared".into()],
+            }],
+        };
+        let initial = store.controls_view(&admin).await.unwrap();
+        let restored = store
+            .restore_controls(
+                &admin,
+                RestoreMutation {
+                    revision: initial["revision"].as_str().unwrap().into(),
+                    snapshot: snapshot.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored["temporary_channels"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            restored["rules"][0]["disabled"],
+            json!(["sub2api-retained"])
+        );
+        assert!(!restored.to_string().contains("restore-secret"));
+        let before = restored.clone();
+        let mut invalid = snapshot.clone();
+        invalid.rules[0].order.push("missing".into());
+        assert!(store
+            .restore_controls(
+                &admin,
+                RestoreMutation {
+                    revision: restored["revision"].as_str().unwrap().into(),
+                    snapshot: invalid
+                }
+            )
+            .await
+            .is_err());
+        assert_eq!(before, store.controls_view(&admin).await.unwrap());
+        assert!(store
+            .restore_controls(
+                &admin,
+                RestoreMutation {
+                    revision: initial["revision"].as_str().unwrap().into(),
+                    snapshot: snapshot.clone()
+                }
+            )
+            .await
+            .is_err());
+        assert!(store
+            .restore_controls(
+                &catalog_headers("restricted"),
+                RestoreMutation {
+                    revision: restored["revision"].as_str().unwrap().into(),
+                    snapshot: snapshot.clone()
+                }
+            )
+            .await
+            .is_err());
+        let fresh = catalog_fixture().await;
+        let view = fresh.controls_view(&admin).await.unwrap();
+        let after = fresh
+            .restore_controls(
+                &admin,
+                RestoreMutation {
+                    revision: view["revision"].as_str().unwrap().into(),
+                    snapshot,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(after["rules"], restored["rules"]);
+        assert_eq!(after["temporary_channels"], restored["temporary_channels"]);
+        assert_ne!(after["instance_id"], restored["instance_id"]);
+    }
+    fn catalog_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+    fn catalog_pairs(rows: &[Value]) -> Vec<(&str, &str)> {
+        rows.iter()
+            .map(|r| {
+                (
+                    r["provider"].as_str().unwrap(),
+                    r["model"].as_str().unwrap(),
+                )
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn temporary_controls_are_scoped_reversible_and_revision_guarded() {
+        use crate::channel_controls::Mutation;
+        let store = catalog_fixture().await;
+        let snapshot = store.snapshot().await.unwrap();
+        let headers = catalog_headers("dashboard-first");
+        assert_eq!(
+            store
+                .controls_view(&catalog_headers("restricted"))
+                .await
+                .unwrap_err(),
+            403
+        );
+        let initial = store.controls_view(&headers).await.unwrap();
+        let input = |revision: &Value,
+                     action: &str,
+                     key: &str,
+                     model: &str,
+                     order: Vec<&str>,
+                     disabled: Vec<&str>| {
+            serde_json::from_value::<Mutation>(json!({"revision":revision,"action":action,"api_key_id":key,"model":model,"order":order,"disabled":disabled})).unwrap()
+        };
+        assert!(store
+            .mutate_controls(
+                &catalog_headers("restricted"),
+                input(&initial["revision"], "set", "", "", vec![], vec!["z-first"])
+            )
+            .await
+            .is_err());
+        assert!(store
+            .mutate_controls(
+                &headers,
+                input(&initial["revision"], "set", "", "", vec!["missing"], vec![])
+            )
+            .await
+            .is_err());
+        let changed = store
+            .mutate_controls(
+                &headers,
+                input(
+                    &initial["revision"],
+                    "set",
+                    "",
+                    "",
+                    vec!["m-third", "a-second", "z-first"],
+                    vec!["z-first"],
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .mutate_controls(
+                &headers,
+                input(&initial["revision"], "reset", "", "", vec![], vec![])
+            )
+            .await
+            .is_err());
+        let names = |providers: Vec<Arc<Provider>>| {
+            providers
+                .into_iter()
+                .map(|p| p.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let available = vec![
+            snapshot.providers_by_name["z-first"].clone(),
+            snapshot.providers_by_name["a-second"].clone(),
+            snapshot.providers_by_name["m-third"].clone(),
+        ];
+        assert_eq!(
+            names(
+                store
+                    .schedule_providers(
+                        &snapshot.api_keys["admin-key"],
+                        "shared",
+                        available.clone()
+                    )
+                    .await
+            ),
+            vec!["m-third", "a-second"]
+        );
+        // No allow-list expansion: configured matches remain the sole candidates.
+        assert!(store
+            .schedule_providers(
+                &snapshot.api_keys["dashboard-first"],
+                "shared",
+                vec![snapshot.providers_by_name["z-first"].clone()]
+            )
+            .await
+            .is_empty());
+        let id = crate::channel_catalog::key_id("restricted");
+        let scoped = store
+            .mutate_controls(
+                &headers,
+                input(
+                    &changed["revision"],
+                    "set",
+                    &id,
+                    "shared",
+                    vec!["a-second", "m-third"],
+                    vec!["m-third"],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            names(
+                store
+                    .schedule_providers(
+                        &snapshot.api_keys["restricted"],
+                        "shared",
+                        available.clone()
+                    )
+                    .await
+            ),
+            vec!["a-second"]
+        );
+        assert_eq!(
+            names(
+                store
+                    .schedule_providers(
+                        &snapshot.api_keys["restricted"],
+                        "extra",
+                        available.clone()
+                    )
+                    .await
+            ),
+            vec!["m-third", "a-second"]
+        );
+        assert_eq!(
+            names(
+                store
+                    .schedule_providers(
+                        &snapshot.api_keys["admin-key"],
+                        "shared",
+                        available.clone()
+                    )
+                    .await
+            ),
+            vec!["m-third", "a-second"]
+        );
+        let (rows, _, _) = store
+            .channel_catalog(&headers, "/v1/responses", false, Some(&id))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|r| r["provider"] == "m-third" && r["model"] == "shared")
+                .unwrap()["reason"],
+            "temporarily_disabled"
+        );
+        let reset = store
+            .mutate_controls(
+                &headers,
+                input(&scoped["revision"], "reset", &id, "shared", vec![], vec![]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reset["rules"].as_array().unwrap().len(), 1);
+        let cleared = store
+            .mutate_controls(
+                &headers,
+                input(&reset["revision"], "reset_all", "", "", vec![], vec![]),
+            )
+            .await
+            .unwrap();
+        assert!(cleared["rules"].as_array().unwrap().is_empty());
+        assert_eq!(
+            names(
+                store
+                    .schedule_providers(&snapshot.api_keys["admin-key"], "shared", available)
+                    .await
+            ),
+            vec!["z-first", "a-second", "m-third"]
+        );
+        let restarted = catalog_fixture().await;
+        let fresh = restarted.controls_view(&headers).await.unwrap();
+        assert_ne!(initial["instance_id"], fresh["instance_id"]);
+        assert!(fresh["rules"].as_array().unwrap().is_empty());
+        assert!(restarted
+            .mutate_controls(
+                &headers,
+                input(&cleared["revision"], "set", "", "", vec![], vec!["z-first"])
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn diagnostic_routing_is_admin_only_and_never_falls_back() {
+        let store = catalog_fixture().await;
+        let snapshot = store.snapshot().await.unwrap();
+        for token in ["dashboard-first", "admin-key"] {
+            let key = &snapshot.api_keys[token];
+            let mut headers = catalog_headers(token);
+            headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("m-third"));
+            let targeted = diagnostic_key(&snapshot, key, &headers, "/v1/responses")
+                .ok()
+                .unwrap();
+            let providers = matching_providers(
+                &snapshot,
+                &targeted,
+                "shared",
+                100,
+                None,
+                None,
+                "/v1/responses",
+            )
+            .unwrap();
+            assert_eq!(
+                providers
+                    .iter()
+                    .map(|p| p.name.as_ref())
+                    .collect::<Vec<_>>(),
+                vec!["m-third"]
+            );
+            assert!(matching_providers(
+                &snapshot,
+                &targeted,
+                "missing",
+                100,
+                None,
+                None,
+                "/v1/responses"
+            )
+            .unwrap()
+            .is_empty());
+            assert!(diagnostic_key(&snapshot, key, &headers, "/v1/chat/completions").is_err());
+            headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("missing"));
+            assert!(diagnostic_key(&snapshot, key, &headers, "/v1/responses").is_err());
+            headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("excluded"));
+            let excluded = diagnostic_key(&snapshot, key, &headers, "/v1/responses")
+                .ok()
+                .unwrap();
+            assert!(matching_providers(
+                &snapshot,
+                &excluded,
+                "shared",
+                100,
+                None,
+                None,
+                "/v1/responses"
+            )
+            .unwrap()
+            .is_empty());
+        }
+        let mut headers = catalog_headers("restricted");
+        headers.insert(TARGET_PROVIDER_HEADER, HeaderValue::from_static("m-third"));
+        assert!(diagnostic_key(
+            &snapshot,
+            &snapshot.api_keys["restricted"],
+            &headers,
+            "/v1/responses"
+        )
+        .is_err());
+        assert_eq!(
+            snapshot.api_keys["dashboard-first"].preferences["__route_graph"],
+            json!(["z-first/shared"])
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_priority_preserves_key_graph_order_when_deduplicating_matches() {
+        let store = catalog_fixture().await;
+        let snapshot = store.snapshot().await.unwrap();
+        for (token, model, endpoint, expected) in [
+            (
+                "restricted",
+                "shared",
+                "/v1/messages",
+                vec!["m-third", "a-second"],
+            ),
+            (
+                "parent",
+                "shared",
+                "/v1/messages",
+                vec!["m-third", "a-second"],
+            ),
+            ("parent", "extra", "/v1/messages", vec!["z-first"]),
+            (
+                "mixed",
+                "shared",
+                "/v1/responses",
+                vec!["z-first", "a-second", "m-third"],
+            ),
+            (
+                "admin-key",
+                "shared",
+                "/v1/messages",
+                vec!["z-first", "a-second", "m-third", "excluded"],
+            ),
+        ] {
+            let key = snapshot.api_keys.get(token).unwrap();
+            let matched =
+                matching_providers(&snapshot, key, model, 0, None, None, endpoint).unwrap();
+            let scheduled = store.schedule_providers(key, model, matched).await;
+            assert_eq!(
+                scheduled
+                    .iter()
+                    .map(|p| p.name.as_ref())
+                    .collect::<Vec<_>>(),
+                expected,
+                "key={token} model={model}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn catalog_default_keeps_provider_order_and_does_not_change_routing_state() {
+        let store = catalog_fixture().await;
+        let headers = catalog_headers("dashboard-first");
+        let (rows, _, selection) = store
+            .channel_catalog(&headers, "/v1/responses", true, None)
+            .await
+            .unwrap();
+        assert!(selection.is_empty());
+        assert_eq!(
+            catalog_pairs(&rows),
+            vec![
+                ("z-first", "extra"),
+                ("z-first", "shared"),
+                ("z-first", "vendor/model"),
+                ("a-second", "extra"),
+                ("a-second", "shared"),
+                ("a-second", "vendor/model"),
+                ("m-third", "extra"),
+                ("m-third", "shared"),
+                ("m-third", "vendor/model"),
+            ]
+        );
+        assert!(store.client_windows.lock().await.is_empty());
+        assert!(store.provider_windows.lock().await.is_empty());
+        assert!(store.routing_cursors.lock().await.is_empty());
+        for p in store.snapshot().await.unwrap().providers.iter() {
+            assert_eq!(p.cursor.load(Ordering::Relaxed), 0);
+        }
+    }
+    #[tokio::test]
+    async fn catalog_selected_key_preserves_rules_filters_and_nested_model_restriction() {
+        let store = catalog_fixture().await;
+        let headers = catalog_headers("dashboard-first");
+        let id = crate::channel_catalog::key_id("restricted");
+        let (rows, _, selected) = store
+            .channel_catalog(&headers, "/v1/responses", true, Some(&id))
+            .await
+            .unwrap();
+        assert_eq!(id, selected);
+        assert_eq!(
+            catalog_pairs(&rows),
+            vec![
+                ("m-third", "shared"),
+                ("a-second", "extra"),
+                ("a-second", "shared"),
+                ("a-second", "vendor/model")
+            ]
+        );
+        let id = crate::channel_catalog::key_id("parent");
+        let (rows, _, _) = store
+            .channel_catalog(&headers, "/v1/responses", true, Some(&id))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog_pairs(&rows),
+            vec![
+                ("m-third", "shared"),
+                ("a-second", "shared"),
+                ("z-first", "extra")
+            ]
+        );
+        let id = crate::channel_catalog::key_id("mixed");
+        let (rows, _, _) = store
+            .channel_catalog(&headers, "/v1/responses", true, Some(&id))
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog_pairs(&rows),
+            vec![
+                ("m-third", "extra"),
+                ("z-first", "shared"),
+                ("a-second", "shared"),
+                ("m-third", "shared"),
+                ("z-first", "vendor/model"),
+                ("a-second", "vendor/model"),
+                ("m-third", "vendor/model"),
+                ("z-first", "extra"),
+            ]
+        );
+    }
+    #[tokio::test]
+    async fn catalog_key_selection_is_redacted_and_cannot_escalate_access() {
+        let store = catalog_fixture().await;
+        for token in ["restricted", "parent", "mixed", "invalid"] {
+            let headers = catalog_headers(token);
+            assert_eq!(store.api_key_catalog(&headers).await.unwrap_err(), 403);
+            assert_eq!(store.authorize_catalog(&headers).await.unwrap_err(), 403);
+            assert!(matches!(
+                store.balance_provider(&headers, "z-first").await,
+                Err(403)
+            ));
+            for selected in [
+                None,
+                Some(crate::channel_catalog::key_id(token)),
+                Some(crate::channel_catalog::key_id("dashboard-first")),
+            ] {
+                assert_eq!(
+                    store
+                        .channel_catalog(&headers, "/v1/responses", true, selected.as_deref())
+                        .await
+                        .unwrap_err(),
+                    403
+                );
+            }
+            if token != "invalid" {
+                assert!(store.models_for_headers(&headers).await.is_ok());
+            }
+        }
+        for token in ["dashboard-first", "admin-key"] {
+            let headers = catalog_headers(token);
+            assert_eq!(
+                store
+                    .balance_provider(&headers, "z-first")
+                    .await
+                    .unwrap()
+                    .0
+                    .name
+                    .as_ref(),
+                "z-first"
+            );
+            assert!(matches!(
+                store.balance_provider(&headers, "unknown").await,
+                Err(404)
+            ));
+            let listing = store.api_key_catalog(&headers).await.unwrap();
+            assert_eq!(listing["data"].as_array().unwrap().len(), 5);
+            assert_eq!(listing["can_inspect_all"], true);
+            assert!(!listing.to_string().contains("restricted"));
+            assert!(store.authorize_catalog(&headers).await.is_ok());
+            assert_eq!(
+                store
+                    .channel_catalog(&headers, "/v1/responses", true, Some("stale-id"))
+                    .await
+                    .unwrap_err(),
+                404
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_metrics_keep_selected_order_and_channel_wide_statistics() {
+        let store = catalog_fixture().await;
+        let headers = catalog_headers("dashboard-first");
+        let id = crate::channel_catalog::key_id("parent");
+        let (rows, revision, _) = store
+            .channel_catalog(&headers, "/v1/responses", true, Some(&id))
+            .await
+            .unwrap();
+        let metrics = crate::channel_metrics::ChannelMetrics::new();
+        metrics.start("m-third", "shared", "actual-shared", "/v1/responses", true);
+        metrics.finish(
+            "m-third",
+            "shared",
+            "actual-shared",
+            "/v1/responses",
+            true,
+            "success",
+            Some(1000.),
+            Some(200.),
+        );
+        for timeseries in [false, true] {
+            let response = metrics.query(rows.clone(), &revision, 15, timeseries);
+            assert_eq!(
+                catalog_pairs(response["data"].as_array().unwrap()),
+                catalog_pairs(&rows)
+            );
+            assert_eq!(response["data"][0]["stats"]["success"], 1);
+            assert_eq!(
+                response["data"][0]["stats"]["first_output"]["last_ms"],
+                200.
+            );
+        }
+    }
+
     #[test]
     fn payload_compiler_matches_codex_contract_without_double_json_envelope() {
-        let provider = provider();
+        let mut provider = provider();
+        provider.preferences = Arc::new(Map::new());
         let mut payload = json!({
             "model": "gpt-public",
             "input": [{"type":"reasoning","id":"rs_1","cache_control":{}}],
             "stream": true,
             "temperature": 1,
+            "response_format": {"type": "json_object"},
+            "store": true,
             "max_output_tokens": 42,
             "previous_response_id": "resp_1"
         });
@@ -4012,10 +5487,73 @@ mod tests {
         assert_eq!(payload["store"], false);
         assert_eq!(payload["instructions"], "");
         assert!(payload.get("temperature").is_none());
+        assert!(payload.get("response_format").is_none());
         assert!(payload.get("max_output_tokens").is_none());
         assert!(payload.get("previous_response_id").is_none());
         assert!(payload["input"][0].get("id").is_none());
         assert!(payload["input"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn codex_defaults_follow_overrides_without_mutating_provider_or_other_engines() {
+        for engine in ["codex", " CODEX ", "gpt"] {
+            let mut provider = provider();
+            provider.engine = Arc::from(engine);
+            let preferences = Map::from_iter([(
+                "post_body_parameter_overrides".into(),
+                json!({
+                    "store": true,
+                    "temperature": 0.5,
+                    "response_format": {"type": "json_object"},
+                    "__remove__": ["metadata.remove"],
+                    "gpt-public": {
+                        "__remove__": ["store"],
+                        "temperature": 0.7,
+                        "response_format": {"type": "text"},
+                        "metadata": {"model_specific": true}
+                    }
+                }),
+            )]);
+            provider.preferences = Arc::new(preferences.clone());
+            let mut payload = json!({"metadata": {"remove": true, "keep": true}});
+            apply_overrides(payload.as_object_mut().unwrap(), &provider, "gpt-public");
+            assert_eq!(
+                payload["metadata"],
+                json!({"keep": true, "model_specific": true})
+            );
+            if engine == "gpt" {
+                assert!(payload.get("store").is_none());
+                assert_eq!(payload["temperature"], 0.7);
+                assert_eq!(payload["response_format"], json!({"type": "text"}));
+            } else {
+                assert_eq!(payload["store"], false);
+                assert!(payload.get("temperature").is_none());
+                assert!(payload.get("response_format").is_none());
+            }
+            assert_eq!(*provider.preferences, preferences);
+        }
+    }
+
+    #[test]
+    fn codex_compact_omits_store_after_applying_defaults() {
+        let mut provider = provider();
+        provider.preferences = Arc::new(Map::new());
+        let mut payload = json!({
+            "model": "gpt-public", "input": "hello", "store": true,
+            "temperature": 1, "response_format": {"type": "json_object"}
+        });
+        compile_payload(
+            &mut payload,
+            &provider,
+            "gpt-public",
+            "gpt-upstream",
+            "codex",
+            true,
+        )
+        .unwrap();
+        for field in ["store", "temperature", "response_format"] {
+            assert!(payload.get(field).is_none(), "unexpected field {field}");
+        }
     }
 
     #[test]
@@ -4043,6 +5581,77 @@ mod tests {
     }
 
     #[test]
+    fn nonstream_total_policy_replaces_only_the_implicit_first_byte_fallback() {
+        let mut provider = provider();
+        let mut snapshot = Snapshot {
+            revision: Arc::from("0".repeat(64)),
+            preferences: Arc::new(Map::from_iter([("model_timeout".into(), json!(20))])),
+            api_keys: Arc::new(HashMap::new()),
+            api_key_order: Arc::new(Vec::new()),
+            providers: Arc::new(Vec::new()),
+            providers_by_name: Arc::new(HashMap::new()),
+            api_config: Arc::new(json!({})),
+        };
+        for (stream, policy, expected_first, expected_total) in [
+            (false, json!({}), 20.0, None),
+            (false, json!({"total":100}), 100.0, Some(100.0)),
+            (false, json!({"total":3000}), 3000.0, Some(3000.0)),
+            (
+                false,
+                json!({"first_byte":10,"total":100}),
+                10.0,
+                Some(100.0),
+            ),
+            (false, json!({"first_byte":0,"total":100}), 0.0, Some(100.0)),
+            (false, json!({"total":0}), 0.0, Some(0.0)),
+            (true, json!({"total":100}), 20.0, Some(100.0)),
+        ] {
+            provider.preferences = Arc::new(Map::from_iter([(
+                "timeout_policy".into(),
+                json!({"default":policy}),
+            )]));
+            let actual = resolve_timeouts(
+                &snapshot,
+                &provider,
+                "gpt-public",
+                "gpt-upstream",
+                "codex",
+                stream,
+                None,
+                "user",
+                "/v1/responses",
+                "POST",
+            );
+            assert_eq!(
+                actual.first_byte,
+                Some(expected_first),
+                "stream={stream} policy={policy}"
+            );
+            assert_eq!(actual.total, expected_total);
+        }
+        // A configured global first_byte is explicit even if a provider adds
+        // only total. Keep that limit rather than mistaking it for the fallback.
+        Arc::make_mut(&mut snapshot.preferences).insert(
+            "timeout_policy".into(),
+            json!({"default":{"first_byte":30}}),
+        );
+        let actual = resolve_timeouts(
+            &snapshot,
+            &provider,
+            "gpt-public",
+            "gpt-upstream",
+            "codex",
+            false,
+            None,
+            "user",
+            "/v1/responses",
+            "POST",
+        );
+        assert_eq!(actual.first_byte, Some(30.0));
+        assert_eq!(actual.total, Some(100.0));
+    }
+
+    #[test]
     fn timeout_policy_matches_compaction_request_type_without_affecting_regular_requests() {
         let provider = provider();
         let snapshot = Snapshot {
@@ -4066,6 +5675,7 @@ mod tests {
                 ),
             ])),
             api_keys: Arc::new(HashMap::new()),
+            api_key_order: Arc::new(Vec::new()),
             providers: Arc::new(Vec::new()),
             providers_by_name: Arc::new(HashMap::new()),
             api_config: Arc::new(json!({})),
@@ -4100,6 +5710,36 @@ mod tests {
         assert_eq!(compaction.total, Some(3000.0));
         assert_eq!(regular.first_byte, Some(20.0));
         assert_eq!(regular.total, None);
+    }
+
+    #[test]
+    fn keepalive_matches_request_then_upstream_then_provider_default_then_global() {
+        let mut provider = provider();
+        provider.preferences = Arc::new(Map::from_iter([(
+            "keepalive_interval".into(),
+            json!({
+                "PUBLIC-MODEL": 1, "public": 2, "upstream": 3, "default": 4
+            }),
+        )]));
+        let global = Map::from_iter([(
+            "keepalive_interval".into(),
+            json!({"global": 5, "default": 6}),
+        )]);
+        let resolve = |p: &Provider, model, upstream| {
+            model_preference(p, &global, model, upstream, "keepalive_interval")
+        };
+        assert_eq!(resolve(&provider, "public-model", "upstream"), Some(1.0));
+        assert_eq!(resolve(&provider, "public-other", "upstream"), Some(2.0));
+        assert_eq!(resolve(&provider, "alias", "upstream-v2"), Some(3.0));
+        assert_eq!(resolve(&provider, "global", "unknown"), Some(4.0));
+        provider.preferences = Arc::new(Map::from_iter([(
+            "keepalive_interval".into(),
+            json!({"local": 7}),
+        )]));
+        assert_eq!(resolve(&provider, "global-v2", "unknown"), Some(5.0));
+        assert_eq!(resolve(&provider, "unknown", "unknown"), Some(6.0));
+        provider.preferences = Arc::new(Map::from_iter([("keepalive_interval".into(), json!(0))]));
+        assert_eq!(resolve(&provider, "global", "unknown"), Some(0.0));
     }
 
     #[test]
@@ -4150,6 +5790,7 @@ mod tests {
                 revision: Arc::from("0".repeat(64)),
                 preferences: Arc::new(global),
                 api_keys: Arc::new(HashMap::new()),
+                api_key_order: Arc::new(Vec::new()),
                 providers: Arc::new(Vec::new()),
                 providers_by_name: Arc::new(HashMap::new()),
                 api_config: Arc::new(json!({})),
@@ -4361,6 +6002,260 @@ mod tests {
         );
         assert_eq!(terminal_error_sha256(true, "earlier attempt failed"), None);
         assert!(terminal_error_sha256(false, "terminal failure").is_some());
+    }
+
+    #[test]
+    fn unavailable_model_message_is_a_retryable_channel_failure() {
+        let body = r#"{"error":{"message":"This model is not available.","type":"invalid_request_error"}}"#;
+        for detail in [
+            body.to_owned(),
+            json!({"error": {"message": body}}).to_string(),
+            json!({"detail": {"message": "  THIS MODEL IS NOT AVAILABLE.  "}}).to_string(),
+            "This model is not available.".to_owned(),
+        ] {
+            for endpoint in [
+                "/v1/responses",
+                "/v1/responses/compact",
+                "/v1/chat/completions",
+            ] {
+                let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                assert_eq!(policy.status, 503, "{detail}");
+                assert!(policy.retryable);
+                assert!(!policy.request_scoped);
+                assert!(policy.provider_model_unavailable);
+                assert!(!policy.force_quota_cooldown);
+                let disabled = classify_provider_failure(400, &detail, None, endpoint, false);
+                assert_eq!(disabled.status, 503);
+                assert!(!disabled.retryable);
+            }
+        }
+        for detail in [
+            r#"{"error":{"type":"invalid_request_error","message":"Missing required parameter: input"}}"#,
+            r#"{"error":{"message":"Invalid input"},"input":"This model is not available."}"#,
+            r#"{"error":{"message":"Invalid input"},"debug":{"message":"This model is not available."}}"#,
+            r#"{"error":{"message":"Invalid input: expected 'This model is not available.'"}}"#,
+        ] {
+            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true);
+            assert_eq!(policy.status, 400, "{detail}");
+            assert!(policy.request_scoped);
+            assert!(!policy.retryable);
+            assert!(!policy.provider_model_unavailable);
+        }
+        assert_eq!(remap_provider_status(413, body), 413);
+    }
+
+    #[test]
+    fn upstream_processing_failure_is_a_retryable_gateway_error() {
+        let body = r#"{"error":{"message":"The upstream service could not process this request.","type":"invalid_request_error"}}"#;
+        for detail in [
+            body.to_owned(),
+            json!({"error": {"message": body}}).to_string(),
+            json!({"detail": {"message": " THE UPSTREAM SERVICE COULD NOT PROCESS THIS REQUEST. "}})
+                .to_string(),
+            "The upstream service could not process this request.".to_owned(),
+        ] {
+            for endpoint in [
+                "/v1/responses",
+                "/v1/responses/compact",
+                "/v1/chat/completions",
+            ] {
+                let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                assert_eq!(policy.status, 502, "{detail}");
+                assert!(policy.retryable);
+                assert!(!policy.request_scoped);
+                assert!(!policy.provider_model_unavailable);
+                let disabled = classify_provider_failure(400, &detail, None, endpoint, false);
+                assert_eq!(disabled.status, 502);
+                assert!(!disabled.retryable);
+            }
+        }
+        for detail in [
+            r#"{"error":{"message":"Invalid input"},"input":"The upstream service could not process this request."}"#,
+            r#"{"error":{"message":"Invalid input"},"debug":{"message":"The upstream service could not process this request."}}"#,
+            r#"{"error":{"message":"Invalid input: expected 'The upstream service could not process this request.'"}}"#,
+        ] {
+            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true);
+            assert_eq!(policy.status, 400, "{detail}");
+            assert!(policy.request_scoped);
+            assert!(!policy.retryable);
+        }
+        assert!(!is_provider_request_processing_failure(401, body));
+        assert!(!is_provider_request_processing_failure(502, body));
+    }
+
+    #[tokio::test]
+    async fn generic_upstream_error_retries_and_cools_the_failed_channel() {
+        let body = r#"{"error":{"code":"upstream_error","message":"Upstream request failed","type":"upstream_error"}}"#;
+        let mut first = provider();
+        first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
+        let mut route = native_route_for_test(Arc::new(first), 3).await;
+        route.providers.insert(1, named_provider("fallback"));
+        let first_plan = route.next_plan().await.unwrap().unwrap();
+        assert!(
+            route
+                .record_plan_failure(
+                    first_plan,
+                    &json!({
+                        "kind": "http_error", "status_code": 400, "body": body,
+                    })
+                )
+                .await
+        );
+        assert_eq!(route.last_status(), 502);
+        assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+        assert_eq!(route.upstream_ledger[0]["error_sha256"], sha256_hex(body));
+        assert_eq!(route.routing_ledger[0]["status_code"], 502);
+        let fallback = route.next_plan().await.unwrap().unwrap();
+        assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
+        assert!(route.next_plan().await.unwrap().is_none());
+        assert_eq!(route.routing_skips, 1);
+        assert_eq!(route.last_status(), 502);
+    }
+
+    #[test]
+    fn generic_upstream_error_requires_the_gateway_error_envelope() {
+        let body = r#"{"error":{"code":"upstream_error","message":"Upstream request failed","type":"upstream_error"}}"#;
+        for detail in [
+            body.to_owned(),
+            json!({"error": {"message": body}}).to_string(),
+            json!({"detail": {"message": body}}).to_string(),
+            json!({"error": {"type": "upstream_error", "message": "Upstream request failed"}}).to_string(),
+            json!({"error": {"type": " UPSTREAM_ERROR ", "code": null, "message": " UPSTREAM REQUEST FAILED "}}).to_string(),
+        ] {
+            for endpoint in ["/v1/responses", "/v1/responses/compact", "/v1/chat/completions"] {
+                let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                assert_eq!(policy.status, 502, "{detail}");
+                assert!(policy.retryable);
+                assert!(!policy.request_scoped);
+                assert!(!policy.provider_model_unavailable);
+                assert!(!policy.force_quota_cooldown);
+                let disabled = classify_provider_failure(400, &detail, None, endpoint, false);
+                assert_eq!(disabled.status, 502);
+                assert!(!disabled.retryable);
+            }
+        }
+        for detail in [
+            "Upstream request failed".to_owned(),
+            json!({"error": {"message": "Upstream request failed", "type": "invalid_request_error"}}).to_string(),
+            json!({"error": {"message": "Upstream request failed", "type": "upstream_error", "code": "invalid_type"}}).to_string(),
+            json!({"error": {"message": "Missing required parameter: input", "type": "upstream_error"}}).to_string(),
+            json!({"error": {"message": "Invalid input: expected 'Upstream request failed'", "type": "upstream_error"}}).to_string(),
+            json!({"error": {"message": "Invalid input"}, "input": body}).to_string(),
+            json!({"error": {"message": "Invalid input"}, "debug": serde_json::from_str::<Value>(body).unwrap()}).to_string(),
+        ] {
+            let policy = classify_provider_failure(400, &detail, None, "/v1/responses", true);
+            assert_eq!(policy.status, 400, "{detail}");
+            assert!(policy.request_scoped);
+            assert!(!policy.retryable);
+        }
+        for status in [401, 403, 404, 413, 429, 500, 503] {
+            assert_eq!(remap_provider_status(status, body), status);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_processing_failure_retries_next_channel() {
+        let mut first = provider();
+        first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
+        let mut route = native_route_for_test(Arc::new(first), 3).await;
+        route.providers.insert(1, named_provider("fallback"));
+        let first_plan = route.next_plan().await.unwrap().unwrap();
+        assert!(route
+            .record_plan_failure(first_plan, &json!({
+                "kind": "http_error",
+                "status_code": 400,
+                "body": r#"{"error":{"message":"The upstream service could not process this request.","type":"invalid_request_error"}}"#,
+            }))
+            .await);
+        assert_eq!(route.last_status(), 502);
+        assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+        assert_eq!(route.routing_ledger[0]["status_code"], 502);
+        let fallback = route.next_plan().await.unwrap().unwrap();
+        assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_model_retries_next_channel_and_preserves_upstream_status() {
+        let mut first = provider();
+        first.preferences = Arc::new(Map::from_iter([("cooldown_period".into(), json!(60.0))]));
+        let mut route = native_route_for_test(Arc::new(first), 3).await;
+        route.providers.insert(1, named_provider("fallback"));
+        let first_plan = route.next_plan().await.unwrap().unwrap();
+        assert!(route
+            .record_plan_failure(first_plan, &json!({
+                "kind": "http_error",
+                "status_code": 400,
+                "body": r#"{"error":{"message":"This model is not available.","type":"invalid_request_error"}}"#,
+            }))
+            .await);
+        assert_eq!(route.last_status(), 503);
+        assert_eq!(route.upstream_ledger[0]["status_code"], 400);
+        assert_eq!(route.upstream_ledger[0]["provider_model_unavailable"], true);
+        assert_eq!(route.routing_ledger[0]["status_code"], 503);
+        let fallback = route.next_plan().await.unwrap().unwrap();
+        assert_eq!(fallback.provider_name.as_deref(), Some("fallback"));
+        // The failed provider/model is cooling, so a later turn skips it.
+        assert!(route.next_plan().await.unwrap().is_none());
+        assert_eq!(route.routing_skips, 1);
+        assert_eq!(route.last_status(), 503);
+    }
+
+    #[test]
+    fn minimum_input_key_restrictions_are_retryable_gateway_errors() {
+        let chinese = "该令牌不接受输入少于 2000 token 的请求(按请求体大小判定)。";
+        let english = "This key does not accept requests with fewer than 2000 input tokens (judged by request body size).";
+        for message in [
+            format!("{chinese}{english}"),
+            chinese.into(),
+            english.into(),
+            english.replace("2000", "8192").to_uppercase(),
+        ] {
+            let body =
+                json!({"error": {"type": "invalid_request_error", "message": message}}).to_string();
+            for detail in [
+                message,
+                body.clone(),
+                json!({"error": {"message": body}}).to_string(),
+            ] {
+                for endpoint in [
+                    "/v1/responses",
+                    "/v1/responses/compact",
+                    "/v1/chat/completions",
+                ] {
+                    let policy = classify_provider_failure(400, &detail, None, endpoint, true);
+                    assert_eq!(policy.status, 502, "{detail}");
+                    assert!(policy.retryable);
+                    assert!(!policy.request_scoped);
+                    assert!(!policy.provider_model_unavailable);
+                    assert!(!policy.force_quota_cooldown);
+                    assert!(
+                        !classify_provider_failure(400, &detail, None, endpoint, false).retryable
+                    );
+                }
+            }
+        }
+        let escaped = r#"{"error":{"message":"\u8be5\u4ee4\u724c\u4e0d\u63a5\u53d7\u8f93\u5165\u5c11\u4e8e 4096 token \u7684\u8bf7\u6c42"}}"#;
+        assert_eq!(remap_provider_status(400, escaped), 502);
+        assert_eq!(remap_provider_status(413, escaped), 413);
+    }
+
+    #[test]
+    fn minimum_input_detection_preserves_client_validation_errors() {
+        for detail in [
+            r#"{"error":{"type":"invalid_request_error","message":"Missing required parameter: input"}}"#,
+            "Input must contain at least 1 token.",
+            "This model requires at least 2000 input tokens.",
+            "This key does not accept requests with fewer than two input tokens.",
+            "This key does not accept requests with fewer than 2000 output tokens.",
+            "该令牌不接受输入少于 token 的请求",
+            r#"{"error":{"message":"Invalid input"},"input":"该令牌不接受输入少于 2000 token 的请求"}"#,
+            r#"{"error":{"message":"Invalid input"},"debug":{"message":"This key does not accept requests with fewer than 2000 input tokens"}}"#,
+        ] {
+            let policy = classify_provider_failure(400, detail, None, "/v1/responses", true);
+            assert_eq!(policy.status, 400, "{detail}");
+            assert!(policy.request_scoped);
+            assert!(!policy.retryable);
+        }
     }
 
     #[test]

@@ -40,12 +40,17 @@ pub struct Translation {
     pub outcome: oneshot::Receiver<StreamOutcome>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StreamOutcome {
     pub usage: (i64, i64, i64),
+    pub fact_usage: crate::fact_usage::FactUsage,
     pub success: bool,
+    pub observational_only: bool,
     pub status_code: u16,
     pub detail: String,
+    pub first_output_ms: Option<f64>,
+    pub response_created_ms: Option<f64>,
+    pub first_text_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -256,7 +261,13 @@ fn spawn_translation(
             },
             claude_thinking,
         };
-        let result = run_translation(
+        let result = tokio::select! {
+            () = tx.closed() => Ok(StreamOutcome {
+                usage: (0, 0, 0), fact_usage: Default::default(), success: false,
+                observational_only: false, status_code: 499,
+                detail: "downstream disconnected".into(), first_output_ms: None, response_created_ms: None, first_text_ms: None,
+            }),
+            result = run_translation(
             stream,
             protocol,
             output_protocol,
@@ -264,8 +275,8 @@ fn spawn_translation(
             &content_type,
             &tx,
             options,
-        )
-        .await;
+        ) => result,
+        };
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -291,9 +302,14 @@ fn spawn_translation(
                 let _ = send_wire(&tx, &payload, output_protocol).await;
                 StreamOutcome {
                     usage: (0, 0, 0),
+                    fact_usage: Default::default(),
                     success: false,
+                    observational_only: false,
                     status_code: 502,
                     detail: error,
+                    first_output_ms: None,
+                    response_created_ms: None,
+                    first_text_ms: None,
                 }
             }
         };
@@ -466,7 +482,7 @@ async fn drain_final_sse_event(
     process_sse_event(&event, protocol, state, tx).await
 }
 
-fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn next_event_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
     for index in 0..buffer.len().saturating_sub(1) {
         if buffer[index..].starts_with(b"\n\n") {
             return Some((index, 2));
@@ -738,11 +754,61 @@ async fn process_json_bytes(
     }
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("decode upstream stream event: {error}"))?;
+    if protocol == Protocol::Responses {
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let elapsed = state.started_at.elapsed().as_secs_f64() * 1000.0;
+        if kind == "response.created" && state.response_created_ms.is_none() {
+            state.response_created_ms = Some(elapsed);
+        }
+        if kind == "response.output_text.delta"
+            && state.first_text_ms.is_none()
+            && value
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        {
+            state.first_text_ms = Some(elapsed);
+        }
+    }
     let chunks = state.convert(protocol, &value);
+    if state.first_output_ms.is_none() && semantic_output_value(protocol, &value) {
+        state.first_output_ms = Some(state.started_at.elapsed().as_secs_f64() * 1000.0);
+    }
     for chunk in chunks {
         send_wire(tx, &chunk, state.output_protocol).await?;
     }
     Ok(())
+}
+
+fn semantic_output_value(protocol: Protocol, value: &Value) -> bool {
+    if protocol == Protocol::Responses {
+        return responses_event_has_real_output(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            value,
+        );
+    }
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|c| {
+                c.pointer("/delta/content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| !v.is_empty())
+                    || c.pointer("/delta/reasoning_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| !v.is_empty())
+                    || c.pointer("/delta/tool_calls")
+                        .and_then(Value::as_array)
+                        .is_some_and(|v| !v.is_empty())
+            })
+        })
 }
 
 async fn drain_aws_frames(
@@ -802,6 +868,11 @@ async fn drain_aws_frames(
                 "completion_tokens":state.completion_tokens,
                 "total_tokens":state.prompt_tokens.saturating_add(state.completion_tokens),
             }));
+            state
+                .fact_usage
+                .merge(crate::fact_usage::FactUsage::from_usage(
+                    state.chat_usage.as_ref(),
+                ));
             for chunk in state.finish_chunks_for_output("stop") {
                 send_wire(tx, &chunk, state.output_protocol).await?;
             }
@@ -937,6 +1008,7 @@ struct StreamState {
     prompt_tokens: i64,
     completion_tokens: i64,
     chat_usage: Option<Value>,
+    fact_usage: crate::fact_usage::FactUsage,
     terminal: bool,
     failure: Option<PrecommitFailure>,
     output_protocol: OutputProtocol,
@@ -950,6 +1022,10 @@ struct StreamState {
     claude_rendered: HashSet<u64>,
     claude_rendered_ids: HashSet<String>,
     claude_has_tool_use: bool,
+    started_at: tokio::time::Instant,
+    first_output_ms: Option<f64>,
+    response_created_ms: Option<f64>,
+    first_text_ms: Option<f64>,
 }
 
 impl StreamState {
@@ -972,6 +1048,7 @@ impl StreamState {
             prompt_tokens: 0,
             completion_tokens: 0,
             chat_usage: None,
+            fact_usage: Default::default(),
             terminal: false,
             failure: None,
             output_protocol,
@@ -984,6 +1061,10 @@ impl StreamState {
             claude_rendered: HashSet::new(),
             claude_rendered_ids: HashSet::new(),
             claude_has_tool_use: false,
+            started_at: tokio::time::Instant::now(),
+            first_output_ms: None,
+            response_created_ms: None,
+            first_text_ms: None,
         }
     }
 
@@ -1031,6 +1112,8 @@ impl StreamState {
             self.id = id.to_owned();
         }
         if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+            self.fact_usage
+                .merge(crate::fact_usage::FactUsage::from_usage(Some(usage)));
             self.prompt_tokens = number(usage.get("prompt_tokens"));
             self.completion_tokens = number(usage.get("completion_tokens"));
             self.chat_usage = Some(usage.clone());
@@ -1226,6 +1309,8 @@ impl StreamState {
                     .pointer("/response/usage")
                     .filter(|usage| usage.is_object())
                 {
+                    self.fact_usage
+                        .merge(crate::fact_usage::FactUsage::from_usage(Some(source_usage)));
                     let usage = responses_usage_to_chat(Some(source_usage));
                     self.prompt_tokens = number(usage.get("prompt_tokens"));
                     self.completion_tokens = number(usage.get("completion_tokens"));
@@ -1743,6 +1828,8 @@ impl StreamState {
             self.prompt_tokens = number(usage.get("promptTokenCount"));
             self.completion_tokens =
                 number(usage.get("candidatesTokenCount")) + number(usage.get("thoughtsTokenCount"));
+            self.fact_usage
+                .merge(crate::fact_usage::FactUsage::from_usage(Some(usage)));
             self.chat_usage = Some(gemini_usage_to_chat(usage));
         }
         if value
@@ -1879,6 +1966,10 @@ impl StreamState {
                 "completion_tokens":self.completion_tokens,
                 "total_tokens":self.prompt_tokens.saturating_add(self.completion_tokens),
             }));
+            self.fact_usage
+                .merge(crate::fact_usage::FactUsage::from_usage(
+                    self.chat_usage.as_ref(),
+                ));
             return self.finish_chunks("stop");
         }
         Vec::new()
@@ -1947,6 +2038,8 @@ impl StreamState {
         let Some(usage) = usage.filter(|usage| usage.is_object()) else {
             return;
         };
+        self.fact_usage
+            .merge(crate::fact_usage::FactUsage::from_usage(Some(usage)));
         let mut merged = self.chat_usage.take().unwrap_or_else(|| json!({}));
         merge_usage_objects(&mut merged, usage);
         let mapped = claude_usage_to_chat(&merged);
@@ -2026,16 +2119,26 @@ impl StreamState {
     fn outcome(&self) -> StreamOutcome {
         match &self.failure {
             Some(failure) => StreamOutcome {
+                observational_only: false,
                 usage: self.usage(),
+                fact_usage: self.fact_usage.clone(),
                 success: false,
                 status_code: failure.status_code,
                 detail: failure.detail.clone(),
+                first_output_ms: self.first_output_ms,
+                response_created_ms: self.response_created_ms,
+                first_text_ms: self.first_text_ms,
             },
             None => StreamOutcome {
+                observational_only: false,
                 usage: self.usage(),
+                fact_usage: self.fact_usage.clone(),
                 success: true,
                 status_code: 200,
                 detail: String::new(),
+                first_output_ms: self.first_output_ms,
+                response_created_ms: self.response_created_ms,
+                first_text_ms: self.first_text_ms,
             },
         }
     }
@@ -2044,6 +2147,9 @@ impl StreamState {
         &mut self,
         tx: &mpsc::Sender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
+        if !self.terminal && self.first_output_ms.is_none() {
+            return Err("upstream stream ended before real output or a terminal event".into());
+        }
         if self.output_protocol == OutputProtocol::Responses {
             for chunk in self.responses.finish() {
                 send_wire(tx, &chunk, self.output_protocol).await?;
@@ -2095,6 +2201,7 @@ struct ResponsesOutputState {
     tools: HashMap<usize, ResponsesToolItem>,
     prompt_tokens: i64,
     completion_tokens: i64,
+    settlement_receipt: Option<Value>,
     completed: bool,
 }
 
@@ -2138,6 +2245,7 @@ impl ResponsesOutputState {
             tools: HashMap::new(),
             prompt_tokens: 0,
             completion_tokens: 0,
+            settlement_receipt: None,
             completed: false,
         }
     }
@@ -2171,6 +2279,9 @@ impl ResponsesOutputState {
         if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
             self.prompt_tokens = number(usage.get("prompt_tokens"));
             self.completion_tokens = number(usage.get("completion_tokens"));
+            if let Some(receipt) = usage.get("oaix_settlement_receipt") {
+                self.settlement_receipt = Some(receipt.clone());
+            }
         }
 
         let mut output = Vec::new();
@@ -2458,7 +2569,7 @@ impl ResponsesOutputState {
     }
 
     fn response(&self, status: &str, output: Vec<Value>, include_usage: bool) -> Value {
-        json!({
+        let mut response = json!({
             "id":self.id,
             "object":"response",
             "created_at":self.created,
@@ -2475,7 +2586,13 @@ impl ResponsesOutputState {
             })),
             "error":Value::Null,
             "incomplete_details":Value::Null,
-        })
+        });
+        if include_usage {
+            if let Some(receipt) = &self.settlement_receipt {
+                response["usage"]["oaix_settlement_receipt"] = receipt.clone();
+            }
+        }
+        response
     }
 
     fn completed_output(&self) -> Vec<Value> {
@@ -2675,7 +2792,7 @@ pub(crate) fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
             .get("completion_tokens_details")
             .or_else(|| value.get("output_tokens_details"))
     });
-    json!({
+    let mut mapped = json!({
         "prompt_tokens":prompt_tokens,
         "completion_tokens":completion_tokens,
         "total_tokens":total_tokens,
@@ -2690,7 +2807,11 @@ pub(crate) fn responses_usage_to_chat(usage: Option<&Value>) -> Value {
             "accepted_prediction_tokens":number(completion_details.and_then(|value| value.get("accepted_prediction_tokens"))),
             "rejected_prediction_tokens":number(completion_details.and_then(|value| value.get("rejected_prediction_tokens"))),
         },
-    })
+    });
+    if let Some(receipt) = usage.and_then(|v| v.get("oaix_settlement_receipt")) {
+        mapped["oaix_settlement_receipt"] = receipt.clone();
+    }
+    mapped
 }
 
 fn trim_ascii(mut value: &[u8]) -> &[u8] {

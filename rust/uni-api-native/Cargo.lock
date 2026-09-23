@@ -415,6 +415,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1628,13 +1634,14 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "uni-api-native"
-version = "0.1.2"
+version = "0.1.63"
 dependencies = [
  "axum",
  "base64",
  "bytes",
  "crc32fast",
  "futures-util",
+ "hex",
  "hmac",
  "hyper-rustls",
  "libc",

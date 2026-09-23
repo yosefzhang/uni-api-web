@@ -39,6 +39,8 @@ type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Sen
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct Plan {
+    #[serde(skip)]
+    pub(crate) dispatch: Option<crate::request_timing::AttemptDispatch>,
     pub(crate) attempt_id: String,
     pub(crate) url: String,
     pub(crate) headers: HashMap<String, String>,
@@ -139,6 +141,10 @@ struct StreamStats {
     normalized_events: u64,
     usage: Option<Value>,
     wire_hash: Option<Sha256>,
+    started_at: tokio::time::Instant,
+    first_output_ms: Option<f64>,
+    response_created_ms: Option<f64>,
+    first_text_ms: Option<f64>,
 }
 
 impl StreamStats {
@@ -158,6 +164,10 @@ impl StreamStats {
             normalized_events: 0,
             usage: None,
             wire_hash: sampled.then(Sha256::new),
+            started_at: tokio::time::Instant::now(),
+            first_output_ms: None,
+            response_created_ms: None,
+            first_text_ms: None,
         }
     }
 
@@ -178,7 +188,36 @@ impl StreamStats {
             "wire_sha256": hash,
             "wire_hash_sampled": self.wire_hash.is_some(),
             "stream_mode": self.stream_mode,
+            "first_output_ms": self.first_output_ms,
+            "response_created_ms": self.response_created_ms,
+            "first_text_ms": self.first_text_ms,
         })
+    }
+
+    fn observe_semantic_output(&mut self, event_type: &str, payload: &Value) {
+        let elapsed = self.started_at.elapsed().as_secs_f64() * 1000.0;
+        if event_type == "response.created" && self.response_created_ms.is_none() {
+            self.response_created_ms = Some(elapsed);
+        }
+        if event_type == "response.output_text.delta"
+            && self.first_text_ms.is_none()
+            && payload
+                .get("delta")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        {
+            self.first_text_ms = Some(elapsed);
+        }
+        if self.first_output_ms.is_none()
+            && (has_real_output(event_type, payload)
+                || matches!(event_type, "response.completed" | "response.incomplete")
+                    && payload
+                        .pointer("/response/output")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| items.iter().any(item_has_output)))
+        {
+            self.first_output_ms = Some(self.started_at.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 
     fn observe_upstream(&mut self, chunk: &[u8]) {
@@ -235,11 +274,11 @@ struct ActiveAttempt {
     commit_reason: &'static str,
     precommit_keepalive_sent: bool,
     business_committed: bool,
-    raw_pending_forwarded: bool,
 }
 
 enum PreflightResult {
     Retry(Value),
+    HttpError(Box<Plan>, Value),
     Started(ActiveAttempt),
 }
 
@@ -249,10 +288,6 @@ enum Coordinator {
 }
 
 impl Coordinator {
-    fn is_native(&self) -> bool {
-        matches!(self, Self::Native { .. })
-    }
-
     async fn commit(&mut self, state: &AppState, observation: &Value) -> Result<(), String> {
         match self {
             Self::Python { session_id } => control_commit(state, session_id, observation)
@@ -272,42 +307,47 @@ impl Coordinator {
         }
     }
 
-    async fn retry(
-        &mut self,
-        state: &AppState,
-        mut outcome: Value,
-    ) -> Result<RetryResolution, String> {
+    async fn retry(&mut self, state: &AppState, outcome: Value) -> Result<RetryResolution, String> {
         match self {
             Self::Python { session_id } => {
                 retry_after_public_start_python(state, session_id, outcome).await
             }
-            Self::Native { route } => loop {
-                if !route.record_failure(&outcome).await {
-                    return Ok(RetryResolution::Final(route.final_message()));
+            Self::Native { route } => {
+                let mut retryable = route.record_failure(&outcome).await;
+                loop {
+                    if !retryable {
+                        return Ok(RetryResolution::Final(route.final_message()));
+                    }
+                    let plan = match route.next_plan().await {
+                        Ok(Some(plan)) => plan,
+                        Ok(None) => return Ok(RetryResolution::Final(route.final_message())),
+                        Err(error) => {
+                            route.emit_internal_failure(502, "native_retry_plan_error", &error);
+                            return Err(error);
+                        }
+                    };
+                    match preflight_attempt(state, plan, true).await {
+                        Ok(PreflightResult::Started(active)) => {
+                            return Ok(RetryResolution::Active(active));
+                        }
+                        Ok(PreflightResult::Retry(next)) => {
+                            retryable = route.record_failure(&next).await;
+                        }
+                        Ok(PreflightResult::HttpError(plan, next)) => {
+                            retryable = route.record_plan_failure(*plan, &next).await;
+                        }
+                        Err(error) => {
+                            let outcome = json!({
+                                "kind": "protocol_error",
+                                "status_code": 502,
+                                "detail": error,
+                                "committed": false,
+                            });
+                            retryable = route.record_failure(&outcome).await;
+                        }
+                    }
                 }
-                let plan = match route.next_plan().await {
-                    Ok(Some(plan)) => plan,
-                    Ok(None) => return Ok(RetryResolution::Final(route.final_message())),
-                    Err(error) => {
-                        route.emit_internal_failure(502, "native_retry_plan_error", &error);
-                        return Err(error);
-                    }
-                };
-                match preflight_attempt(state, plan, true).await {
-                    Ok(PreflightResult::Started(active)) => {
-                        return Ok(RetryResolution::Active(active));
-                    }
-                    Ok(PreflightResult::Retry(next)) => outcome = next,
-                    Err(error) => {
-                        outcome = json!({
-                            "kind": "protocol_error",
-                            "status_code": 502,
-                            "detail": error,
-                            "committed": false,
-                        });
-                    }
-                }
-            },
+            }
         }
     }
 }
@@ -322,6 +362,7 @@ fn spawn_hedge_attempt(
         match preflight_attempt_with_trigger(&state, plan.clone(), false, Some(&trigger)).await {
             Ok(PreflightResult::Started(active)) => Ok((plan, active)),
             Ok(PreflightResult::Retry(outcome)) => Err((plan, outcome)),
+            Ok(PreflightResult::HttpError(plan, outcome)) => Err((*plan, outcome)),
             Err(error) => Err((
                 plan,
                 json!({
@@ -369,7 +410,7 @@ async fn preflight_native_hedged(
                 key: _,
                 failure: (plan, outcome),
             } => {
-                let retryable = route.record_failure_for(&plan, &outcome).await;
+                let retryable = route.record_plan_failure(plan, &outcome).await;
                 if retryable && scheduler.has_capacity() {
                     if let Some(next) = route.next_plan().await? {
                         spawn_hedge_attempt(&mut scheduler, state.clone(), next);
@@ -469,6 +510,15 @@ pub async fn serve_native(
                     return json_error(status, &route.response_detail());
                 }
             }
+            Ok(PreflightResult::HttpError(plan, outcome)) => {
+                if !route.record_plan_failure(*plan, &outcome).await {
+                    let status = StatusCode::from_u16(route.last_status())
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    route.emit_final_response(status.as_u16(), "failed_before_commit");
+                    release_owner(&mut idempotency_owner).await;
+                    return json_error(status, &route.response_detail());
+                }
+            }
             Err(error) => {
                 let outcome = json!({
                     "kind": "protocol_error",
@@ -508,7 +558,15 @@ async fn serve_native_nonstream(
             }
         };
         match send_native_nonstream_attempt(&state, &plan).await {
-            Ok((status, mut headers, mut body)) if status.is_success() => {
+            Ok((status, mut headers, mut body, elapsed_ms)) if status.is_success() => {
+                let first_output_ms = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .filter(|p| {
+                        p.get("output")
+                            .and_then(Value::as_array)
+                            .is_some_and(|items| items.iter().any(item_has_output))
+                    })
+                    .map(|_| elapsed_ms);
                 let usage = serde_json::from_slice::<Value>(&body)
                     .ok()
                     .and_then(|payload| {
@@ -552,6 +610,7 @@ async fn serve_native_nonstream(
                     "status_code": status.as_u16(),
                     "upstream_status_code": status.as_u16(),
                     "downstream_bytes": body.len(),
+                    "first_output_ms":first_output_ms,
                 });
                 if let Some(usage) = usage {
                     outcome["usage"] = usage;
@@ -562,7 +621,7 @@ async fn serve_native_nonstream(
                 *response.headers_mut() = headers;
                 return response;
             }
-            Ok((status, _headers, body)) => {
+            Ok((status, _headers, body, _elapsed_ms)) => {
                 let detail = String::from_utf8_lossy(&body)
                     .chars()
                     .take(4096)
@@ -574,7 +633,7 @@ async fn serve_native_nonstream(
                     "body": detail,
                     "committed": false,
                 });
-                if !route.record_failure(&outcome).await {
+                if !route.record_plan_failure(plan, &outcome).await {
                     let final_status = StatusCode::from_u16(route.last_status())
                         .unwrap_or(StatusCode::BAD_GATEWAY);
                     route.emit_final_response(final_status.as_u16(), "failed_before_commit");
@@ -602,7 +661,7 @@ async fn serve_native_nonstream(
 async fn send_native_nonstream_attempt(
     state: &AppState,
     plan: &Plan,
-) -> Result<(StatusCode, HeaderMap, Vec<u8>), String> {
+) -> Result<(StatusCode, HeaderMap, Vec<u8>, f64), String> {
     let client = state
         .upstream_client(
             plan.proxy.as_deref(),
@@ -627,10 +686,21 @@ async fn send_native_nonstream_attempt(
         plan.first_byte_timeout_seconds,
         plan.total_timeout_seconds,
     ]);
-    let request = client
+    let billing_secret = crate::billing_observation::request_key(&headers, &plan.url);
+    let mut request = client
         .post(&plan.url)
         .headers(headers)
         .body(plan.body.clone());
+    // RequestBuilder::timeout covers both headers and the complete body. A
+    // timeout around send() alone stops protecting the request after headers.
+    if let Some(total) = positive_duration(plan.total_timeout_seconds) {
+        request = request.timeout(total);
+    }
+    if let Some(dispatch) = &plan.dispatch {
+        dispatch.billing.target(&plan.url, &billing_secret);
+        dispatch.record(&state.channel_metrics);
+    }
+    let observation_started = tokio::time::Instant::now();
     let response = if let Some(timeout) = timeout {
         tokio::time::timeout(timeout, request.send())
             .await
@@ -642,14 +712,38 @@ async fn send_native_nonstream_attempt(
             .await
             .map_err(|error| format!("upstream non-streaming request failed: {error}"))?
     };
+    if let Some(dispatch) = &plan.dispatch {
+        dispatch.billing.headers(
+            response.headers(),
+            response.status().as_u16(),
+            &billing_secret,
+        );
+    }
     let status = response.status();
     let headers = filtered_response_headers(response.headers());
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| format!("read upstream non-streaming body: {error}"))?
-        .to_vec();
-    Ok((status, headers, body))
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    loop {
+        let next = if let Some(idle) = positive_duration(plan.idle_timeout_seconds) {
+            tokio::time::timeout(idle, stream.next())
+                .await
+                .map_err(|_| "upstream non-streaming body idle timed out".to_owned())?
+        } else {
+            stream.next().await
+        };
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|error| format!("read upstream non-streaming body: {error}"))?;
+        body.extend_from_slice(&chunk);
+    }
+    if let Some(dispatch) = &plan.dispatch {
+        dispatch.billing.error_body(status.as_u16(), &body);
+    }
+    Ok((
+        status,
+        headers,
+        body,
+        observation_started.elapsed().as_secs_f64() * 1000.0,
+    ))
 }
 
 pub async fn serve_session(
@@ -689,7 +783,9 @@ pub async fn serve_session(
             }
         };
         match preflight_attempt(&state, plan, false).await {
-            Ok(PreflightResult::Retry(mut outcome)) => {
+            Ok(
+                PreflightResult::Retry(mut outcome) | PreflightResult::HttpError(_, mut outcome),
+            ) => {
                 outcome["attempt_id"] = Value::String(
                     message
                         .get("attempt_id")
@@ -811,10 +907,15 @@ async fn preflight_attempt_with_trigger(
         earlier_deadline(first_deadline, total_deadline),
         send_stage_deadline,
     );
+    let billing_secret = crate::billing_observation::request_key(&headers, &plan.url);
     let request = client
         .post(&plan.url)
         .headers(headers)
         .body(plan.body.clone());
+    if let Some(dispatch) = &plan.dispatch {
+        dispatch.billing.target(&plan.url, &billing_secret);
+        dispatch.record(&state.channel_metrics);
+    }
     let mut request_future = Box::pin(request.send());
     let mut hedge_triggered = false;
     let response = if let Some(trigger) = trigger {
@@ -850,6 +951,13 @@ async fn preflight_attempt_with_trigger(
             .map_err(|error| format!("upstream response headers failed: {error}"))?
             .map_err(|error| format!("upstream response headers failed: {error}"))?
     };
+    if let Some(dispatch) = &plan.dispatch {
+        dispatch.billing.headers(
+            response.headers(),
+            response.status().as_u16(),
+            &billing_secret,
+        );
+    }
     let status = response.status();
     let unsupported_encoding = response
         .headers()
@@ -859,13 +967,21 @@ async fn preflight_attempt_with_trigger(
     let response_headers = filtered_response_headers(response.headers());
     if !status.is_success() {
         let body = read_limited_body(response, total_deadline).await;
-        return Ok(PreflightResult::Retry(json!({
-            "kind": "http_error",
-            "status_code": status.as_u16(),
-            "upstream_status_code": status.as_u16(),
-            "body": body,
-            "committed": false,
-        })));
+        if let Some(dispatch) = &plan.dispatch {
+            dispatch
+                .billing
+                .error_body(status.as_u16(), body.as_bytes());
+        }
+        return Ok(PreflightResult::HttpError(
+            Box::new(plan),
+            json!({
+                "kind": "http_error",
+                "status_code": status.as_u16(),
+                "upstream_status_code": status.as_u16(),
+                "body": body,
+                "committed": false,
+            }),
+        ));
     }
     if unsupported_encoding {
         return Ok(PreflightResult::Retry(json!({
@@ -880,6 +996,7 @@ async fn preflight_attempt_with_trigger(
     let mode = StreamMode::for_plan(&plan);
     let mut stats = StreamStats::new(&plan.attempt_id);
     stats.stream_mode = mode.as_str();
+    stats.started_at = started_at;
     let stream = Box::pin(response.bytes_stream());
     let mut active = ActiveAttempt {
         decoder: SseDecoder::new(plan.max_event_bytes),
@@ -900,7 +1017,6 @@ async fn preflight_attempt_with_trigger(
         commit_reason: "real_output",
         precommit_keepalive_sent: keepalive_already_sent,
         business_committed: false,
-        raw_pending_forwarded: false,
     };
 
     if active.mode == StreamMode::OpaqueRaw {
@@ -986,11 +1102,6 @@ fn process_preflight_frames(
                     active, event_type, payload, false,
                 ))));
             }
-            if active.business_committed {
-                if let Some(wire) = processed.wire {
-                    active.buffered.push(wire);
-                }
-            }
             active.terminal = processed.terminal;
             return Ok(Some(PreflightResult::Started(take_active(active)?)));
         }
@@ -1067,7 +1178,6 @@ fn process_preflight_frames(
 }
 
 fn take_active(active: &mut ActiveAttempt) -> Result<ActiveAttempt, String> {
-    stage_raw_pending(active);
     let placeholder = ActiveAttempt {
         plan: active.plan.clone(),
         status: active.status,
@@ -1084,21 +1194,8 @@ fn take_active(active: &mut ActiveAttempt) -> Result<ActiveAttempt, String> {
         commit_reason: active.commit_reason,
         precommit_keepalive_sent: active.precommit_keepalive_sent,
         business_committed: active.business_committed,
-        raw_pending_forwarded: false,
     };
     Ok(std::mem::replace(active, placeholder))
-}
-
-fn stage_raw_pending(active: &mut ActiveAttempt) {
-    if active.business_committed
-        && active.mode.relays_raw_after_commit()
-        && !active.raw_pending_forwarded
-    {
-        if let Some(pending) = active.decoder.pending_copy() {
-            active.buffered.push(pending);
-        }
-        active.raw_pending_forwarded = true;
-    }
 }
 
 fn start_public_stream(
@@ -1302,6 +1399,15 @@ async fn run_active_attempt(
                     }
                     Err(_) => break 'request false,
                 }
+            }
+            if let Terminal::SemanticFailure {
+                event_type,
+                payload,
+            } = terminal
+            {
+                let outcome = semantic_failure_outcome(&active, &event_type, &payload, true);
+                let _ = coordinator.complete(&state, &outcome).await;
+                break 'request false;
             }
             finish_terminal(
                 &state,
@@ -1576,24 +1682,6 @@ async fn run_raw_committed(
     output: &mut OutputSink,
     cancellation: &CancellationToken,
 ) -> bool {
-    if !active.raw_pending_forwarded {
-        if let Some(pending) = active.decoder.pending_copy() {
-            active.stats.observe_wire(&pending);
-            if output.send_wire(pending).await.is_err() {
-                complete_disconnect(
-                    state,
-                    coordinator,
-                    active.plan.attempt_id.clone(),
-                    active.status,
-                    &mut active.stats,
-                )
-                .await;
-                return false;
-            }
-        }
-        active.raw_pending_forwarded = true;
-    }
-
     loop {
         let idle_deadline = deadline(
             tokio::time::Instant::now(),
@@ -1617,17 +1705,16 @@ async fn run_raw_committed(
         match next {
             Ok(Some(Ok(chunk))) => {
                 active.stats.observe_upstream(&chunk);
-                let already_forwarded_bytes = active.decoder.buffer.len();
                 let inspection = match active.decoder.feed(&chunk) {
-                    Ok(frames) => {
-                        raw_terminal_prefix(frames, &mut active.stats, already_forwarded_bytes)
-                    }
+                    Ok(frames) => raw_terminal_prefix(frames, &mut active.stats),
                     Err(error) => Err(error),
                 };
                 match inspection {
-                    Ok(Some((prefix, terminal))) => {
-                        active.stats.observe_wire(&prefix);
-                        if output.send_wire(prefix).await.is_err() {
+                    Ok((prefix, terminal)) => {
+                        if !prefix.is_empty() {
+                            active.stats.observe_wire(&prefix);
+                        }
+                        if !prefix.is_empty() && output.send_wire(prefix).await.is_err() {
                             complete_disconnect(
                                 state,
                                 coordinator,
@@ -1638,23 +1725,12 @@ async fn run_raw_committed(
                             .await;
                             return false;
                         }
-                        finish_observed_terminal(state, coordinator, active, terminal).await;
-                        return true;
-                    }
-                    Ok(None) => {
-                        active.stats.observe_wire(&chunk);
-                        if output.send_wire(chunk).await.is_err() {
-                            complete_disconnect(
-                                state,
-                                coordinator,
-                                active.plan.attempt_id.clone(),
-                                active.status,
-                                &mut active.stats,
-                            )
-                            .await;
-                            return false;
+                        if let Some(terminal) = terminal {
+                            return finish_observed_terminal(state, coordinator, active, terminal)
+                                .await;
                         }
                     }
+
                     Err(error) => {
                         complete_failure(
                             state,
@@ -1671,17 +1747,16 @@ async fn run_raw_committed(
                 }
             }
             Ok(None) => {
-                let already_forwarded_bytes = active.decoder.buffer.len();
                 let inspection = match active.decoder.finish() {
-                    Ok(frames) => {
-                        raw_terminal_prefix(frames, &mut active.stats, already_forwarded_bytes)
-                    }
+                    Ok(frames) => raw_terminal_prefix(frames, &mut active.stats),
                     Err(error) => Err(error),
                 };
                 match inspection {
-                    Ok(Some((prefix, terminal))) => {
-                        active.stats.observe_wire(&prefix);
-                        if output.send_wire(prefix).await.is_err() {
+                    Ok((prefix, terminal)) => {
+                        if !prefix.is_empty() {
+                            active.stats.observe_wire(&prefix);
+                        }
+                        if !prefix.is_empty() && output.send_wire(prefix).await.is_err() {
                             complete_disconnect(
                                 state,
                                 coordinator,
@@ -1692,10 +1767,10 @@ async fn run_raw_committed(
                             .await;
                             return false;
                         }
-                        finish_observed_terminal(state, coordinator, active, terminal).await;
-                        return true;
-                    }
-                    Ok(None) => {
+                        if let Some(terminal) = terminal {
+                            return finish_observed_terminal(state, coordinator, active, terminal)
+                                .await;
+                        }
                         complete_failure(
                             state,
                             coordinator,
@@ -1706,6 +1781,7 @@ async fn run_raw_committed(
                             "Responses upstream ended without a terminal response event",
                         )
                         .await;
+                        return false;
                     }
                     Err(error) => {
                         complete_failure(
@@ -1752,30 +1828,34 @@ async fn run_raw_committed(
     }
 }
 
-/// Return only the wire prefix through the first terminal event.
+/// Return only the safe wire prefix before the first terminal event.
 ///
 /// Upstream providers sometimes append heartbeats or unrelated bytes after
 /// `response.completed` in the same HTTP chunk. Raw forwarding must stop at
-/// the semantic terminal instead of sending that suffix first.
+/// the semantic terminal instead of sending that suffix first. A semantic
+/// failure is omitted from the returned wire prefix so the downstream stream
+/// closes without exposing the provider's error event.
 fn raw_terminal_prefix(
     frames: Vec<SseFrame>,
     stats: &mut StreamStats,
-    already_forwarded_bytes: usize,
-) -> Result<Option<(Bytes, Terminal)>, String> {
+) -> Result<(Bytes, Option<Terminal>), String> {
     let mut prefix = BytesMut::new();
     for frame in frames {
         let wire = frame.wire.clone();
         let terminal = inspect_terminal_frame(&frame, stats)?;
-        prefix.extend_from_slice(&wire);
         if let Some(terminal) = terminal {
-            let already_forwarded_bytes = already_forwarded_bytes.min(prefix.len());
-            return Ok(Some((
-                prefix.freeze().slice(already_forwarded_bytes..),
-                terminal,
-            )));
+            // A semantic failure after committed output is an internal
+            // terminal only. Do not leak the provider's error event to the
+            // downstream SSE client; the transport closes after the already
+            // emitted content.
+            if !matches!(terminal, Terminal::SemanticFailure { .. }) {
+                prefix.extend_from_slice(&wire);
+            }
+            return Ok((prefix.freeze(), Some(terminal)));
         }
+        prefix.extend_from_slice(&wire);
     }
-    Ok(None)
+    Ok((prefix.freeze(), None))
 }
 
 async fn finish_observed_terminal(
@@ -1783,7 +1863,7 @@ async fn finish_observed_terminal(
     coordinator: &mut Coordinator,
     active: &mut ActiveAttempt,
     terminal: Terminal,
-) {
+) -> bool {
     if let Terminal::SemanticFailure {
         event_type,
         payload,
@@ -1791,7 +1871,7 @@ async fn finish_observed_terminal(
     {
         let outcome = semantic_failure_outcome(active, event_type, payload, true);
         let _ = coordinator.complete(state, &outcome).await;
-        return;
+        return false;
     }
     finish_terminal(
         state,
@@ -1802,6 +1882,7 @@ async fn finish_observed_terminal(
         terminal,
     )
     .await;
+    true
 }
 
 async fn run_selective_committed(
@@ -1933,7 +2014,7 @@ async fn relay_selective_frames(
             || frame_is_comment_only(frame.raw())
             || terminal_candidate(&frame);
         if !special {
-            observe_light_frame(&mut active.stats, &frame);
+            let _ = inspect_terminal_frame(&frame, &mut active.stats);
             batch.extend_from_slice(&frame.canonical_wire());
             continue;
         }
@@ -2196,7 +2277,10 @@ async fn retry_after_public_start_python(
                 control_commit(state, session_id, &observation).await?;
                 return Ok(RetryResolution::Active(active));
             }
-            Ok(PreflightResult::Retry(mut next_outcome)) => {
+            Ok(
+                PreflightResult::Retry(mut next_outcome)
+                | PreflightResult::HttpError(_, mut next_outcome),
+            ) => {
                 next_outcome["attempt_id"] = Value::String(plan.attempt_id);
                 outcome = next_outcome;
             }
@@ -2290,23 +2374,8 @@ async fn process_active_frames(
                 return ActiveFrameResult::Retry(outcome);
             }
             let outcome = semantic_failure_outcome(active, event_type, payload, true);
-            let mut terminal_sent = false;
-            if let Some(reply) = coordinator.complete(state, &outcome).await {
-                if let Some(encoded) = reply.get("terminal_b64").and_then(Value::as_str) {
-                    if let Ok(terminal) = BASE64.decode(encoded) {
-                        let wire = Bytes::from(terminal);
-                        active.stats.observe_wire(&wire);
-                        terminal_sent = output.send_wire(wire).await.is_ok();
-                    }
-                }
-            }
-            if coordinator.is_native() && !terminal_sent {
-                if let Ok(wire) = encode_event(event_type, payload) {
-                    active.stats.observe_wire(&wire);
-                    terminal_sent = output.send_wire(wire).await.is_ok();
-                }
-            }
-            return ActiveFrameResult::Done(terminal_sent);
+            let _ = coordinator.complete(state, &outcome).await;
+            return ActiveFrameResult::Done(false);
         }
 
         let suppress_repeated_keepalive = !active.business_committed
@@ -2587,6 +2656,7 @@ impl ResponsesProcessor {
             None
         };
         let canonical_keepalive = event_type == "keepalive" && is_canonical_keepalive(&payload);
+        stats.observe_semantic_output(&event_type, &payload);
         let commits = terminal.is_some()
             || (!matches!(
                 event_type.as_str(),
@@ -2644,6 +2714,22 @@ fn is_terminal_event_type(event_type: &[u8]) -> bool {
 }
 
 fn terminal_candidate(frame: &SseFrame) -> bool {
+    // A data-only event's type is in JSON and may use arbitrary whitespace.
+    if declared_event_bytes(frame.raw()).is_none() && frame_has_data(frame.raw()) {
+        if let Ok(parsed) = parse_sse_frame(frame) {
+            if let Some(data) = parsed.data {
+                if let Ok(payload) = serde_json::from_str::<Value>(&data) {
+                    if payload
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|event| is_terminal_event_type(event.as_bytes()))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
     if declared_event_bytes(frame.raw()).is_some_and(is_terminal_event_type) {
         return true;
     }
@@ -2699,6 +2785,20 @@ fn inspect_terminal_frame(
     stats: &mut StreamStats,
 ) -> Result<Option<Terminal>, String> {
     observe_light_frame(stats, frame);
+    if stats.first_output_ms.is_none() || stats.first_text_ms.is_none() {
+        // Observation is best-effort and cannot reject or rewrite raw traffic.
+        if let Ok(parsed) = parse_sse_frame(frame) {
+            if let Some(data) = parsed.data {
+                if let Ok(payload) = serde_json::from_str::<Value>(&data) {
+                    let kind = payload
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    stats.observe_semantic_output(kind, &payload);
+                }
+            }
+        }
+    }
     if !terminal_candidate(frame) {
         return Ok(None);
     }
@@ -2954,10 +3054,6 @@ impl SseDecoder {
         self.buffer.clear();
         self.scan_from = 0;
         Ok(frames)
-    }
-
-    fn pending_copy(&self) -> Option<Bytes> {
-        (!self.buffer.is_empty()).then(|| Bytes::copy_from_slice(&self.buffer))
     }
 }
 
@@ -3247,6 +3343,7 @@ mod tests {
 
     fn test_active(engine: &str) -> ActiveAttempt {
         let plan = Plan {
+            dispatch: None,
             attempt_id: "attempt-1".into(),
             url: "http://provider.example/v1/responses".into(),
             headers: HashMap::new(),
@@ -3287,10 +3384,41 @@ mod tests {
             commit_reason: "real_output",
             precommit_keepalive_sent: false,
             business_committed: false,
-            raw_pending_forwarded: false,
         }
     }
 
+    #[test]
+    fn raw_stream_observes_semantic_latency_without_rewriting_or_counting_keepalive() {
+        let mut stats = StreamStats::new("latency");
+        stats.started_at = tokio::time::Instant::now() - Duration::from_millis(400);
+        let mut decoder = SseDecoder::new(4096);
+        let keepalive =
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n";
+        let (wire, _) = raw_terminal_prefix(decoder.feed(keepalive).unwrap(), &mut stats).unwrap();
+        assert_eq!(wire.as_ref(), keepalive);
+        assert!(stats.first_output_ms.is_none());
+        let created = stats.response_created_ms.unwrap();
+        assert!(created >= 400.0);
+        assert!(stats.first_text_ms.is_none());
+        stats.started_at = tokio::time::Instant::now() - Duration::from_millis(800);
+        let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"test\"}\n\n";
+        let (wire, _) = raw_terminal_prefix(decoder.feed(delta).unwrap(), &mut stats).unwrap();
+        assert_eq!(wire.as_ref(), delta);
+        let first = stats.first_output_ms.unwrap();
+        assert!(first >= 800.0);
+        let first_text = stats.first_text_ms.unwrap();
+        assert!(first_text >= 800.0 && first_text <= first);
+        assert_eq!(stats.response_created_ms, Some(created));
+        raw_terminal_prefix(decoder.feed(delta).unwrap(), &mut stats).unwrap();
+        assert_eq!(stats.first_output_ms, Some(first));
+        assert_eq!(stats.first_text_ms, Some(first_text));
+        let mut failed = StreamStats::new("failure");
+        let body=b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n";
+        raw_terminal_prefix(decoder.feed(body).unwrap(), &mut failed).unwrap();
+        assert!(failed.first_output_ms.is_none());
+        assert!(failed.response_created_ms.is_none());
+        assert!(failed.first_text_ms.is_none());
+    }
     #[test]
     fn decoder_preserves_fragmented_canonical_frames() {
         let mut decoder = SseDecoder::new(1024);
@@ -3354,9 +3482,8 @@ mod tests {
             )
             .unwrap();
         let mut stats = StreamStats::new("raw-terminal-test");
-        let (_prefix, terminal) = raw_terminal_prefix(frames, &mut stats, 0)
-            .unwrap()
-            .expect("completed terminal expected");
+        let (_prefix, terminal) = raw_terminal_prefix(frames, &mut stats).unwrap();
+        let terminal = terminal.expect("completed terminal expected");
         assert!(matches!(terminal, Terminal::Completed));
         assert_eq!(stats.event_count, 2);
         assert_eq!(stats.delta_events, 1);
@@ -3374,9 +3501,8 @@ mod tests {
             )
             .unwrap();
         let mut stats = StreamStats::new("raw-terminal-prefix-test");
-        let (prefix, terminal) = raw_terminal_prefix(frames, &mut stats, 0)
-            .unwrap()
-            .expect("completed must terminate raw forwarding");
+        let (prefix, terminal) = raw_terminal_prefix(frames, &mut stats).unwrap();
+        let terminal = terminal.expect("completed must terminate raw forwarding");
         let wire = String::from_utf8(prefix.to_vec()).unwrap();
         assert!(matches!(terminal, Terminal::Completed));
         assert!(wire.contains("event: response.completed"));
@@ -3384,20 +3510,62 @@ mod tests {
     }
 
     #[test]
+    fn raw_mode_filters_semantic_failure_after_committed_output() {
+        let mut decoder = SseDecoder::new(4096);
+        let frames = decoder
+            .feed(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"test\"}\n\n\\
+                  event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"upstream_error\",\"code\":\"server_error\",\"message\":\"temporarily unavailable\"}}\n\n",
+            )
+            .unwrap();
+        let mut stats = StreamStats::new("raw-semantic-failure-test");
+        let (prefix, terminal) = raw_terminal_prefix(frames, &mut stats).unwrap();
+        let terminal = terminal.expect("semantic terminal expected");
+        let wire = String::from_utf8(prefix.to_vec()).unwrap();
+        assert!(matches!(terminal, Terminal::SemanticFailure { .. }));
+        assert!(wire.contains("\"delta\":\"test\""));
+        assert!(!wire.contains("event: error"));
+    }
+
+    #[test]
+    fn raw_mode_filters_fragmented_semantic_failure_without_leaking_partial_error() {
+        let mut decoder = SseDecoder::new(4096);
+        let first = decoder
+            .feed(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"test\"}\n\n\
+                  event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"upstream_error\"",
+            )
+            .unwrap();
+        let mut stats = StreamStats::new("raw-fragmented-semantic-failure-test");
+        let (first_wire, first_terminal) = raw_terminal_prefix(first, &mut stats).unwrap();
+        assert!(first_terminal.is_none());
+        assert!(String::from_utf8(first_wire.to_vec())
+            .unwrap()
+            .contains("delta"));
+
+        let second = decoder
+            .feed(b",\"message\":\"temporarily unavailable\"}}\n\n")
+            .unwrap();
+        let (second_wire, second_terminal) = raw_terminal_prefix(second, &mut stats).unwrap();
+        assert!(second_wire.is_empty());
+        assert!(matches!(
+            second_terminal,
+            Some(Terminal::SemanticFailure { .. })
+        ));
+    }
+
+    #[test]
     fn raw_mode_does_not_repeat_fragmented_terminal_prefix() {
         let mut decoder = SseDecoder::new(4096);
         let first = b"event: response.completed\ndata: {\"type\":\"response.com";
         assert!(decoder.feed(first).unwrap().is_empty());
-        let already_forwarded_bytes = decoder.buffer.len();
         let second = b"pleted\",\"response\":{\"status\":\"completed\"}}\n\n";
         let frames = decoder.feed(second).unwrap();
         let mut stats = StreamStats::new("raw-terminal-fragment-test");
-        let (new_bytes, terminal) =
-            raw_terminal_prefix(frames, &mut stats, already_forwarded_bytes)
-                .unwrap()
-                .expect("completed terminal expected");
+        let (new_bytes, terminal) = raw_terminal_prefix(frames, &mut stats).unwrap();
+        let terminal = terminal.expect("completed terminal expected");
         assert!(matches!(terminal, Terminal::Completed));
-        assert_eq!(new_bytes.as_ref(), second);
+        assert!(new_bytes.ends_with(second));
     }
 
     #[test]
@@ -3578,9 +3746,8 @@ mod tests {
             panic!("expected the transparent stream to remain committed");
         };
         assert!(active.business_committed);
-        assert_eq!(active.buffered.len(), 2);
+        assert_eq!(active.buffered.len(), 1);
         assert!(active.buffered[0].starts_with(b"event: response.created\n"));
-        assert!(active.buffered[1].starts_with(b"event: response.failed\n"));
         assert!(matches!(
             active.terminal,
             Some(Terminal::SemanticFailure { .. })

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{to_bytes, Body};
 use axum::extract::Request;
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri};
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -15,8 +16,6 @@ use ring::rand::SystemRandom;
 use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
 
 use crate::hedging::{
@@ -51,6 +50,7 @@ const UPSTREAM_REQUEST_HEADER: &str = "x-uni-api-upstream-request";
 const UPSTREAM_RESPONSE_HEADER: &str = "x-uni-api-upstream-response";
 
 const PUBLIC_JSON_ROUTES: &[&str] = &[
+    "/v1/systemone",
     "/v1/chat/completions",
     "/v1/messages",
     "/v1/images/generations",
@@ -86,6 +86,7 @@ enum DownstreamProtocol {
 }
 
 struct PreparedAttempt {
+    dispatch: Option<crate::request_timing::AttemptDispatch>,
     method: Method,
     url: String,
     headers: HeaderMap,
@@ -192,6 +193,10 @@ pub fn known_path(path: &str) -> bool {
 
 pub async fn handle(state: AppState, request: Request, resource_wait: Duration) -> Response<Body> {
     let started = Instant::now();
+    let arrival = request
+        .extensions()
+        .get::<crate::request_timing::RequestArrival>()
+        .copied();
     let method = request.method().clone();
     let uri = request.uri().clone();
     let path = uri.path().trim_end_matches('/').to_owned();
@@ -286,7 +291,9 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         .native_responses_config
         .auto_retry_budget(&headers)
         .await;
-    let max_attempts = if retry_budget == 0 {
+    let max_attempts = if headers.contains_key(crate::responses_native::TARGET_PROVIDER_HEADER)
+        || retry_budget == 0
+    {
         1
     } else {
         compute_retry_count(&resolved.providers)
@@ -306,20 +313,17 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         .native_responses_config
         .prices_for_model(&request_model)
         .await;
-    let use_precommit_stream = path == "/v1/chat/completions"
+    let use_chat_stream = path == "/v1/chat/completions"
         && input
             .payload
             .as_ref()
             .and_then(|payload| payload.get("stream"))
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        && resolved
-            .providers
-            .iter()
-            .any(|provider| provider_uses_responses_chat(provider));
-    let execution = AttemptLoop {
+            .unwrap_or(false);
+    let mut execution = AttemptLoop {
         state,
         started,
+        arrival,
         method,
         uri,
         path,
@@ -338,10 +342,12 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
         image_reservations,
         prompt_price,
         completion_price,
-        precommit_comment_sent: use_precommit_stream,
+        keepalive_updates: None,
     };
-    if use_precommit_stream {
-        return precommit_chat_stream(execution);
+    if use_chat_stream {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        execution.keepalive_updates = Some(tx);
+        return crate::chat_stream::with_keepalive(run_attempt_loop(execution), rx).await;
     }
     if chat_nonstream_hedging_enabled(&execution.path, execution.input.payload.as_ref(), hedging) {
         return run_hedged_attempt_loop(execution, hedging).await;
@@ -352,6 +358,7 @@ pub async fn handle(state: AppState, request: Request, resource_wait: Duration) 
 struct AttemptLoop {
     state: AppState,
     started: Instant,
+    arrival: Option<crate::request_timing::RequestArrival>,
     method: Method,
     uri: Uri,
     path: String,
@@ -370,7 +377,7 @@ struct AttemptLoop {
     image_reservations: Vec<MemoryReservation>,
     prompt_price: f64,
     completion_price: f64,
-    precommit_comment_sent: bool,
+    keepalive_updates: Option<crate::chat_stream::KeepaliveUpdates>,
 }
 
 fn chat_nonstream_hedging_enabled(
@@ -386,73 +393,6 @@ fn chat_nonstream_hedging_enabled(
         && hedging.active()
 }
 
-fn provider_uses_responses_chat(provider: &Provider) -> bool {
-    let engine = provider.engine.trim().to_ascii_lowercase();
-    engine == "codex"
-        || (matches!(
-            engine.as_str(),
-            "gpt" | "openrouter" | "azure" | "azure-databricks" | "cloudflare"
-        ) && provider
-            .base_url
-            .to_ascii_lowercase()
-            .contains("/responses"))
-}
-
-fn precommit_chat_stream(execution: AttemptLoop) -> Response<Body> {
-    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
-    tokio::spawn(async move {
-        if tx.send(Ok(Bytes::from_static(b":\n\n"))).await.is_err() {
-            return;
-        }
-        let response = run_attempt_loop(execution).await;
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let (parts, body) = response.into_parts();
-        if content_type.contains("text/event-stream") {
-            let mut body = body.into_data_stream();
-            while let Some(chunk) = body.next().await {
-                if tx.send(chunk.map_err(io::Error::other)).await.is_err() {
-                    return;
-                }
-            }
-            return;
-        }
-        let body = match to_bytes(body, UPSTREAM_ERROR_MAX_BYTES).await {
-            Ok(body) => body,
-            Err(error) => Bytes::from(
-                json!({"error":{"message":format!("read terminal provider response: {error}")}})
-                    .to_string(),
-            ),
-        };
-        let payload = serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| {
-            json!({"error":{
-                "message":String::from_utf8_lossy(&body),
-                "status_code":parts.status.as_u16(),
-            }})
-        });
-        let _ = tx
-            .send(Ok(Bytes::from(format!("data: {payload}\n\n"))))
-            .await;
-    });
-    let mut response = Response::new(Body::from_stream(ReceiverStream::new(rx)));
-    response.headers_mut().insert(
-        "content-type",
-        HeaderValue::from_static("text/event-stream; charset=utf-8"),
-    );
-    response.headers_mut().insert(
-        "cache-control",
-        HeaderValue::from_static("no-cache, no-transform"),
-    );
-    response
-        .headers_mut()
-        .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
-    response
-}
-
 #[derive(Clone)]
 struct GenericHedgeContext {
     attempt_index: usize,
@@ -461,6 +401,7 @@ struct GenericHedgeContext {
     original_model: String,
     provider_key: String,
     upstream_url: String,
+    downstream_stream: bool,
 }
 
 struct GenericHedgePlan {
@@ -619,6 +560,20 @@ async fn next_generic_hedge_plan(
             }
         }
         let attempt_started = Instant::now();
+        prepared.dispatch = execution.arrival.map(|arrival| {
+            arrival.attempt(
+                crate::channel_metrics::MetricKey::new(
+                    provider.name.as_ref(),
+                    &execution.request_model,
+                    &original_model,
+                    &execution.path,
+                    prepared.downstream_stream,
+                ),
+                execution.request_id.clone(),
+                attempt_id,
+                &execution.api_key,
+            )
+        });
         emit_attempt(
             &execution.request_id,
             &execution.trace_id,
@@ -628,6 +583,7 @@ async fn next_generic_hedge_plan(
             &execution.request_model,
             &original_model,
             &execution.path,
+            prepared.downstream_stream,
             &execution.method,
             &prepared.url,
             "started",
@@ -642,6 +598,7 @@ async fn next_generic_hedge_plan(
                 original_model,
                 provider_key: provider_key_raw,
                 upstream_url,
+                downstream_stream: prepared.downstream_stream,
             },
             prepared,
         });
@@ -701,7 +658,7 @@ fn spawn_generic_hedge_attempt(
             plan.prepared,
             &incoming_headers,
             &endpoint,
-            false,
+            None,
             Some(&trigger),
         )
         .await
@@ -763,6 +720,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                             &execution.request_model,
                             &context.original_model,
                             &execution.path,
+                            context.downstream_stream,
                             &execution.method,
                             &context.upstream_url,
                             "cancelled",
@@ -775,17 +733,26 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     response,
                     status,
                     usage,
+                    fact_usage,
                     stream_outcome,
                     upstream_url,
                 } = success;
                 debug_assert!(stream_outcome.is_none());
                 execution.state.persistence.record_channel(ChannelStat {
+                    duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
+                    first_output_ms: None,
+                    response_created_ms: None,
+                    first_text_ms: None,
                     request_id: execution.request_id.clone(),
+                    attempt_id: format!("{}-r{}", execution.request_id, context.attempt_index + 1),
                     provider: context.provider.name.to_string(),
                     model: execution.request_model.clone(),
+                    upstream_model: context.original_model.clone(),
                     api_key: execution.api_key.clone(),
                     provider_api_key: context.provider_key.clone(),
                     success: true,
+                    endpoint: execution.path.clone(),
+                    stream: context.downstream_stream,
                 });
                 execution
                     .state
@@ -793,6 +760,9 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     .reset_route_failure(&context.provider, &context.original_model)
                     .await;
                 execution.state.persistence.record_request(RequestStat {
+                    fact_usage,
+                    stream: context.downstream_stream,
+                    status: status.as_u16(),
                     request_id: execution.request_id.clone(),
                     trace_id: execution.trace_id.clone(),
                     endpoint: execution.path.clone(),
@@ -801,6 +771,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     first_response_time: context.attempt_started.elapsed().as_secs_f64(),
                     provider: context.provider.name.to_string(),
                     model: execution.request_model.clone(),
+                    upstream_model: context.original_model.clone(),
                     api_key: execution.api_key.clone(),
                     prompt_tokens: usage.0,
                     completion_tokens: usage.1,
@@ -828,6 +799,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     &execution.request_model,
                     &context.original_model,
                     &execution.path,
+                    context.downstream_stream,
                     &execution.method,
                     &upstream_url,
                     "completed",
@@ -867,12 +839,20 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     }
                 }
                 execution.state.persistence.record_channel(ChannelStat {
+                    duration_ms: Some(context.attempt_started.elapsed().as_secs_f64() * 1000.0),
+                    first_output_ms: None,
+                    response_created_ms: None,
+                    first_text_ms: None,
                     request_id: execution.request_id.clone(),
+                    attempt_id: format!("{}-r{}", execution.request_id, context.attempt_index + 1),
                     provider: context.provider.name.to_string(),
                     model: execution.request_model.clone(),
+                    upstream_model: context.original_model.clone(),
                     api_key: execution.api_key.clone(),
                     provider_api_key: context.provider_key.clone(),
                     success: false,
+                    endpoint: execution.path.clone(),
+                    stream: context.downstream_stream,
                 });
                 if !policy.request_scoped || policy.force_quota_cooldown {
                     execution
@@ -909,6 +889,7 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                     &execution.request_model,
                     &context.original_model,
                     &execution.path,
+                    context.downstream_stream,
                     &execution.method,
                     &failure.upstream_url,
                     "failed",
@@ -932,6 +913,8 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
     }
 
     execution.state.persistence.record_request(RequestStat {
+        is_flagged: true,
+        status: last_status.as_u16(),
         request_id: execution.request_id,
         trace_id: execution.trace_id,
         endpoint: execution.path,
@@ -956,6 +939,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     let AttemptLoop {
         state,
         started,
+        arrival,
         method,
         uri,
         path,
@@ -974,11 +958,12 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
         image_reservations: _image_reservations,
         prompt_price,
         completion_price,
-        precommit_comment_sent,
+        keepalive_updates,
     } = execution;
     let mut last_status = StatusCode::BAD_GATEWAY;
     let mut last_detail = String::from("No upstream attempt succeeded");
     let mut last_upstream_response = None;
+    let mut upstream_failed = false;
 
     for attempt_index in 0..max_attempts {
         let provider = providers[attempt_index % providers.len()].clone();
@@ -1004,8 +989,10 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 continue;
             }
             ProviderKeySelection::ChannelCooling | ProviderKeySelection::AllKeysCooling => {
-                last_status = StatusCode::TOO_MANY_REQUESTS;
-                last_detail = "All matching provider routes are cooling down".into();
+                if !upstream_failed {
+                    last_status = StatusCode::TOO_MANY_REQUESTS;
+                    last_detail = "All matching provider routes are cooling down".into();
+                }
                 continue;
             }
         };
@@ -1056,6 +1043,21 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             }
         }
         let attempt_started = Instant::now();
+        prepared.dispatch = arrival.map(|arrival| {
+            arrival.attempt(
+                crate::channel_metrics::MetricKey::new(
+                    provider.name.as_ref(),
+                    &request_model,
+                    &original_model,
+                    &path,
+                    prepared.downstream_stream,
+                ),
+                request_id.clone(),
+                format!("{request_id}-r{}", attempt_index + 1),
+                &api_key,
+            )
+        });
+        let downstream_stream = prepared.downstream_stream;
         emit_attempt(
             &request_id,
             &trace_id,
@@ -1065,6 +1067,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             &request_model,
             &original_model,
             &path,
+            downstream_stream,
             &method,
             &prepared.url,
             "started",
@@ -1076,7 +1079,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
             prepared,
             &headers,
             &path,
-            precommit_comment_sent,
+            keepalive_updates.as_ref(),
             None,
         )
         .await
@@ -1086,10 +1089,15 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     response,
                     status,
                     usage,
+                    fact_usage,
                     stream_outcome,
                     upstream_url,
                 } = success;
                 let request_stat = RequestStat {
+                    fact_usage,
+                    stream: downstream_stream,
+                    upstream_model: original_model.clone(),
+                    status: status.as_u16(),
                     request_id: request_id.clone(),
                     trace_id: trace_id.clone(),
                     endpoint: path.clone(),
@@ -1129,9 +1137,14 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         let outcome = stream_outcome.await.unwrap_or_else(|_| {
                             provider_stream::StreamOutcome {
                                 usage: (0, 0, 0),
+                                fact_usage: Default::default(),
                                 success: false,
+                                observational_only: false,
                                 status_code: 502,
                                 detail: "provider stream outcome was canceled".into(),
+                                first_output_ms: None,
+                                response_created_ms: None,
+                                first_text_ms: None,
                             }
                         });
                         let mut request_stat = request_stat;
@@ -1139,28 +1152,47 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                         request_stat.prompt_tokens = outcome.usage.0;
                         request_stat.completion_tokens = outcome.usage.1;
                         request_stat.total_tokens = outcome.usage.2;
+                        request_stat.fact_usage = outcome.fact_usage.clone();
+                        request_stat.first_output_ms = outcome.first_output_ms;
+                        request_stat.response_created_ms = outcome.response_created_ms;
+                        request_stat.first_text_ms = outcome.first_text_ms;
+                        request_stat.status = outcome.status_code;
+                        request_stat.is_flagged = !outcome.success;
                         request_stat.timing_spans = json!({
                             "runtime": "rust",
                             "attempt_count": attempt_index + 1,
                             "upstream_ms": attempt_started.elapsed().as_millis(),
                             "terminal": if outcome.success { "stream_completed" } else { "stream_failed" },
                             "status_code": outcome.status_code,
+                            "first_output_ms": outcome.first_output_ms,
                         })
                         .to_string();
                         outcome_state.persistence.record_channel(ChannelStat {
+                            duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
+                            first_output_ms: outcome.first_output_ms,
+                            response_created_ms: outcome.response_created_ms,
+                            first_text_ms: outcome.first_text_ms,
                             request_id: outcome_request_id.clone(),
+                            attempt_id: format!("{}-r{}", outcome_request_id, attempt_index + 1),
                             provider: outcome_provider.name.to_string(),
                             model: outcome_model.clone(),
+                            upstream_model: outcome_original_model.clone(),
                             api_key: outcome_api_key,
                             provider_api_key: outcome_provider_key.clone(),
                             success: outcome.success,
+                            endpoint: outcome_path.clone(),
+                            stream: downstream_stream,
                         });
                         let recorded_status = if outcome.success {
-                            outcome_state
-                                .native_responses_config
-                                .reset_route_failure(&outcome_provider, &outcome_original_model)
-                                .await;
+                            if !outcome.observational_only {
+                                outcome_state
+                                    .native_responses_config
+                                    .reset_route_failure(&outcome_provider, &outcome_original_model)
+                                    .await;
+                            }
                             status.as_u16()
+                        } else if outcome.observational_only || outcome.status_code == 499 {
+                            outcome.status_code
                         } else {
                             let policy = classify_provider_failure(
                                 outcome.status_code,
@@ -1194,7 +1226,16 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             policy.status
                         };
                         outcome_state.persistence.record_request(request_stat);
-                        emit_attempt(
+                        crate::channel_metrics::global().response_timings(
+                            &outcome_provider.name,
+                            &outcome_model,
+                            &outcome_original_model,
+                            &outcome_path,
+                            downstream_stream,
+                            outcome.response_created_ms,
+                            outcome.first_text_ms,
+                        );
+                        emit_attempt_with_first_output(
                             &outcome_request_id,
                             &outcome_trace_id,
                             &outcome_role,
@@ -1203,6 +1244,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             &outcome_model,
                             &outcome_original_model,
                             &outcome_path,
+                            downstream_stream,
                             &outcome_method,
                             &upstream_url,
                             if outcome.success {
@@ -1211,17 +1253,26 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                                 "failed"
                             },
                             Some(recorded_status),
+                            outcome.first_output_ms,
                         );
                     });
                     return response;
                 }
                 state.persistence.record_channel(ChannelStat {
+                    duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
+                    first_output_ms: None,
+                    response_created_ms: None,
+                    first_text_ms: None,
                     request_id: request_id.clone(),
+                    attempt_id: format!("{}-r{}", request_id, attempt_index + 1),
                     provider: provider.name.to_string(),
                     model: request_model.clone(),
+                    upstream_model: original_model.clone(),
                     api_key: api_key.clone(),
                     provider_api_key: provider_key_raw.clone(),
                     success: true,
+                    endpoint: path.clone(),
+                    stream: downstream_stream,
                 });
                 state
                     .native_responses_config
@@ -1237,6 +1288,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     &request_model,
                     &original_model,
                     &path,
+                    downstream_stream,
                     &method,
                     &upstream_url,
                     "completed",
@@ -1245,6 +1297,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                 return response;
             }
             Err(mut failure) => {
+                upstream_failed = true;
                 let policy = classify_provider_failure(
                     failure.status.as_u16(),
                     &failure.detail,
@@ -1269,12 +1322,20 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     }
                 }
                 state.persistence.record_channel(ChannelStat {
+                    duration_ms: Some(attempt_started.elapsed().as_secs_f64() * 1000.0),
+                    first_output_ms: None,
+                    response_created_ms: None,
+                    first_text_ms: None,
                     request_id: request_id.clone(),
+                    attempt_id: format!("{}-r{}", request_id, attempt_index + 1),
                     provider: provider.name.to_string(),
                     model: request_model.clone(),
+                    upstream_model: original_model.clone(),
                     api_key: api_key.clone(),
                     provider_api_key: provider_key_raw.clone(),
                     success: false,
+                    endpoint: path.clone(),
+                    stream: downstream_stream,
                 });
                 if !policy.request_scoped || policy.force_quota_cooldown {
                     state
@@ -1306,6 +1367,7 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     &request_model,
                     &original_model,
                     &path,
+                    downstream_stream,
                     &method,
                     &failure.upstream_url,
                     "failed",
@@ -1319,6 +1381,14 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
     }
 
     state.persistence.record_request(RequestStat {
+        is_flagged: true,
+        status: last_status.as_u16(),
+        stream: input
+            .payload
+            .as_ref()
+            .and_then(|v| v.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         request_id,
         trace_id,
         endpoint: path,
@@ -1342,6 +1412,11 @@ fn missing_required_field(path: &str, payload: &Value) -> Option<&'static str> {
         })
     };
     match path {
+        "/v1/systemone" if !root.get("model").is_some_and(Value::is_string) => Some("model"),
+        "/v1/systemone" if !root.contains_key("state") => Some("state"),
+        "/v1/systemone" if !root.get("questions").is_some_and(Value::is_object) => {
+            Some("questions")
+        }
         "/v1/chat/completions" | "/v1/messages" if missing("messages") => Some("messages"),
         "/v1/images/generations" if missing("prompt") => Some("prompt"),
         "/v1/embeddings" if missing("input") => Some("input"),
@@ -1540,7 +1615,7 @@ pub(crate) async fn run_moderation_preflight(
             prepared,
             headers,
             "/v1/moderations",
-            false,
+            None,
             None,
         )
         .await
@@ -2043,6 +2118,48 @@ async fn prepare_input(
     })
 }
 
+// Pure request preparation for the administrator preview. No send, OAuth
+// refresh, key scheduling or model invocation occurs here.
+pub(crate) fn preview_channel_request(
+    provider: &Provider,
+    model: &str,
+    upstream: &str,
+    endpoint: &str,
+    payload: Value,
+) -> Result<Value, String> {
+    let uri: Uri = endpoint
+        .parse()
+        .map_err(|_| "invalid preview endpoint".to_owned())?;
+    let input = PreparedInput {
+        payload: Some(payload),
+        replay: None,
+        observation: SpoolObservation::default(),
+        default_model: String::new(),
+        content_type: "application/json".into(),
+    };
+    let attempt = build_attempt(
+        provider,
+        "preview-key",
+        model,
+        upstream,
+        &Method::POST,
+        &uri,
+        endpoint,
+        &HeaderMap::new(),
+        &input,
+        "preview",
+    )?;
+    let body = match attempt.body {
+        AttemptBody::Json(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    let mut url = Url::parse(&attempt.url).map_err(|_| "invalid prepared endpoint".to_owned())?;
+    url.set_query(None);
+    Ok(
+        json!({"url":url.to_string(),"method":attempt.method.as_str(),"header_names":attempt.headers.keys().map(|h|h.as_str()).collect::<Vec<_>>(),"body":body,"stream":attempt.upstream_stream}),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_attempt(
     provider: &Provider,
@@ -2057,7 +2174,11 @@ fn build_attempt(
     request_id: &str,
 ) -> Result<PreparedAttempt, String> {
     let is_alpha_search = path == ALPHA_SEARCH_ENDPOINT;
+    let is_systemone = path == "/v1/systemone";
     let engine = provider.engine.trim().to_ascii_lowercase();
+    if !crate::responses_native::provider_accepts_endpoint(provider, path) {
+        return Err("Provider does not support this endpoint".into());
+    }
     let native_responses_wire = matches!(path, "/v1/responses" | "/v1/responses/compact")
         && (engine == "codex"
             || (engine == "gpt"
@@ -2071,6 +2192,7 @@ fn build_attempt(
         DownstreamProtocol::Native
     };
     let downstream_stream = !is_alpha_search
+        && !is_systemone
         && input
             .payload
             .as_ref()
@@ -2152,6 +2274,7 @@ fn build_attempt(
             AttemptBody::Replay(storage.clone_for_replay(), observation.clone())
         };
         return Ok(PreparedAttempt {
+            dispatch: None,
             method: method.clone(),
             url,
             headers,
@@ -2182,6 +2305,14 @@ fn build_attempt(
         .then(|| estimate_video_tokens(&payload))
         .flatten();
     let (url, adapter, upstream_stream) = match engine.as_str() {
+        "typesafe" => {
+            set_model(&mut payload, original_model)?;
+            (
+                typesafe_endpoint_url(provider.base_url.as_ref())?,
+                ResponseAdapter::Passthrough,
+                false,
+            )
+        }
         "codex" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_responses(&payload, original_model)?;
             (
@@ -2483,6 +2614,7 @@ fn build_attempt(
             | ResponseAdapter::CallxyqVideo
     ) && engine != "vertex-claude"
         && !is_alpha_search
+        && !is_systemone
     {
         if let Some(root) = payload.as_object_mut() {
             root.insert("stream".into(), Value::Bool(upstream_stream));
@@ -2501,6 +2633,19 @@ fn build_attempt(
             }
         }
     }
+    // OpenAI-compatible overrides may explicitly disable upstream streaming.
+    // Decode the wire format we actually requested before adapting the result.
+    let upstream_stream = if matches!(
+        adapter,
+        ResponseAdapter::ResponsesToChat | ResponseAdapter::Passthrough
+    ) {
+        payload
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(upstream_stream)
+    } else {
+        upstream_stream
+    };
     let mut headers = provider_headers(
         provider,
         provider_key,
@@ -2536,6 +2681,7 @@ fn build_attempt(
         AttemptBody::Json(body)
     };
     Ok(PreparedAttempt {
+        dispatch: None,
         method: outgoing_method,
         url,
         headers,
@@ -2860,8 +3006,19 @@ struct AttemptSuccess {
     response: Response<Body>,
     status: StatusCode,
     usage: (i64, i64, i64),
+    fact_usage: crate::fact_usage::FactUsage,
     stream_outcome: Option<tokio::sync::oneshot::Receiver<provider_stream::StreamOutcome>>,
     upstream_url: String,
+}
+
+// Only attribution headers survive a protocol conversion. Forwarding content
+// type/length or other representation headers would describe the wrong body.
+fn copy_oaix_headers(source: &HeaderMap, target: &mut HeaderMap) {
+    for (name, value) in source {
+        if name.as_str().starts_with("x-oaix-") {
+            target.append(name.clone(), value.clone());
+        }
+    }
 }
 
 struct AttemptFailure {
@@ -2929,7 +3086,7 @@ async fn send_attempt(
     mut prepared: PreparedAttempt,
     incoming_headers: &HeaderMap,
     endpoint: &str,
-    precommit_comment_sent: bool,
+    keepalive_updates: Option<&crate::chat_stream::KeepaliveUpdates>,
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
     let debug_enabled = upstream_debug_enabled(incoming_headers);
@@ -2950,6 +3107,13 @@ async fn send_attempt(
             prepared.method.as_str(),
         )
         .await;
+    if let Some(updates) = keepalive_updates {
+        let interval = state
+            .native_responses_config
+            .keepalive_interval(provider, &prepared.request_model, &prepared.original_model)
+            .await;
+        updates.send_replace(interval);
+    }
     let connect_timeout = positive_duration(timeouts.connect);
     let client = state
         .upstream_client(proxy, http1_only, connect_timeout)
@@ -2962,7 +3126,9 @@ async fn send_attempt(
         })?;
     let base_timeout = provider_timeout(provider, &prepared.original_model);
     let configured_total_timeout = positive_duration(timeouts.total);
-    let request_timeout = if hedge_trigger.is_some() {
+    let request_timeout = if hedge_trigger.is_some()
+        || (prepared.upstream_stream && endpoint == "/v1/chat/completions")
+    {
         configured_total_timeout
     } else {
         Some(configured_total_timeout.unwrap_or(base_timeout))
@@ -3072,6 +3238,12 @@ async fn send_attempt(
         }
         AttemptBody::Empty => request,
     };
+    let billing_secret = crate::billing_observation::request_key(&prepared.headers, &prepared.url);
+    if let Some(dispatch) = &prepared.dispatch {
+        dispatch.billing.target(&prepared.url, &billing_secret);
+        dispatch.record(&state.channel_metrics);
+    }
+    let send_started = Instant::now();
     let response = if let Some(trigger) = hedge_trigger {
         let started = tokio::time::Instant::now();
         let hard_timeout = [timeouts.write, timeouts.pool, timeouts.total]
@@ -3109,12 +3281,23 @@ async fn send_attempt(
         upstream_url: prepared.url.clone(),
         response: None,
     })?;
+    if let Some(dispatch) = &prepared.dispatch {
+        dispatch.billing.headers(
+            response.headers(),
+            response.status().as_u16(),
+            &billing_secret,
+        );
+    }
     let status = response.status();
+    let attribution_headers = response.headers().clone();
     if !status.is_success() {
         let headers = filtered_response_headers(response.headers());
         let body = read_limited_upstream_body(response, UPSTREAM_ERROR_MAX_BYTES)
             .await
             .unwrap_or_else(|error| Bytes::from(format!("read upstream error response: {error}")));
+        if let Some(dispatch) = &prepared.dispatch {
+            dispatch.billing.error_body(status.as_u16(), &body);
+        }
         let detail = String::from_utf8_lossy(&body).into_owned();
         let upstream_response_debug = debug_enabled.then(|| {
             BASE64.encode(
@@ -3158,6 +3341,54 @@ async fn send_attempt(
         && prepared.downstream_protocol == DownstreamProtocol::Native
         && prepared.upstream_stream
     {
+        if response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("text/event-stream"))
+        {
+            let guarded_chat = endpoint == "/v1/chat/completions";
+            // Chat routing is finalized by the stream outcome, not HTTP headers.
+            if !guarded_chat {
+                state
+                    .native_responses_config
+                    .reset_route_failure(provider, &prepared.original_model)
+                    .await;
+            }
+            let mut translation = crate::passthrough_observation::observe(
+                response,
+                send_started,
+                guarded_chat,
+                positive_duration(timeouts.idle),
+            );
+            if guarded_chat {
+                translation = crate::chat_stream::preflight(
+                    translation,
+                    positive_duration(timeouts.first_byte)
+                        .map(|duration| tokio::time::Instant::from_std(send_started + duration)),
+                )
+                .await
+                .map_err(|failure| AttemptFailure {
+                    status: StatusCode::from_u16(failure.status_code)
+                        .unwrap_or(StatusCode::BAD_GATEWAY),
+                    detail: failure.detail,
+                    upstream_url: prepared.url.clone(),
+                    response: None,
+                })?;
+            }
+            translation
+                .response
+                .headers_mut()
+                .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
+            return Ok(AttemptSuccess {
+                response: translation.response,
+                status,
+                usage: (0, 0, 0),
+                fact_usage: Default::default(),
+                stream_outcome: Some(translation.outcome),
+                upstream_url: prepared.url,
+            });
+        }
         let headers = filtered_response_headers(response.headers());
         let mut output = Response::new(Body::from_stream(response.bytes_stream()));
         *output.status_mut() = status;
@@ -3169,6 +3400,7 @@ async fn send_attempt(
             response: output,
             status,
             usage: (0, 0, 0),
+            fact_usage: Default::default(),
             stream_outcome: None,
             upstream_url: prepared.url,
         });
@@ -3205,10 +3437,14 @@ async fn send_attempt(
                 output_protocol,
                 prepared.request_model.clone(),
                 prepared.chat_stream_include_usage,
-                timeouts.first_byte,
+                timeouts.first_byte.map(|seconds| {
+                    (seconds - send_started.elapsed().as_secs_f64()).max(f64::EPSILON)
+                }),
                 timeouts.idle,
-                timeouts.total,
-                !precommit_comment_sent,
+                timeouts.total.map(|seconds| {
+                    (seconds - send_started.elapsed().as_secs_f64()).max(f64::EPSILON)
+                }),
+                false,
             )
             .await
             .map_err(|failure| AttemptFailure {
@@ -3235,6 +3471,24 @@ async fn send_attempt(
                 prepared.anthropic_thinking,
             )
         };
+        if endpoint == "/v1/chat/completions"
+            && prepared.adapter != ResponseAdapter::ResponsesToChat
+        {
+            translation = crate::chat_stream::preflight(
+                translation,
+                positive_duration(timeouts.first_byte)
+                    .map(|duration| tokio::time::Instant::from_std(send_started + duration)),
+            )
+            .await
+            .map_err(|failure| AttemptFailure {
+                status: StatusCode::from_u16(failure.status_code)
+                    .unwrap_or(StatusCode::BAD_GATEWAY),
+                detail: failure.detail,
+                upstream_url: prepared.url.clone(),
+                response: None,
+            })?;
+        }
+        copy_oaix_headers(&attribution_headers, translation.response.headers_mut());
         translation
             .response
             .headers_mut()
@@ -3243,6 +3497,7 @@ async fn send_attempt(
             response: translation.response,
             status,
             usage: (0, 0, 0),
+            fact_usage: Default::default(),
             stream_outcome: Some(translation.outcome),
             upstream_url: prepared.url,
         });
@@ -3259,6 +3514,10 @@ async fn send_attempt(
                 upstream_url: prepared.url.clone(),
                 response: None,
             })?;
+        let parsed = serde_json::from_slice::<Value>(&body).ok();
+        let fact_usage =
+            crate::fact_usage::FactUsage::from_usage(parsed.as_ref().and_then(|v| v.get("usage")));
+        let usage = parsed.as_ref().map(usage).unwrap_or((0, 0, 0));
         let upstream_response_debug = debug_enabled.then(|| {
             BASE64.encode(
                 json!({
@@ -3269,10 +3528,6 @@ async fn send_attempt(
                 .to_string(),
             )
         });
-        let usage = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .map(|value| usage(&value))
-            .unwrap_or((0, 0, 0));
         let mut output = Response::new(Body::from(body));
         *output.status_mut() = status;
         *output.headers_mut() = headers;
@@ -3288,6 +3543,7 @@ async fn send_attempt(
             response: output,
             status,
             usage,
+            fact_usage,
             stream_outcome: None,
             upstream_url: prepared.url,
         });
@@ -3320,6 +3576,11 @@ async fn send_attempt(
             response: None,
         })?
     };
+    let fact_usage = crate::fact_usage::FactUsage::from_usage(
+        upstream
+            .get("usage")
+            .or_else(|| upstream.get("usageMetadata")),
+    );
     let upstream_response_debug = debug_enabled.then(|| {
         BASE64.encode(
             json!({
@@ -3396,6 +3657,7 @@ async fn send_attempt(
     } else {
         json_response(StatusCode::OK, normalized)
     };
+    copy_oaix_headers(&attribution_headers, output.headers_mut());
     output
         .headers_mut()
         .insert("x-uni-api-runtime", HeaderValue::from_static("rust"));
@@ -3408,6 +3670,7 @@ async fn send_attempt(
         response: output,
         status: StatusCode::OK,
         usage,
+        fact_usage,
         stream_outcome: None,
         upstream_url: prepared.url,
     })
@@ -3590,6 +3853,9 @@ fn provider_headers(
                 headers.insert(ua, value);
             }
         }
+    }
+    if let Some(value) = incoming.get("x-oaix-settlement-nonce") {
+        headers.insert("x-oaix-settlement-nonce", value.clone());
     }
     Ok(headers)
 }
@@ -5790,7 +6056,7 @@ fn chat_to_responses_response(value: &Value, model: &str) -> Value {
         .get("completion_tokens")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    json!({
+    let mut response = json!({
         "id":format!("resp_{}", unix_seconds()),
         "object":"response",
         "created_at":unix_seconds(),
@@ -5807,7 +6073,11 @@ fn chat_to_responses_response(value: &Value, model: &str) -> Value {
         },
         "error":Value::Null,
         "incomplete_details":Value::Null,
-    })
+    });
+    if let Some(receipt) = chat_usage.get("oaix_settlement_receipt") {
+        response["usage"]["oaix_settlement_receipt"] = receipt.clone();
+    }
+    response
 }
 
 fn normalize_search_response(url: &str, value: &Value) -> Value {
@@ -6270,6 +6540,22 @@ fn filtered_lingjing_query(query: Option<&str>) -> Option<String> {
     retained.then(|| output.finish())
 }
 
+fn typesafe_endpoint_url(base: &str) -> Result<String, String> {
+    let mut url = Url::parse(base).map_err(|_| "Invalid TypeSafe base URL".to_owned())?;
+    let mut path = url.path().trim_end_matches('/').to_owned();
+    for suffix in ["/systemone", "/models"] {
+        if path.ends_with(suffix) {
+            path.truncate(path.len() - suffix.len());
+            break;
+        }
+    }
+    if !path.ends_with("/v1") {
+        path.push_str("/v1");
+    }
+    url.set_path(&format!("{path}/systemone"));
+    Ok(url.to_string())
+}
+
 fn replace_known_endpoint(base: &str, endpoint: &str) -> Result<String, String> {
     let mut url =
         Url::parse(base).map_err(|error| format!("invalid provider base URL: {error}"))?;
@@ -6284,6 +6570,7 @@ fn replace_known_endpoint(base: &str, endpoint: &str) -> Result<String, String> 
         "/responses/compact",
         "/responses",
         "/messages",
+        "/systemone",
     ];
     let mut path = url.path().trim_end_matches('/').to_owned();
     for suffix in known {
@@ -7319,11 +7606,69 @@ fn emit_attempt(
     request_model: &str,
     original_model: &str,
     endpoint: &str,
+    downstream_stream: bool,
     method: &Method,
     url: &str,
     outcome: &str,
     status: Option<u16>,
 ) {
+    emit_attempt_with_first_output(
+        request_id,
+        trace_id,
+        role,
+        attempt_index,
+        provider,
+        request_model,
+        original_model,
+        endpoint,
+        downstream_stream,
+        method,
+        url,
+        outcome,
+        status,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_attempt_with_first_output(
+    request_id: &str,
+    trace_id: &str,
+    role: &str,
+    attempt_index: usize,
+    provider: &Provider,
+    request_model: &str,
+    original_model: &str,
+    endpoint: &str,
+    downstream_stream: bool,
+    method: &Method,
+    url: &str,
+    outcome: &str,
+    status: Option<u16>,
+    first_output_ms: Option<f64>,
+) {
+    let metrics = crate::channel_metrics::global();
+    let upstream_model = original_model;
+    if outcome == "started" {
+        metrics.start(
+            provider.name.as_ref(),
+            request_model,
+            upstream_model,
+            endpoint,
+            downstream_stream,
+        );
+    } else {
+        metrics.finish(
+            provider.name.as_ref(),
+            request_model,
+            upstream_model,
+            endpoint,
+            downstream_stream,
+            outcome,
+            None,
+            first_output_ms,
+        );
+    }
     let upstream_host = Url::parse(url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
@@ -7349,6 +7694,7 @@ fn emit_attempt(
             "request_id": request_id,
             "trace_id": trace_id,
             "path": endpoint,
+            "streaming": downstream_stream,
             "path_template": endpoint,
             "route": format!("{} {endpoint}", method.as_str()),
             "method": method.as_str(),

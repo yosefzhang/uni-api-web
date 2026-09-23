@@ -333,7 +333,7 @@ fn discovery_cache_key(provider: &Value) -> String {
     format!("{:x}", Sha256::digest(provider.to_string().as_bytes()))
 }
 
-async fn discover_provider_models(
+pub(crate) async fn discover_provider_models(
     client: &reqwest::Client,
     provider: &Value,
 ) -> Result<Vec<String>, String> {
@@ -437,6 +437,7 @@ fn provider_models_url(base_url: &str) -> Result<Url, String> {
     let mut url = Url::parse(base_url)
         .map_err(|error| format!("invalid provider model discovery URL: {error}"))?;
     let known = [
+        "/systemone",
         "/chat/completions",
         "/responses/compact",
         "/responses",
@@ -679,7 +680,7 @@ fn compile_video_provider(value: &Value) -> Option<Value> {
     )
 }
 
-fn compile_provider(value: &Value) -> Option<Value> {
+pub(crate) fn compile_provider(value: &Value) -> Option<Value> {
     let item = value.as_object()?;
     let name = scalar_string(item.get("provider")?).trim().to_owned();
     if name.is_empty() {
@@ -791,6 +792,13 @@ fn compile_provider(value: &Value) -> Option<Value> {
 
 fn infer_engine(base_url: &str) -> String {
     let lower = base_url.trim().to_ascii_lowercase();
+    if Url::parse(base_url)
+        .ok()
+        .is_some_and(|url| url.host_str() == Some("api.typesafe.ai"))
+        || lower.trim_end_matches('/').ends_with("/v1/systemone")
+    {
+        return "typesafe".into();
+    }
     if lower.contains("/v1/messages") || lower.contains("/claude/") {
         return "claude".into();
     }

@@ -11,6 +11,7 @@ RUN cd rust/uni-api-native && cargo chef cook --release --locked --recipe-path r
 FROM planner AS builder
 COPY README.md ./README.md
 COPY static ./static
+RUN mkdir -p ./uni_api/api
 COPY uni_api/api/codex_models_pro_0_153_2.json ./uni_api/api/codex_models_pro_0_153_2.json
 COPY webui/package.json ./webui/package.json
 COPY VERSION ./VERSION
