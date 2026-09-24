@@ -370,6 +370,38 @@ api_keys:
 >
 > 注意：Codex 上游会拒绝部分 Chat Completions 参数（如 `temperature`/`top_p`/`max_tokens` 等），uni-api 会在转发时自动过滤；如果你看到 `403 Forbidden`，也请先确认客户端携带的是 uni-api 的 `api_keys[].api`。
 
+### GitHub Copilot（`engine: copilot`）
+
+把 GitHub Copilot 的模型目录（GPT / Claude / Gemini 等）作为一种上游渠道。`api` 字段直接填 **GitHub PAT**（`github_pat_...` 或 `ghp_...`，需有 Copilot 订阅），uni-api 会自动向 GitHub 换取短命 Copilot token（约 30 分钟有效，内存缓存、过期自动刷新、401/403 自动清缓存重试），无需手动维护 token。
+
+- `claude-*` 模型自动路由到 Copilot 的 Anthropic 原生 `/v1/messages` 端点（唯一会返回 prompt-cache token 计数的端点）；其他模型走 OpenAI 兼容的 `/chat/completions`。
+- 下游 `/v1/chat/completions` 与 `/v1/messages` 均可使用，协议转换自动完成。
+- gpt-5+/o 系模型的 `max_tokens` 自动改写为 `max_completion_tokens`；`reasoning_effort: "none"` 与非 `text`/`image_url` 的 content part 自动清洗，避免上游 400。
+- 模型留空时可通过面板「发现模型」自动拉取当前账号可用的 chat 模型目录。
+
+示例配置：
+
+```yaml
+providers:
+  - provider: copilot
+    engine: copilot
+    base_url: https://api.githubcopilot.com
+    api:
+      # GitHub PAT，支持多账号轮询
+      - github_pat_xxx
+      - ghp_yyy
+    model:
+      - gpt-5.2
+      - claude-opus-4.6
+
+api_keys:
+  - api: sk-xxx
+    model:
+      - copilot/*
+```
+
+> ⚠️ 风险提示：该接口是 Copilot 客户端的内部协议（非公开 API），需要有效的 Copilot 订阅，请求按 AI credits 计费（1 credit = $0.01）且有 per-user 速率限制。仅建议个人自用，不适合高并发或对外转售场景；协议细节可能随 GitHub 更新而变化。
+
 ### 搜索渠道（`/v1/search`）
 
 要启用 `/v1/search`，需要在 `providers` 中配置包含 `search` 模型的渠道，并在 `api_keys[].model` 中显式授权 `provider/search`。
