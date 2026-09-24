@@ -7,6 +7,7 @@ mod channel_settings;
 mod chat_stream;
 mod codex_oauth;
 mod config;
+mod copilot_oauth;
 mod cors;
 mod fact_usage;
 mod facts_s3;

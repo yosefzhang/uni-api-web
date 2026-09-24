@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::codex_oauth::CodexOAuthManager;
 use crate::config::RuntimeConfigPublisher;
+use crate::copilot_oauth::CopilotTokenManager;
 use crate::idempotency::RequestHasher;
 use crate::persistence::Persistence;
 use crate::request_spool::{RequestSpool, SpoolFailure, SpoolManager, SpoolObservation};
@@ -39,6 +40,7 @@ pub struct AppState {
     pub config_publisher: RuntimeConfigPublisher,
     pub native_responses_config: NativeConfigStore,
     pub codex_oauth: CodexOAuthManager,
+    pub copilot_oauth: CopilotTokenManager,
     pub(crate) channel_metrics: crate::channel_metrics::ChannelMetrics,
 }
 
@@ -78,6 +80,7 @@ impl AppState {
             config_publisher,
             native_responses_config: NativeConfigStore::new(),
             codex_oauth: CodexOAuthManager::new(),
+            copilot_oauth: CopilotTokenManager::new(),
             channel_metrics: crate::channel_metrics::global(),
         })
     }
