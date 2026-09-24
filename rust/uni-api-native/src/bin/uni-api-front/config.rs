@@ -374,6 +374,12 @@ pub(crate) async fn discover_provider_models(
             url.query_pairs_mut().append_pair("key", &api_key);
         }
         url
+    } else if engine == "copilot" {
+        // The Copilot catalog needs a short-lived token exchanged from the PAT,
+        // plus the same identity headers the data plane sends.
+        let token = exchange_copilot_token(client, &api_key).await?;
+        copilot_discovery_headers(&mut headers, &token)?;
+        copilot_models_url(base_url)?
     } else {
         if !api_key.is_empty() {
             if engine == "claude" || engine == "vertex-claude" {
@@ -416,7 +422,132 @@ pub(crate) async fn discover_provider_models(
         .json::<Value>()
         .await
         .map_err(|error| format!("decode model discovery response from {url}: {error}"))?;
+    if engine == "copilot" {
+        return Ok(discovered_copilot_model_ids(&payload));
+    }
     Ok(discovered_model_ids(&payload))
+}
+
+/// Copilot's /models is OpenAI-shaped but carries policy metadata: keep only
+/// chat-capable models the account is allowed to use (embeddings and disabled
+/// entries are filtered out), mirroring 10router's catalog expansion.
+fn discovered_copilot_model_ids(payload: &Value) -> Vec<String> {
+    let items = payload
+        .get("data")
+        .or_else(|| payload.get("models"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let mut seen = std::collections::BTreeSet::new();
+    for item in items {
+        if item.pointer("/capabilities/type").and_then(Value::as_str) != Some("chat") {
+            continue;
+        }
+        if item
+            .pointer("/policy/state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state != "enabled")
+        {
+            continue;
+        }
+        let value = item
+            .get("id")
+            .or_else(|| item.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if !value.is_empty() {
+            seen.insert(value.to_owned());
+        }
+    }
+    seen.into_iter().collect()
+}
+
+fn copilot_models_url(base_url: &str) -> Result<Url, String> {
+    let base = base_url
+        .trim()
+        .trim_end_matches('/')
+        .strip_suffix("/chat/completions")
+        .or_else(|| {
+            base_url
+                .trim()
+                .trim_end_matches('/')
+                .strip_suffix("/v1/messages")
+        })
+        .unwrap_or(base_url.trim().trim_end_matches('/'));
+    Url::parse(&format!("{base}/models"))
+        .map_err(|error| format!("invalid Copilot model discovery URL: {error}"))
+}
+
+fn copilot_discovery_headers(headers: &mut HeaderMap, token: &str) -> Result<(), String> {
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| "provider API key is not a valid header".to_owned())?,
+    );
+    headers.insert(
+        "copilot-integration-id",
+        HeaderValue::from_static("vscode-chat"),
+    );
+    headers.insert("editor-version", HeaderValue::from_static("vscode/1.110.0"));
+    headers.insert(
+        "editor-plugin-version",
+        HeaderValue::from_static("copilot-chat/0.38.0"),
+    );
+    headers.insert(
+        "user-agent",
+        HeaderValue::from_static("GitHubCopilotChat/0.38.0"),
+    );
+    headers.insert(
+        "x-github-api-version",
+        HeaderValue::from_static("2025-04-01"),
+    );
+    Ok(())
+}
+
+/// Exchange a GitHub PAT for a short-lived Copilot token during model
+/// discovery. The data plane keeps its own cache; discovery is rare enough
+/// that a one-off exchange is fine.
+async fn exchange_copilot_token(client: &reqwest::Client, pat: &str) -> Result<String, String> {
+    let pat = pat.trim();
+    if pat.is_empty() {
+        return Err("Copilot provider requires a GitHub PAT in api".into());
+    }
+    let token_url = std::env::var("COPILOT_TOKEN_URL")
+        .unwrap_or_else(|_| "https://api.github.com/copilot_internal/v2/token".into());
+    let response = client
+        .get(&token_url)
+        .header("authorization", format!("token {pat}"))
+        .header("user-agent", "GitHubCopilotChat/0.38.0")
+        .header("editor-version", "vscode/1.110.0")
+        .header("editor-plugin-version", "copilot-chat/0.38.0")
+        .header("accept", "application/json")
+        .header("x-github-api-version", "2025-04-01")
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|error| format!("Copilot token exchange request failed: {error}"))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| format!("read Copilot token exchange response failed: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Copilot token exchange failed: status {}: {}",
+            status.as_u16(),
+            String::from_utf8_lossy(&body)
+        ));
+    }
+    let payload: Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("decode Copilot token exchange response failed: {error}"))?;
+    payload
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Copilot token exchange returned empty token".into())
 }
 
 fn first_provider_key(value: Option<&Value>) -> String {
@@ -799,6 +930,9 @@ fn infer_engine(base_url: &str) -> String {
     {
         return "typesafe".into();
     }
+    if lower.contains("api.githubcopilot.com") {
+        return "copilot".into();
+    }
     if lower.contains("/v1/messages") || lower.contains("/claude/") {
         return "claude".into();
     }
@@ -1111,6 +1245,34 @@ fn unix_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_engine_is_inferred_from_official_host() {
+        assert_eq!(
+            infer_engine("https://api.githubcopilot.com"),
+            "copilot".to_owned()
+        );
+        assert_eq!(
+            infer_engine("https://api.githubcopilot.com/chat/completions"),
+            "copilot".to_owned()
+        );
+        assert_eq!(infer_engine("https://example.com"), "gpt".to_owned());
+    }
+
+    #[test]
+    fn copilot_catalog_keeps_enabled_chat_models_only() {
+        let payload = json!({"data": [
+            {"id": "gpt-5.2", "capabilities": {"type": "chat"}, "policy": {"state": "enabled"}},
+            {"id": "claude-opus-4.6", "capabilities": {"type": "chat"}, "policy": {"state": "enabled"}},
+            {"id": "claude-hidden", "capabilities": {"type": "chat"}, "policy": {"state": "disabled"}},
+            {"id": "text-embedding-3-small", "capabilities": {"type": "embeddings"}, "policy": {"state": "enabled"}},
+            {"id": "no-capabilities"}
+        ]});
+        assert_eq!(
+            discovered_copilot_model_ids(&payload),
+            vec!["claude-opus-4.6".to_owned(), "gpt-5.2".to_owned()]
+        );
+    }
 
     #[test]
     fn compiles_python_compatible_model_mappings_and_paid_state() {

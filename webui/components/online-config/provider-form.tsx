@@ -241,6 +241,7 @@ export function ProviderDialog({
                 { value: "gemini", label: "gemini" },
                 { value: "openrouter", label: "openrouter" },
                 { value: "codex", label: "codex" },
+                { value: "copilot", label: "copilot" },
               ]}
               placeholder="不设置（自动识别）"
             />

@@ -514,6 +514,31 @@ async fn next_generic_hedge_plan(
                 }
             }
         }
+        if provider.engine.eq_ignore_ascii_case("copilot") {
+            match execution
+                .state
+                .copilot_oauth
+                .resolve(
+                    &provider_key_raw,
+                    provider.preferences.get("proxy").and_then(Value::as_str),
+                )
+                .await
+            {
+                Ok(auth) => provider_key = auth.token,
+                Err(error) => {
+                    *last_status = StatusCode::UNAUTHORIZED;
+                    *last_detail = error;
+                    emit_routing_skip(
+                        execution,
+                        attempt_index,
+                        &provider,
+                        &original_model,
+                        "copilot_token_resolution_failed",
+                    );
+                    continue;
+                }
+            }
+        }
         let mut prepared = match build_attempt(
             &provider,
             &provider_key,
@@ -880,6 +905,15 @@ async fn run_hedged_attempt_loop(execution: AttemptLoop, hedging: HedgingConfig)
                         .clear(&context.provider_key)
                         .await;
                 }
+                if context.provider.engine.eq_ignore_ascii_case("copilot")
+                    && matches!(failure.status.as_u16(), 401..=403)
+                {
+                    execution
+                        .state
+                        .copilot_oauth
+                        .clear(&context.provider_key)
+                        .await;
+                }
                 emit_attempt(
                     &execution.request_id,
                     &execution.trace_id,
@@ -1011,6 +1045,23 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     provider_key = auth.bearer;
                     codex_account_id = auth.account_id;
                 }
+                Err(error) => {
+                    last_status = StatusCode::UNAUTHORIZED;
+                    last_detail = error;
+                    continue;
+                }
+            }
+        }
+        if provider.engine.eq_ignore_ascii_case("copilot") {
+            match state
+                .copilot_oauth
+                .resolve(
+                    &provider_key_raw,
+                    provider.preferences.get("proxy").and_then(Value::as_str),
+                )
+                .await
+            {
+                Ok(auth) => provider_key = auth.token,
                 Err(error) => {
                     last_status = StatusCode::UNAUTHORIZED;
                     last_detail = error;
@@ -1223,6 +1274,14 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                             {
                                 outcome_state.codex_oauth.clear(&outcome_provider_key).await;
                             }
+                            if outcome_provider.engine.eq_ignore_ascii_case("copilot")
+                                && matches!(policy.status, 401..=403)
+                            {
+                                outcome_state
+                                    .copilot_oauth
+                                    .clear(&outcome_provider_key)
+                                    .await;
+                            }
                             policy.status
                         };
                         outcome_state.persistence.record_request(request_stat);
@@ -1357,6 +1416,11 @@ async fn run_attempt_loop(execution: AttemptLoop) -> Response<Body> {
                     && matches!(failure.status.as_u16(), 401..=403)
                 {
                     state.codex_oauth.clear(&provider_key_raw).await;
+                }
+                if provider.engine.eq_ignore_ascii_case("copilot")
+                    && matches!(failure.status.as_u16(), 401..=403)
+                {
+                    state.copilot_oauth.clear(&provider_key_raw).await;
                 }
                 emit_attempt(
                     &request_id,
@@ -2390,6 +2454,27 @@ fn build_attempt(
                 provider_stream,
             )
         }
+        "copilot" if wire_path == "/v1/chat/completions" => {
+            // Claude models go to Copilot's Anthropic-native /v1/messages shim
+            // (the only Copilot endpoint that reports prompt-cache token counts);
+            // everything else stays on the OpenAI-compatible chat endpoint.
+            if is_copilot_claude_model(original_model) {
+                payload = chat_to_claude(&payload, original_model)?;
+                (
+                    copilot_messages_url(provider.base_url.as_ref())?,
+                    ResponseAdapter::ClaudeToChat,
+                    provider_stream,
+                )
+            } else {
+                set_model(&mut payload, original_model)?;
+                sanitize_copilot_chat_payload(&mut payload, original_model);
+                (
+                    copilot_chat_url(provider.base_url.as_ref())?,
+                    ResponseAdapter::Passthrough,
+                    provider_stream,
+                )
+            }
+        }
         "aws" if wire_path == "/v1/chat/completions" => {
             payload = chat_to_claude(&payload, original_model)?;
             if let Some(root) = payload.as_object_mut() {
@@ -2455,6 +2540,25 @@ fn build_attempt(
                 ResponseAdapter::Passthrough,
                 provider_stream,
             )
+        }
+        "copilot" if path == "/v1/messages" => {
+            if is_copilot_claude_model(original_model) {
+                set_model(&mut payload, original_model)?;
+                (
+                    copilot_messages_url(provider.base_url.as_ref())?,
+                    ResponseAdapter::Passthrough,
+                    provider_stream,
+                )
+            } else {
+                payload = claude_to_chat_request(&payload)?;
+                set_model(&mut payload, original_model)?;
+                sanitize_copilot_chat_payload(&mut payload, original_model);
+                (
+                    copilot_chat_url(provider.base_url.as_ref())?,
+                    ResponseAdapter::ChatToClaude,
+                    provider_stream,
+                )
+            }
         }
         _ if path == "/v1/messages" => {
             payload = claude_to_chat_request(&payload)?;
@@ -3775,6 +3879,43 @@ fn provider_headers(
             HeaderValue::from_str(&format!("Basic {encoded}"))
                 .map_err(|_| "provider API key is not a valid header".to_owned())?,
         );
+    } else if engine == "copilot" {
+        // provider_key is the short-lived Copilot token resolved from the PAT
+        // upstream of build_attempt. The identity headers mirror the official
+        // Copilot Chat client; the endpoint rejects requests without them.
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {provider_key}"))
+                .map_err(|_| "provider API key is not a valid header".to_owned())?,
+        );
+        headers.insert(
+            "copilot-integration-id",
+            HeaderValue::from_static("vscode-chat"),
+        );
+        headers.insert("editor-version", HeaderValue::from_static("vscode/1.110.0"));
+        headers.insert(
+            "editor-plugin-version",
+            HeaderValue::from_static("copilot-chat/0.38.0"),
+        );
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("GitHubCopilotChat/0.38.0"),
+        );
+        headers.insert(
+            "openai-intent",
+            HeaderValue::from_static("conversation-panel"),
+        );
+        headers.insert(
+            "x-github-api-version",
+            HeaderValue::from_static("2025-04-01"),
+        );
+        headers.insert(
+            "x-vscode-user-agent-library-version",
+            HeaderValue::from_static("electron-fetch"),
+        );
+        headers.insert("x-initiator", HeaderValue::from_static("user"));
+        // Required by the /v1/messages shim; harmless on chat/completions.
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     } else if !matches!(
         engine,
         "gemini" | "vertex" | "vertex-gemini" | "vertex-claude" | "aws"
@@ -6602,6 +6743,107 @@ fn messages_url(base: &str) -> String {
     }
 }
 
+/// Copilot's chat/completions lives directly under the host root (no `/v1`),
+/// while the Anthropic-native shim is versioned. Both helpers tolerate a
+/// `base_url` that already carries either endpoint suffix.
+fn copilot_chat_url(base: &str) -> Result<String, String> {
+    let base = base.trim().trim_end_matches('/');
+    let stripped = base
+        .strip_suffix("/chat/completions")
+        .unwrap_or(base)
+        .trim_end_matches('/');
+    Ok(format!("{stripped}/chat/completions"))
+}
+
+fn copilot_messages_url(base: &str) -> Result<String, String> {
+    let base = base.trim().trim_end_matches('/');
+    let stripped = base
+        .strip_suffix("/v1/messages")
+        .or_else(|| base.strip_suffix("/messages"))
+        .or_else(|| base.strip_suffix("/chat/completions"))
+        .unwrap_or(base)
+        .trim_end_matches('/');
+    Ok(format!("{stripped}/v1/messages"))
+}
+
+/// Claude models on Copilot route to the Anthropic-native /v1/messages shim.
+/// Detection is by model name (Copilot's live catalog adds claude-* variants
+/// faster than any static list can track, per 10router's experience).
+fn is_copilot_claude_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("claude")
+}
+
+/// Copilot's chat/completions quirks (validated by 10router):
+/// - newer OpenAI models (gpt-5+, o1/o3/o4) require `max_completion_tokens`
+///   instead of `max_tokens`;
+/// - `reasoning_effort: "none"` must be stripped (models without "none"
+///   support reject it with a 400);
+/// - content parts other than `text`/`image_url` (tool_use, tool_result,
+///   thinking) must be serialized as text parts.
+fn sanitize_copilot_chat_payload(payload: &mut Value, model: &str) {
+    let Some(root) = payload.as_object_mut() else {
+        return;
+    };
+    if model.to_ascii_lowercase().contains("gpt-5") || copilot_requires_max_completion_tokens(model)
+    {
+        if let Some(value) = root.remove("max_tokens") {
+            root.insert("max_completion_tokens".into(), value);
+        }
+    }
+    if root.get("reasoning_effort").and_then(Value::as_str) == Some("none") {
+        root.remove("reasoning_effort");
+    }
+    if let Some(messages) = root.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages.iter_mut() {
+            copilot_sanitize_message_content(message);
+        }
+    }
+}
+
+fn copilot_requires_max_completion_tokens(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    ["o1", "o3", "o4"].iter().any(|prefix| {
+        model
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('-'))
+    })
+}
+
+fn copilot_sanitize_message_content(message: &mut Value) {
+    let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut rewritten = Vec::with_capacity(parts.len());
+    let mut changed = false;
+    for part in parts.iter() {
+        let part_type = part.get("type").and_then(Value::as_str).unwrap_or_default();
+        if part_type == "text" || part_type == "image_url" {
+            rewritten.push(part.clone());
+            continue;
+        }
+        changed = true;
+        let text = match part.get("text").and_then(Value::as_str) {
+            Some(text) => Value::String(text.to_owned()),
+            None => match part.get("content") {
+                Some(content) => content.clone(),
+                None => serde_json::to_value(part).unwrap_or(Value::Null),
+            },
+        };
+        if let Some(text) = text.as_str().filter(|text| !text.is_empty()) {
+            rewritten.push(json!({"type":"text","text":text}));
+        }
+    }
+    if changed {
+        // Empty content (e.g. a tool_result with no text) becomes null, which
+        // OpenAI-compatible backends accept for assistant messages.
+        message["content"] = if rewritten.is_empty() {
+            Value::Null
+        } else {
+            Value::Array(rewritten)
+        };
+    }
+}
+
 fn gemini_url(base: &str, model: &str, key: &str, stream: bool) -> Result<String, String> {
     let mut url = Url::parse(base).map_err(|error| format!("invalid Gemini base URL: {error}"))?;
     let path = url
@@ -8423,6 +8665,98 @@ mod tests {
             "https://github.com/yym68686/uni-api"
         );
         assert_eq!(headers["x-title"], "Uni API");
+    }
+
+    #[test]
+    fn copilot_provider_headers_carry_client_identity() {
+        let request_headers = HeaderMap::new();
+        let provider = test_provider("copilot", "https://api.githubcopilot.com");
+        let headers = provider_headers(
+            &provider,
+            "copilot-token",
+            &request_headers,
+            "request-a",
+            "copilot",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(headers["authorization"], "Bearer copilot-token");
+        assert_eq!(headers["copilot-integration-id"], "vscode-chat");
+        assert_eq!(headers["editor-version"], "vscode/1.110.0");
+        assert_eq!(headers["editor-plugin-version"], "copilot-chat/0.38.0");
+        assert_eq!(headers["openai-intent"], "conversation-panel");
+        assert_eq!(headers["anthropic-version"], "2023-06-01");
+    }
+
+    #[test]
+    fn copilot_urls_strip_known_suffixes() {
+        assert_eq!(
+            copilot_chat_url("https://api.githubcopilot.com").unwrap(),
+            "https://api.githubcopilot.com/chat/completions"
+        );
+        assert_eq!(
+            copilot_chat_url("https://api.githubcopilot.com/chat/completions").unwrap(),
+            "https://api.githubcopilot.com/chat/completions"
+        );
+        assert_eq!(
+            copilot_messages_url("https://api.githubcopilot.com").unwrap(),
+            "https://api.githubcopilot.com/v1/messages"
+        );
+        assert_eq!(
+            copilot_messages_url("https://api.githubcopilot.com/v1/messages").unwrap(),
+            "https://api.githubcopilot.com/v1/messages"
+        );
+        assert_eq!(
+            copilot_messages_url("https://api.githubcopilot.com/chat/completions").unwrap(),
+            "https://api.githubcopilot.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn copilot_sanitizer_rewrites_token_limit_and_content_parts() {
+        let mut payload = json!({
+            "model": "gpt-5.2",
+            "max_tokens": 42,
+            "reasoning_effort": "none",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                    {"type": "tool_result", "content": "tool output"},
+                    {"type": "thinking", "thinking": "internal"}
+                ]},
+                {"role": "assistant", "content": "ok"}
+            ]
+        });
+        sanitize_copilot_chat_payload(&mut payload, "gpt-5.2");
+        assert_eq!(payload["max_completion_tokens"], 42);
+        assert!(payload.get("max_tokens").is_none());
+        assert!(payload.get("reasoning_effort").is_none());
+        let parts = payload["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[2]["type"], "text");
+        assert_eq!(parts[2]["text"], "tool output");
+        // untouched string content stays as-is
+        assert_eq!(payload["messages"][1]["content"], "ok");
+    }
+
+    #[test]
+    fn copilot_sanitizer_keeps_max_tokens_for_older_models() {
+        let mut payload = json!({"model": "gemini-2.5-pro", "max_tokens": 7});
+        sanitize_copilot_chat_payload(&mut payload, "gemini-2.5-pro");
+        assert_eq!(payload["max_tokens"], 7);
+        assert!(payload.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn copilot_claude_detection_matches_model_names() {
+        assert!(is_copilot_claude_model("claude-opus-4.6"));
+        assert!(is_copilot_claude_model("Claude-Sonnet-4.5"));
+        assert!(!is_copilot_claude_model("gpt-5.2"));
+        assert!(!is_copilot_claude_model("gemini-3-flash"));
     }
 
     #[test]
