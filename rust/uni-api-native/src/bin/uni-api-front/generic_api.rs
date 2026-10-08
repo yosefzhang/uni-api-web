@@ -2244,12 +2244,7 @@ fn build_attempt(
         return Err("Provider does not support this endpoint".into());
     }
     let native_responses_wire = matches!(path, "/v1/responses" | "/v1/responses/compact")
-        && (engine == "codex"
-            || (engine == "gpt"
-                && provider
-                    .base_url
-                    .to_ascii_lowercase()
-                    .contains("/responses")));
+        && provider_speaks_responses_natively(&engine, provider.base_url.as_ref());
     let downstream_protocol = if path == "/v1/responses" && !native_responses_wire {
         DownstreamProtocol::ResponsesCompat
     } else {
@@ -6734,6 +6729,20 @@ fn responses_url(base: &str) -> String {
     }
 }
 
+/// Whether the upstream accepts the Responses wire format verbatim.
+///
+/// Getting this wrong fails silently in the worst way: when the predicate is
+/// false for a client `/v1/responses` request the caller switches to
+/// `ResponsesCompat`, which rewrites the payload into a chat body and posts it
+/// to `/v1/chat/completions`. Copilot answers that with
+/// `unsupported_api_for_model` for every gpt-5+/gpt-6 model, because those are
+/// only served on `/responses` (`https://api.githubcopilot.com/responses`).
+fn provider_speaks_responses_natively(engine: &str, base_url: &str) -> bool {
+    engine == "codex"
+        || engine == "copilot"
+        || (engine == "gpt" && base_url.to_ascii_lowercase().contains("/responses"))
+}
+
 fn messages_url(base: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.ends_with("/messages") {
@@ -8711,6 +8720,39 @@ mod tests {
             copilot_messages_url("https://api.githubcopilot.com/chat/completions").unwrap(),
             "https://api.githubcopilot.com/v1/messages"
         );
+    }
+
+    #[test]
+    fn copilot_speaks_responses_natively() {
+        // Copilot's gpt-5+/gpt-6 models reject /chat/completions with
+        // `unsupported_api_for_model`, so a client /v1/responses request must be
+        // forwarded verbatim instead of being rewritten into a chat body.
+        assert!(provider_speaks_responses_natively(
+            "copilot",
+            "https://api.githubcopilot.com"
+        ));
+        // The native responses path resolves to the host root, which is the
+        // endpoint Copilot actually serves (`/v1/responses` there is a 404).
+        assert_eq!(
+            replace_known_endpoint("https://api.githubcopilot.com", "/v1/responses").unwrap(),
+            "https://api.githubcopilot.com/responses"
+        );
+        assert!(provider_speaks_responses_natively(
+            "codex",
+            "https://example.com"
+        ));
+        assert!(provider_speaks_responses_natively(
+            "gpt",
+            "https://example.com/v1/responses"
+        ));
+        assert!(!provider_speaks_responses_natively(
+            "gpt",
+            "https://example.com/v1"
+        ));
+        assert!(!provider_speaks_responses_natively(
+            "claude",
+            "https://example.com"
+        ));
     }
 
     #[test]
