@@ -821,6 +821,32 @@ fn channel_key(api: &Value) -> String {
     }
 }
 
+fn provider_keys(api: &Value) -> Vec<String> {
+    match api {
+        Value::String(key) if !key.is_empty() => vec![key.clone()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(key) if !key.is_empty() => Some(key.clone()),
+                other => other
+                    .get("api")
+                    .and_then(Value::as_str)
+                    .filter(|key| !key.is_empty())
+                    .map(ToOwned::to_owned),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn mask_key(key: &str) -> String {
+    if key.len() <= 8 {
+        "***".to_owned()
+    } else {
+        format!("{}...{}", &key[..4], &key[key.len() - 4..])
+    }
+}
+
 async fn provider_models(State(state): State<StatusState>, Json(body): Json<Value>) -> Response {
     let api_key = body_key(&body, "apiKey").map(str::to_owned);
     let base_url = body_key(&body, "base_url").unwrap_or_default().to_owned();
@@ -974,100 +1000,170 @@ async fn provider_test_real(
     } else {
         json!({ "model": model, "messages": [{ "role": "user", "content": test_text }] })
     };
-    let channel_api = channel_key(&api);
-    let mut request_headers = Map::new();
-    request_headers.insert("Content-Type".into(), json!("application/json"));
-    let mut request = state
-        .http
-        .post(&url)
-        .timeout(Duration::from_secs(60))
-        .header(header::CONTENT_TYPE, "application/json")
-        .header("x-uni-api-debug", "1");
-    if effective_endpoint == "messages" {
-        request = request
-            .header("x-api-key", &channel_api)
-            .header("anthropic-version", "2023-06-01");
-        request_headers.insert("x-api-key".into(), json!(channel_api.clone()));
-        request_headers.insert("anthropic-version".into(), json!("2023-06-01"));
-    } else {
-        request = request.bearer_auth(&channel_api);
-        request_headers.insert(
-            "Authorization".into(),
-            json!(format!("Bearer {channel_api}")),
-        );
+    let keys = provider_keys(&api);
+    if keys.is_empty() {
+        return Json(json!({
+            "success": false,
+            "message": "渠道未配置 API Key",
+            "responseTime": 0.0,
+            "request": { "method": "POST", "url": url, "headers": {}, "body": request_body },
+            "response": { "status": 0, "body": "" },
+        }))
+        .into_response();
     }
-    if url.contains("opencode.ai") && url.contains("/zen/go") {
-        if !request_headers.contains_key("x-opencode-session") {
-            let session_id = format!(
-                "{:x}",
-                Sha256::digest(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                        .to_le_bytes()
-                )
-            );
-            request = request.header("x-opencode-session", &session_id);
-            request_headers.insert("x-opencode-session".into(), json!(session_id));
-        }
-        if !request_headers.contains_key("user-agent") {
-            request = request.header("user-agent", "uni-api-web");
-            request_headers.insert("user-agent".into(), json!("uni-api-web"));
-        }
-    }
-    let request_info =
-        json!({ "method": "POST", "url": url, "headers": request_headers, "body": request_body });
+
+    let base_headers = Map::from_iter([("Content-Type".into(), json!("application/json"))]);
     let started = Instant::now();
-    match request.json(&request_body).send().await {
-        Ok(response) => {
-            let status = response.status().as_u16();
-            let upstream_request = response
-                .headers()
-                .get("x-uni-api-upstream-request")
-                .and_then(|value| value.to_str().ok())
-                .and_then(decode_upstream_debug);
-            let upstream_response = response
-                .headers()
-                .get("x-uni-api-upstream-response")
-                .and_then(|value| value.to_str().ok())
-                .and_then(decode_upstream_debug);
-            let text = response.text().await.unwrap_or_default();
-            let elapsed = started.elapsed().as_secs_f64();
-            let mut result = json!({
-                "success": (200..300).contains(&status),
-                "message": if (200..300).contains(&status) { "测试成功".to_owned() } else { format!("HTTP {status}") },
-                "responseTime": elapsed,
-                "request": request_info,
-                "response": { "status": status, "body": text },
-            });
-            if let (Some(request), Some(response)) = (upstream_request, upstream_response) {
-                if let Some(object) = result.as_object_mut() {
-                    object.insert(
-                        "upstream".into(),
-                        json!({ "request": request, "response": response }),
-                    );
-                }
-            }
-            Json(result).into_response()
+    let mut key_results: Vec<Value> = Vec::with_capacity(keys.len());
+    let mut first_success: Option<Value> = None;
+    let mut first_failure: Option<Value> = None;
+
+    for key in keys {
+        let mut request_headers = base_headers.clone();
+        let mut request = state
+            .http
+            .post(&url)
+            .timeout(Duration::from_secs(20))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-uni-api-debug", "1");
+        if effective_endpoint == "messages" {
+            request = request
+                .header("x-api-key", &key)
+                .header("anthropic-version", "2023-06-01");
+            request_headers.insert("x-api-key".into(), json!(mask_key(&key)));
+            request_headers.insert("anthropic-version".into(), json!("2023-06-01"));
+        } else {
+            request = request.bearer_auth(&key);
+            request_headers.insert(
+                "Authorization".into(),
+                json!(format!("Bearer {}", mask_key(&key))),
+            );
         }
-        Err(error) => {
-            let elapsed = started.elapsed().as_secs_f64();
-            let message = if error.is_timeout() {
-                "请求超时(60s)".to_owned()
-            } else {
-                format!("网络错误: {error}")
-            };
-            Json(json!({
-                "success": false,
-                "message": message,
-                "responseTime": elapsed,
-                "request": request_info,
-                "response": { "status": 0, "body": "" },
-            }))
-            .into_response()
+        if url.contains("opencode.ai") && url.contains("/zen/go") {
+            if !request_headers.contains_key("x-opencode-session") {
+                let session_id = format!(
+                    "{:x}",
+                    Sha256::digest(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos()
+                            .to_le_bytes()
+                    )
+                );
+                request = request.header("x-opencode-session", &session_id);
+                request_headers.insert("x-opencode-session".into(), json!(session_id));
+            }
+            if !request_headers.contains_key("user-agent") {
+                request = request.header("user-agent", "uni-api-web");
+                request_headers.insert("user-agent".into(), json!("uni-api-web"));
+            }
+        }
+        let request_info = json!({ "method": "POST", "url": url, "headers": request_headers, "body": request_body });
+
+        match request.json(&request_body).send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let upstream_request = response
+                    .headers()
+                    .get("x-uni-api-upstream-request")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(decode_upstream_debug);
+                let upstream_response = response
+                    .headers()
+                    .get("x-uni-api-upstream-response")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(decode_upstream_debug);
+                let text = response.text().await.unwrap_or_default();
+                let success = (200..300).contains(&status);
+                let message = if success {
+                    "测试成功".to_owned()
+                } else {
+                    format!("HTTP {status}")
+                };
+                let mut result = json!({
+                    "key": mask_key(&key),
+                    "success": success,
+                    "message": message,
+                    "responseTime": started.elapsed().as_secs_f64(),
+                    "request": request_info,
+                    "response": { "status": status, "body": text },
+                });
+                if let (Some(request), Some(response)) = (upstream_request, upstream_response) {
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert(
+                            "upstream".into(),
+                            json!({ "request": request, "response": response }),
+                        );
+                    }
+                }
+                if success && first_success.is_none() {
+                    first_success = Some(result.clone());
+                }
+                if !success && first_failure.is_none() {
+                    first_failure = Some(result.clone());
+                }
+                key_results.push(result);
+            }
+            Err(error) => {
+                let message = if error.is_timeout() {
+                    "请求超时(20s)".to_owned()
+                } else {
+                    format!("网络错误: {error}")
+                };
+                let result = json!({
+                    "key": mask_key(&key),
+                    "success": false,
+                    "message": message,
+                    "responseTime": started.elapsed().as_secs_f64(),
+                    "request": request_info,
+                    "response": { "status": 0, "body": "" },
+                });
+                if first_failure.is_none() {
+                    first_failure = Some(result.clone());
+                }
+                key_results.push(result);
+            }
         }
     }
+
+    let total = key_results.len();
+    let success_count = key_results
+        .iter()
+        .filter(|r| r["success"].as_bool().unwrap_or(false))
+        .count();
+    let any_success = success_count > 0;
+    let summary = format!(
+        "测试了 {total} 把 Key，{success_count} 成功，{} 失败",
+        total - success_count
+    );
+
+    let mut top_level = if let Some(mut success_result) = first_success {
+        if let Some(object) = success_result.as_object_mut() {
+            object.insert("message".into(), json!(summary));
+            object.insert("keyResults".into(), json!(key_results));
+        }
+        success_result
+    } else if let Some(mut failure_result) = first_failure {
+        if let Some(object) = failure_result.as_object_mut() {
+            object.insert("message".into(), json!(summary));
+            object.insert("keyResults".into(), json!(key_results));
+        }
+        failure_result
+    } else {
+        json!({
+            "success": false,
+            "message": summary,
+            "responseTime": started.elapsed().as_secs_f64(),
+            "keyResults": key_results,
+            "request": { "method": "POST", "url": url, "headers": {}, "body": request_body },
+            "response": { "status": 0, "body": "" },
+        })
+    };
+    if let Some(object) = top_level.as_object_mut() {
+        object.insert("success".into(), json!(any_success));
+    }
+    Json(top_level).into_response()
 }
 
 // ---------------------------------------------------------------------------
