@@ -923,12 +923,11 @@ fn extract_model_ids(data: &Value) -> Vec<Value> {
     Vec::new()
 }
 
-/// Strip a known endpoint suffix (mirrors resolveBaseRoot in the TS route).
+/// Strip a known endpoint suffix while preserving a leading `/v1`.
 fn normalize_base_root(base_url: &str) -> String {
     let mut root = base_url.trim_end_matches('/').to_owned();
     for suffix in [
         "/chat/completions",
-        "/v1/messages",
         "/completions",
         "/responses",
         "/messages",
@@ -983,16 +982,20 @@ async fn provider_test_real(
         };
         (format!("{root}/{endpoint}"), endpoint)
     } else {
-        // 渠道显式指定了 engine：直接用它自己的 base_url，不再拼接/剥离端点。
-        let root = base_url.trim_end_matches('/').to_owned();
-        let eff = if root.ends_with("/responses") {
-            "responses".to_owned()
-        } else if root.ends_with("/messages") {
+        // 渠道显式指定了 engine：按 engine 决定测试哪个端点，
+        // 同时把 base_url 末尾已有的同类型后缀剥掉（保留 /v1），再拼回目标端点。
+        // 这样 base_url 配置正确时 URL 不变；配置带旧后缀时也能测到对应协议。
+        let root = normalize_base_root(&base_url);
+        let eff = if engine.eq_ignore_ascii_case("claude")
+            || engine.eq_ignore_ascii_case("vertex-claude")
+        {
             "messages".to_owned()
+        } else if engine.eq_ignore_ascii_case("codex") {
+            "responses".to_owned()
         } else {
             "chat/completions".to_owned()
         };
-        (root, eff)
+        (format!("{root}/{eff}"), eff)
     };
     let test_text = "真实测试，请回复 ok";
     let request_body = if effective_endpoint == "responses" {
