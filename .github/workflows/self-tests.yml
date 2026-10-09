@@ -1,9 +1,11 @@
-name: Rust Unit Tests
+name: Self Tests
+
 on:
   pull_request:
   push:
     branches: [main]
   workflow_dispatch:
+
 jobs:
   unit:
     runs-on: ubuntu-latest
@@ -11,15 +13,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.84.0"
           components: rustfmt, clippy
+
       - name: Check Rust
         run: |
           cargo fmt --check --manifest-path rust/uni-api-native/Cargo.toml
           cargo clippy --manifest-path rust/uni-api-native/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path rust/uni-api-native/Cargo.toml --locked
+
       - name: Verify arrival-to-dispatch timing with isolated upstreams
         run: |
           cargo build --manifest-path rust/uni-api-native/Cargo.toml --locked
