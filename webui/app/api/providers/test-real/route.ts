@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import crypto from 'crypto';
 import { requireKey, readConfig, findKey } from '@/lib/status-config';
 
 function normalizeBaseRoot(baseUrl: string): string {
@@ -46,29 +47,59 @@ export async function POST(request: NextRequest) {
     if (!findKey(config, apiKey)) {
       return NextResponse.json({ success: false, message: '未授权' });
     }
-    const endpoint = body.endpoint === 'responses' ? 'responses' : body.endpoint === 'messages' ? 'messages' : 'chat/completions';
+    const engine = body.engine || '';
+    const requestedEndpoint = body.endpoint === 'responses' ? 'responses' : body.endpoint === 'messages' ? 'messages' : 'chat/completions';
     const baseUrl = body.baseUrl || '';
-    let root: string;
-    if (!baseUrl) {
-      root = UNI_API_BASE_URL.replace(/\/v1$/, '');
-    } else if (baseUrl.startsWith('/')) {
-      root = UNI_API_BASE_URL.replace(/\/v1$/, '') + normalizeBaseRoot(baseUrl);
+    let url: string;
+    let effectiveEndpoint: 'chat/completions' | 'responses' | 'messages';
+    if (engine) {
+      if (!baseUrl) {
+        url = UNI_API_BASE_URL;
+      } else if (baseUrl.startsWith('/')) {
+        url = UNI_API_BASE_URL.replace(/\/v1$/, '') + baseUrl.replace(/\/+$/, '');
+      } else {
+        url = baseUrl.replace(/\/+$/, '');
+      }
+      if (url.endsWith('/responses')) {
+        effectiveEndpoint = 'responses';
+      } else if (url.endsWith('/messages')) {
+        effectiveEndpoint = 'messages';
+      } else {
+        effectiveEndpoint = 'chat/completions';
+      }
     } else {
-      root = normalizeBaseRoot(baseUrl);
+      const endpoint = requestedEndpoint;
+      let root: string;
+      if (!baseUrl) {
+        root = UNI_API_BASE_URL.replace(/\/v1$/, '');
+      } else if (baseUrl.startsWith('/')) {
+        root = UNI_API_BASE_URL.replace(/\/v1$/, '') + normalizeBaseRoot(baseUrl);
+      } else {
+        root = normalizeBaseRoot(baseUrl);
+      }
+      url = `${root}/${endpoint}`;
+      effectiveEndpoint = endpoint;
     }
-    const url = `${root}/${endpoint}`;
     const testText = '真实测试，请回复 ok';
-    const requestBody: any = endpoint === 'responses'
+    const requestBody: any = effectiveEndpoint === 'responses'
       ? { model, input: [{ role: 'user', content: [{ type: 'input_text', text: testText }] }] }
       : { model, messages: [{ role: 'user', content: testText }] };
 
     const channelApi = channelKey(api);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (endpoint === 'messages') {
+    if (effectiveEndpoint === 'messages') {
       headers['x-api-key'] = channelApi;
       headers['anthropic-version'] = '2023-06-01';
     } else {
       headers['Authorization'] = `Bearer ${channelApi}`;
+    }
+    if (url.includes('opencode.ai') && url.includes('/zen/go')) {
+      if (!headers['x-opencode-session']) {
+        headers['x-opencode-session'] = crypto.randomUUID().replace(/-/g, '');
+      }
+      if (!headers['user-agent']) {
+        headers['user-agent'] = 'uni-api-web';
+      }
     }
 
     const requestInfo = { method: 'POST', url, headers, body: requestBody };

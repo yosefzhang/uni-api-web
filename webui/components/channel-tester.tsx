@@ -39,6 +39,7 @@ interface Provider {
   provider: string
   base_url: string
   api: string | string[]
+  engine: string | null
   models: ModelConfig[]
 }
 
@@ -76,6 +77,7 @@ interface BaseUrlOption {
   label: string
   baseUrl: string // 空串表示 uni-api 网关
   api: string
+  engine: string | null
   models: string[]
 }
 
@@ -156,6 +158,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
         label: uniApiBaseUrl || "uni-api 网关",
         baseUrl: uniApiBaseUrl,
         api: apiKey,
+        engine: null,
         models: allModels,
       },
     ]
@@ -167,6 +170,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
         label: p.base_url,
         baseUrl: p.base_url,
         api,
+        engine: p.engine,
         models: p.models.map((m) => m.original),
       })
     }
@@ -175,6 +179,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
 
   const isCustom = selectedBase === "__custom__"
   const selectedOption = baseUrlOptions.find((o) => o.key === selectedBase)
+  const hasExplicitEngine = Boolean(!isCustom && selectedOption?.engine)
   const currentModels = isCustom ? customModels : selectedOption?.models || []
   const effectiveBaseUrl = isCustom ? customBaseUrl : selectedOption?.baseUrl || ""
   const effectiveApi = isCustom ? apiKey : selectedOption?.api || ""
@@ -269,7 +274,8 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
             baseUrl: effectiveBaseUrl,
             api: effectiveApi,
             model,
-            endpoint,
+            endpoint: hasExplicitEngine ? "" : endpoint,
+            engine: selectedOption?.engine || "",
           }),
         })
         result = await response.json()
@@ -379,9 +385,9 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
               {/* 端点 */}
               <div className="w-full sm:w-44 space-y-1">
                 <Label className="text-xs">端点</Label>
-                <Select value={endpoint} onValueChange={handleEndpointChange} disabled={testing}>
+                <Select value={endpoint} onValueChange={handleEndpointChange} disabled={testing || hasExplicitEngine}>
                   <SelectTrigger className="h-9 text-xs w-full">
-                    <SelectValue placeholder="选择端点" />
+                    <SelectValue placeholder={hasExplicitEngine ? "由 engine 决定" : "选择端点"} />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="chat/completions" className="text-xs">chat/completions</SelectItem>
@@ -389,6 +395,9 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
                     <SelectItem value="messages" className="text-xs">messages</SelectItem>
                   </SelectContent>
                 </Select>
+                {hasExplicitEngine && (
+                  <p className="text-[10px] text-muted-foreground">已指定 engine，端点由 Base URL 决定</p>
+                )}
               </div>
 
               {/* 模型多选 */}

@@ -23,6 +23,7 @@ export async function GET(request: NextRequest) {
         provider: p.provider || null,
         base_url: baseUrl,
         api: p.api || null,
+        engine: p.engine || null,
         models,
         supported,
       };
