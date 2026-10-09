@@ -803,39 +803,52 @@ fn base_url_to_models_url(base_url: &str) -> String {
     format!("{root}/models")
 }
 
-fn channel_key(api: &Value) -> String {
-    match api {
-        Value::String(key) => key.clone(),
-        Value::Array(items) => items
-            .first()
-            .map(|item| match item {
-                Value::String(key) => key.clone(),
-                other => other
-                    .get("api")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-            })
-            .unwrap_or_default(),
-        _ => String::new(),
+/// 把渠道 `api` 字段的一项解析成可用的 key。
+///
+/// 项有两种形态：纯字符串，或对象 `{ key, enabled }`（对应面板的
+/// `ApiKeyItemType`）。显式禁用的项返回 `None`，因此被软禁用的 key 既不会
+/// 被测试，也不会被选作渠道凭据。
+fn api_entry_key(item: &Value) -> Option<&str> {
+    match item {
+        Value::String(key) => Some(key.as_str()).filter(|key| !key.is_empty()),
+        Value::Object(entry) => {
+            if entry.get("enabled").and_then(Value::as_bool) == Some(false) {
+                return None;
+            }
+            entry
+                .get("key")
+                .or_else(|| entry.get("api"))
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())
+        }
+        _ => None,
     }
 }
 
+/// 渠道全部**已启用**的 key，按声明顺序。接受整个 `api` 字段（字符串或数组），
+/// 调用方可以直接原样透传。
 fn provider_keys(api: &Value) -> Vec<String> {
     match api {
         Value::String(key) if !key.is_empty() => vec![key.clone()],
         Value::Array(items) => items
             .iter()
-            .filter_map(|item| match item {
-                Value::String(key) if !key.is_empty() => Some(key.clone()),
-                other => other
-                    .get("api")
-                    .and_then(Value::as_str)
-                    .filter(|key| !key.is_empty())
-                    .map(ToOwned::to_owned),
-            })
+            .filter_map(api_entry_key)
+            .map(ToOwned::to_owned)
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// 渠道第一把**已启用**的 key —— 给只接受单个凭据的调用方（如模型列表）。
+fn channel_key(api: &Value) -> String {
+    match api {
+        Value::String(key) => key.clone(),
+        Value::Array(items) => items
+            .iter()
+            .find_map(api_entry_key)
+            .unwrap_or_default()
+            .to_owned(),
+        _ => String::new(),
     }
 }
 
@@ -860,7 +873,7 @@ async fn provider_models(State(state): State<StatusState>, Json(body): Json<Valu
     }
     let channel_api = channel_key(&api);
     if channel_api.is_empty() {
-        return Json(json!({ "success": false, "message": "渠道未配置 API Key" })).into_response();
+        return Json(json!({ "success": false, "message": "渠道没有可用的 API Key（未配置，或全部已禁用）" })).into_response();
     }
     let url = base_url_to_models_url(&base_url);
     let mut request = state.http.get(&url).timeout(Duration::from_secs(30));
@@ -1004,7 +1017,7 @@ async fn provider_test_real(
     if keys.is_empty() {
         return Json(json!({
             "success": false,
-            "message": "渠道未配置 API Key",
+            "message": "渠道没有可用的 API Key（未配置，或全部已禁用）",
             "responseTime": 0.0,
             "request": { "method": "POST", "url": url, "headers": {}, "body": request_body },
             "response": { "status": 0, "body": "" },
