@@ -17,6 +17,7 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 pub struct StatusState {
@@ -774,6 +775,7 @@ async fn providers_list(
             "provider": provider.get("provider").cloned().unwrap_or(Value::Null),
             "base_url": base_url,
             "api": provider.get("api").cloned().unwrap_or(Value::Null),
+            "engine": provider.get("engine").cloned().unwrap_or(Value::Null),
             "models": models,
             "supported": supported,
         }));
@@ -939,49 +941,83 @@ async fn provider_test_real(
         _ => "chat/completions".to_owned(),
     };
     let base_url = body_key(&body, "baseUrl").unwrap_or_default().to_owned();
+    let engine = body_key(&body, "engine").unwrap_or_default().to_owned();
     let public_url = public_base_url(&headers);
-    let root = if base_url.is_empty()
-        || base_url.trim_end_matches('/') == public_url.trim_end_matches('/')
-    {
-        // uni-api 网关自身：走内部地址，避免依赖容器的外部端口映射。
-        format!("{}/v1", state.internal_base)
-    } else if base_url.starts_with('/') {
-        // 历史遗留的相对路径选项（"/v1"）。
-        format!("{}{}", state.internal_base, normalize_base_root(&base_url))
+    let (url, effective_endpoint) = if engine.is_empty() {
+        let root = if base_url.is_empty()
+            || base_url.trim_end_matches('/') == public_url.trim_end_matches('/')
+        {
+            // uni-api 网关自身：走内部地址，避免依赖容器的外部端口映射。
+            format!("{}/v1", state.internal_base)
+        } else if base_url.starts_with('/') {
+            // 历史遗留的相对路径选项（"/v1"）。
+            format!("{}{}", state.internal_base, normalize_base_root(&base_url))
+        } else {
+            normalize_base_root(&base_url)
+        };
+        (format!("{root}/{endpoint}"), endpoint)
     } else {
-        normalize_base_root(&base_url)
+        // 渠道显式指定了 engine：直接用它自己的 base_url，不再拼接/剥离端点。
+        let root = base_url.trim_end_matches('/').to_owned();
+        let eff = if root.ends_with("/responses") {
+            "responses".to_owned()
+        } else if root.ends_with("/messages") {
+            "messages".to_owned()
+        } else {
+            "chat/completions".to_owned()
+        };
+        (root, eff)
     };
-    let url = format!("{root}/{endpoint}");
     let test_text = "真实测试，请回复 ok";
-    let request_body = if endpoint == "responses" {
+    let request_body = if effective_endpoint == "responses" {
         json!({ "model": model, "input": [{ "role": "user", "content": [{ "type": "input_text", "text": test_text }] }] })
     } else {
         json!({ "model": model, "messages": [{ "role": "user", "content": test_text }] })
     };
     let channel_api = channel_key(&api);
-    let mut headers = Map::new();
-    headers.insert("Content-Type".into(), json!("application/json"));
+    let mut request_headers = Map::new();
+    request_headers.insert("Content-Type".into(), json!("application/json"));
     let mut request = state
         .http
         .post(&url)
         .timeout(Duration::from_secs(60))
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-uni-api-debug", "1");
-    if endpoint == "messages" {
+    if effective_endpoint == "messages" {
         request = request
             .header("x-api-key", &channel_api)
             .header("anthropic-version", "2023-06-01");
-        headers.insert("x-api-key".into(), json!(channel_api.clone()));
-        headers.insert("anthropic-version".into(), json!("2023-06-01"));
+        request_headers.insert("x-api-key".into(), json!(channel_api.clone()));
+        request_headers.insert("anthropic-version".into(), json!("2023-06-01"));
     } else {
         request = request.bearer_auth(&channel_api);
-        headers.insert(
+        request_headers.insert(
             "Authorization".into(),
             json!(format!("Bearer {channel_api}")),
         );
     }
+    if url.contains("opencode.ai") && url.contains("/zen/go") {
+        if !request_headers.contains_key("x-opencode-session") {
+            let session_id = format!(
+                "{:x}",
+                Sha256::digest(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                        .to_le_bytes()
+                )
+            );
+            request = request.header("x-opencode-session", &session_id);
+            request_headers.insert("x-opencode-session".into(), json!(session_id));
+        }
+        if !request_headers.contains_key("user-agent") {
+            request = request.header("user-agent", "uni-api-web");
+            request_headers.insert("user-agent".into(), json!("uni-api-web"));
+        }
+    }
     let request_info =
-        json!({ "method": "POST", "url": url, "headers": headers, "body": request_body });
+        json!({ "method": "POST", "url": url, "headers": request_headers, "body": request_body });
     let started = Instant::now();
     match request.json(&request_body).send().await {
         Ok(response) => {
