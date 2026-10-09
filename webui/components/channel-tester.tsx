@@ -179,7 +179,6 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
 
   const isCustom = selectedBase === "__custom__"
   const selectedOption = baseUrlOptions.find((o) => o.key === selectedBase)
-  const hasExplicitEngine = Boolean(!isCustom && selectedOption?.engine)
   const currentModels = isCustom ? customModels : selectedOption?.models || []
   const effectiveBaseUrl = isCustom ? customBaseUrl : selectedOption?.baseUrl || ""
   const effectiveApi = isCustom ? apiKey : selectedOption?.api || ""
@@ -274,7 +273,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
             baseUrl: effectiveBaseUrl,
             api: effectiveApi,
             model,
-            endpoint: hasExplicitEngine ? "" : endpoint,
+            endpoint,
             engine: selectedOption?.engine || "",
           }),
         })
@@ -385,9 +384,9 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
               {/* 端点 */}
               <div className="w-full sm:w-44 space-y-1">
                 <Label className="text-xs">端点</Label>
-                <Select value={endpoint} onValueChange={handleEndpointChange} disabled={testing || hasExplicitEngine}>
+                <Select value={endpoint} onValueChange={handleEndpointChange} disabled={testing}>
                   <SelectTrigger className="h-9 text-xs w-full">
-                    <SelectValue placeholder={hasExplicitEngine ? "由 engine 决定" : "选择端点"} />
+                    <SelectValue placeholder="选择端点" />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="chat/completions" className="text-xs">chat/completions</SelectItem>
@@ -396,9 +395,6 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
                     <SelectItem value="default" className="text-xs">default（使用 base url）</SelectItem>
                   </SelectContent>
                 </Select>
-                {hasExplicitEngine && (
-                  <p className="text-[10px] text-muted-foreground">已指定 engine，端点由 Base URL 决定</p>
-                )}
               </div>
 
               {/* 模型多选 */}
