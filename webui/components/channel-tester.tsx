@@ -35,10 +35,28 @@ interface ModelConfig {
   display: string
 }
 
+/** 渠道 `api` 字段的一项：纯字符串，或 { key, enabled } 对象 */
+type ApiKeyEntry = string | { key?: string; enabled?: boolean }
+
+/**
+ * 判断一段 `api`（字符串 / 字符串数组 / 带 enabled 的对象数组）里
+ * 是否至少有一把可用（非空且未显式禁用）的 key。
+ */
+function hasEnabledKey(api: ApiKeyEntry | ApiKeyEntry[] | null | undefined): boolean {
+  const entries = Array.isArray(api) ? api : api ? [api] : []
+  return entries.some((item) => {
+    if (typeof item === "string") return item.trim().length > 0
+    if (item && typeof item === "object") {
+      return (item.key || "").trim().length > 0 && item.enabled !== false
+    }
+    return false
+  })
+}
+
 interface Provider {
   provider: string
   base_url: string
-  api: string | string[]
+  api: string | ApiKeyEntry[]
   engine: string | null
   models: ModelConfig[]
 }
@@ -76,7 +94,8 @@ interface BaseUrlOption {
   key: string
   label: string
   baseUrl: string // 空串表示 uni-api 网关
-  api: string
+  // 整段 api 原样透传给后端，由后端按 enabled 过滤；客户端不要盲取 [0]
+  api: ApiKeyEntry | ApiKeyEntry[]
   engine: string | null
   models: string[]
 }
@@ -163,13 +182,15 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
       },
     ]
     for (const p of providers) {
-      const api = Array.isArray(p.api) ? p.api[0] : p.api
-      if (!p.base_url || !api) continue
+      // 整段 api 原样透传：后端会挑出未禁用的 key。
+      // 之前这里盲取 p.api[0]，第一项若恰好是被禁用的 { key, enabled } 对象，
+      // 后端就解析不出任何可用 key，测试必然报「渠道未配置 API Key」。
+      if (!p.base_url || !hasEnabledKey(p.api)) continue
       opts.push({
         key: p.base_url,
         label: p.base_url,
         baseUrl: p.base_url,
-        api,
+        api: p.api,
         engine: p.engine,
         models: p.models.map((m) => m.original),
       })
