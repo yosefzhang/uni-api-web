@@ -393,6 +393,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
                     <SelectItem value="chat/completions" className="text-xs">chat/completions</SelectItem>
                     <SelectItem value="responses" className="text-xs">responses</SelectItem>
                     <SelectItem value="messages" className="text-xs">messages</SelectItem>
+                    <SelectItem value="default" className="text-xs">default（使用 base url）</SelectItem>
                   </SelectContent>
                 </Select>
                 {hasExplicitEngine && (

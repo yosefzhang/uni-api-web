@@ -962,25 +962,38 @@ async fn provider_test_real(
         return Json(json!({ "success": false, "message": "未授权" })).into_response();
     }
     let endpoint = match body_key(&body, "endpoint") {
-        Some(value @ ("responses" | "messages")) => value.to_owned(),
+        Some(value @ ("responses" | "messages" | "default")) => value.to_owned(),
         _ => "chat/completions".to_owned(),
     };
     let base_url = body_key(&body, "baseUrl").unwrap_or_default().to_owned();
     let engine = body_key(&body, "engine").unwrap_or_default().to_owned();
     let public_url = public_base_url(&headers);
     let (url, effective_endpoint) = if engine.is_empty() {
-        let root = if base_url.is_empty()
-            || base_url.trim_end_matches('/') == public_url.trim_end_matches('/')
-        {
-            // uni-api 网关自身：走内部地址，避免依赖容器的外部端口映射。
-            format!("{}/v1", state.internal_base)
-        } else if base_url.starts_with('/') {
-            // 历史遗留的相对路径选项（"/v1"）。
-            format!("{}{}", state.internal_base, normalize_base_root(&base_url))
+        if endpoint == "default" {
+            // 使用 base_url 原样，根据后缀推断协议。
+            let root = base_url.trim_end_matches('/').to_owned();
+            let eff = if root.ends_with("/responses") {
+                "responses".to_owned()
+            } else if root.ends_with("/messages") {
+                "messages".to_owned()
+            } else {
+                "chat/completions".to_owned()
+            };
+            (root, eff)
         } else {
-            normalize_base_root(&base_url)
-        };
-        (format!("{root}/{endpoint}"), endpoint)
+            let root = if base_url.is_empty()
+                || base_url.trim_end_matches('/') == public_url.trim_end_matches('/')
+            {
+                // uni-api 网关自身：走内部地址，避免依赖容器的外部端口映射。
+                format!("{}/v1", state.internal_base)
+            } else if base_url.starts_with('/') {
+                // 历史遗留的相对路径选项（"/v1"）。
+                format!("{}{}", state.internal_base, normalize_base_root(&base_url))
+            } else {
+                normalize_base_root(&base_url)
+            };
+            (format!("{root}/{endpoint}"), endpoint)
+        }
     } else {
         // 渠道显式指定了 engine：按 engine 决定测试哪个端点，
         // 同时把 base_url 末尾已有的同类型后缀剥掉（保留 /v1），再拼回目标端点。
