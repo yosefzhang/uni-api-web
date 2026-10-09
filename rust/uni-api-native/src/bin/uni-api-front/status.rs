@@ -997,6 +997,8 @@ async fn provider_test_real(
     let test_text = "真实测试，请回复 ok";
     let request_body = if effective_endpoint == "responses" {
         json!({ "model": model, "input": [{ "role": "user", "content": [{ "type": "input_text", "text": test_text }] }] })
+    } else if effective_endpoint == "messages" {
+        json!({ "model": model, "max_tokens": 4096, "messages": [{ "role": "user", "content": test_text }] })
     } else {
         json!({ "model": model, "messages": [{ "role": "user", "content": test_text }] })
     };
