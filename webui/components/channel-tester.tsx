@@ -106,7 +106,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
   const [providers, setProviders] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedBase, setSelectedBase] = useState<string>("__uni_api__")
-  const [endpoint, setEndpoint] = useState<string>("chat/completions")
+  const [endpoint, setEndpoint] = useState<string>("default")
   const [selectedModels, setSelectedModels] = useState<string[]>([])
   const [testing, setTesting] = useState(false)
   const [results, setResults] = useState<Record<string, TestResult>>({})
@@ -410,10 +410,10 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
                     <SelectValue placeholder="选择端点" />
                   </SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="default" className="text-xs">default（使用 base url）</SelectItem>
                     <SelectItem value="chat/completions" className="text-xs">chat/completions</SelectItem>
                     <SelectItem value="responses" className="text-xs">responses</SelectItem>
                     <SelectItem value="messages" className="text-xs">messages</SelectItem>
-                    <SelectItem value="default" className="text-xs">default（使用 base url）</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
