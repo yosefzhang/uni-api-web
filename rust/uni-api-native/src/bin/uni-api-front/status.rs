@@ -671,7 +671,7 @@ async fn logs(
          r.model, r.provider, \
          r.process_time as processTime, r.first_response_time as firstResponseTime, \
          r.prompt_tokens as promptTokens, r.completion_tokens as completionTokens, \
-         r.total_tokens as totalTokens, r.text \
+         r.total_tokens as totalTokens, r.text, r.status \
          FROM request_stats r LEFT JOIN channel_stats c ON r.request_id = c.request_id \
          WHERE {} \
          GROUP BY r.request_id ORDER BY r.timestamp DESC \
@@ -961,7 +961,11 @@ async fn provider_test_real(
     let api_key = body_key(&body, "apiKey").unwrap_or_default().to_owned();
     let api = body.get("api").cloned().unwrap_or(Value::Null);
     let model = body_key(&body, "model").unwrap_or_default().to_owned();
-    if api_key.is_empty() || model.is_empty() || api.is_null() {
+    let endpoint = match body_key(&body, "endpoint") {
+        Some(value @ ("responses" | "messages" | "default" | "models")) => value.to_owned(),
+        _ => "chat/completions".to_owned(),
+    };
+    if api_key.is_empty() || api.is_null() || (endpoint != "models" && model.is_empty()) {
         return Json(json!({ "success": false, "message": "缺少必要参数 (apiKey / api / model)" }))
             .into_response();
     }
@@ -974,13 +978,21 @@ async fn provider_test_real(
     if find_key(&config, &api_key).is_none() {
         return Json(json!({ "success": false, "message": "未授权" })).into_response();
     }
-    let endpoint = match body_key(&body, "endpoint") {
-        Some(value @ ("responses" | "messages" | "default")) => value.to_owned(),
-        _ => "chat/completions".to_owned(),
-    };
     let base_url = body_key(&body, "baseUrl").unwrap_or_default().to_owned();
     let public_url = public_base_url(&headers);
-    let (url, effective_endpoint) = if endpoint == "default" {
+
+    fn build_chat_body(endpoint: &str, model: &str) -> Value {
+        let test_text = "真实测试，请回复 ok";
+        if endpoint == "responses" {
+            json!({ "model": model, "input": [{ "role": "user", "content": [{ "type": "input_text", "text": test_text }] }] })
+        } else if endpoint == "messages" {
+            json!({ "model": model, "max_tokens": 4096, "messages": [{ "role": "user", "content": test_text }] })
+        } else {
+            json!({ "model": model, "messages": [{ "role": "user", "content": test_text }] })
+        }
+    }
+
+    let (url, effective_endpoint, method, request_body) = if endpoint == "default" {
         // 使用 base_url 原样，根据后缀推断协议。
         let root = base_url.trim_end_matches('/').to_owned();
         let eff = if root.ends_with("/responses") {
@@ -990,7 +1002,18 @@ async fn provider_test_real(
         } else {
             "chat/completions".to_owned()
         };
-        (root, eff)
+        (root.clone(), eff.clone(), "POST", build_chat_body(&eff, &model))
+    } else if endpoint == "models" {
+        let url = if base_url.is_empty()
+            || base_url.trim_end_matches('/') == public_url.trim_end_matches('/')
+        {
+            format!("{}/v1/models", state.internal_base)
+        } else if base_url.starts_with('/') {
+            format!("{}{}/models", state.internal_base, normalize_base_root(&base_url))
+        } else {
+            base_url_to_models_url(&base_url)
+        };
+        (url, "models".to_owned(), "GET", Value::Null)
     } else {
         let root = if base_url.is_empty()
             || base_url.trim_end_matches('/') == public_url.trim_end_matches('/')
@@ -1003,15 +1026,12 @@ async fn provider_test_real(
         } else {
             normalize_base_root(&base_url)
         };
-        (format!("{root}/{endpoint}"), endpoint)
-    };
-    let test_text = "真实测试，请回复 ok";
-    let request_body = if effective_endpoint == "responses" {
-        json!({ "model": model, "input": [{ "role": "user", "content": [{ "type": "input_text", "text": test_text }] }] })
-    } else if effective_endpoint == "messages" {
-        json!({ "model": model, "max_tokens": 4096, "messages": [{ "role": "user", "content": test_text }] })
-    } else {
-        json!({ "model": model, "messages": [{ "role": "user", "content": test_text }] })
+        (
+            format!("{root}/{endpoint}"),
+            endpoint.clone(),
+            "POST",
+            build_chat_body(&endpoint, &model),
+        )
     };
     let keys = provider_keys(&api);
     if keys.is_empty() {
@@ -1019,13 +1039,17 @@ async fn provider_test_real(
             "success": false,
             "message": "渠道没有可用的 API Key（未配置，或全部已禁用）",
             "responseTime": 0.0,
-            "request": { "method": "POST", "url": url, "headers": {}, "body": request_body },
+            "request": { "method": method, "url": url, "headers": {}, "body": request_body },
             "response": { "status": 0, "body": "" },
         }))
         .into_response();
     }
 
-    let base_headers = Map::from_iter([("Content-Type".into(), json!("application/json"))]);
+    let base_headers = if method == "GET" {
+        Map::new()
+    } else {
+        Map::from_iter([("Content-Type".into(), json!("application/json"))])
+    };
     let started = Instant::now();
     let mut key_results: Vec<Value> = Vec::with_capacity(keys.len());
     let mut first_success: Option<Value> = None;
@@ -1033,13 +1057,21 @@ async fn provider_test_real(
 
     for key in keys {
         let mut request_headers = base_headers.clone();
-        let mut request = state
-            .http
-            .post(&url)
-            .timeout(Duration::from_secs(20))
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-uni-api-debug", "1");
-        if effective_endpoint == "messages" {
+        let mut request = if method == "GET" {
+            state.http.get(&url)
+        } else {
+            state.http.post(&url)
+        }
+        .timeout(Duration::from_secs(20))
+        .header("x-uni-api-debug", "1");
+
+        let is_anthropic = if method == "GET" {
+            base_url.contains("/v1/messages")
+        } else {
+            effective_endpoint == "messages"
+        };
+
+        if is_anthropic {
             request = request
                 .header("x-api-key", &key)
                 .header("anthropic-version", "2023-06-01");
@@ -1051,6 +1083,9 @@ async fn provider_test_real(
                 "Authorization".into(),
                 json!(format!("Bearer {}", mask_key(&key))),
             );
+        }
+        if method != "GET" {
+            request = request.header(header::CONTENT_TYPE, "application/json");
         }
         if url.contains("opencode.ai") && url.contains("/zen/go") {
             if !request_headers.contains_key("x-opencode-session") {
@@ -1072,9 +1107,15 @@ async fn provider_test_real(
                 request_headers.insert("user-agent".into(), json!("uni-api-web"));
             }
         }
-        let request_info = json!({ "method": "POST", "url": url, "headers": request_headers, "body": request_body });
+        let request_info = json!({ "method": method, "url": url, "headers": request_headers, "body": request_body });
 
-        match request.json(&request_body).send().await {
+        let send_future = if method == "GET" {
+            request.send()
+        } else {
+            request.json(&request_body).send()
+        };
+
+        match send_future.await {
             Ok(response) => {
                 let status = response.status().as_u16();
                 let upstream_request = response

@@ -308,7 +308,13 @@ async fn initialize_sqlite(path: PathBuf) -> Result<(), String> {
         let connection = sqlite_connection(&path)?;
         connection
             .execute_batch(SQLITE_SCHEMA)
-            .map_err(|error| format!("initialize SQLite stats schema: {error}"))
+            .map_err(|error| format!("initialize SQLite stats schema: {error}"))?;
+        // 兼容旧数据库：status 列是后续新增的
+        let _ = connection.execute(
+            "ALTER TABLE request_stats ADD COLUMN status INTEGER DEFAULT 0",
+            [],
+        );
+        Ok(())
     })
     .await
     .map_err(|error| format!("join SQLite schema initialization: {error}"))?
@@ -331,7 +337,7 @@ fn sqlite_write(path: &PathBuf, event: WriteEvent) -> Result<(), String> {
     match event {
         WriteEvent::Request(stat) => connection
             .execute(
-                "INSERT INTO request_stats (request_id, trace_id, endpoint, client_ip, process_time, first_response_time, provider, model, api_key, is_flagged, text, prompt_tokens, completion_tokens, total_tokens, prompt_price, completion_price, timing_spans) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                "INSERT INTO request_stats (request_id, trace_id, endpoint, client_ip, process_time, first_response_time, provider, model, api_key, is_flagged, text, prompt_tokens, completion_tokens, total_tokens, prompt_price, completion_price, timing_spans, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 params![
                     stat.request_id,
                     stat.trace_id,
@@ -350,6 +356,7 @@ fn sqlite_write(path: &PathBuf, event: WriteEvent) -> Result<(), String> {
                     stat.prompt_price,
                     stat.completion_price,
                     stat.timing_spans,
+                    stat.status,
                 ],
             )
             .map(|_| ())
@@ -382,7 +389,7 @@ async fn postgres_write(client: &Client, event: WriteEvent) -> Result<(), String
     match event {
         WriteEvent::Request(stat) => client
             .execute(
-                "INSERT INTO request_stats (request_id, trace_id, endpoint, client_ip, process_time, first_response_time, provider, model, api_key, is_flagged, text, prompt_tokens, completion_tokens, total_tokens, prompt_price, completion_price, timing_spans) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+                "INSERT INTO request_stats (request_id, trace_id, endpoint, client_ip, process_time, first_response_time, provider, model, api_key, is_flagged, text, prompt_tokens, completion_tokens, total_tokens, prompt_price, completion_price, timing_spans, status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
                 &[
                     &stat.request_id,
                     &stat.trace_id,
@@ -401,6 +408,7 @@ async fn postgres_write(client: &Client, event: WriteEvent) -> Result<(), String
                     &stat.prompt_price,
                     &stat.completion_price,
                     &stat.timing_spans,
+                    &(stat.status as i32),
                 ],
             )
             .await
@@ -775,6 +783,7 @@ CREATE TABLE IF NOT EXISTS request_stats (
     prompt_price REAL DEFAULT 0,
     completion_price REAL DEFAULT 0,
     timing_spans TEXT,
+    status INTEGER DEFAULT 0,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS ix_request_stats_request_id ON request_stats(request_id);
@@ -820,8 +829,10 @@ CREATE TABLE IF NOT EXISTS request_stats (
     prompt_price DOUBLE PRECISION DEFAULT 0,
     completion_price DOUBLE PRECISION DEFAULT 0,
     timing_spans TEXT,
+    status INTEGER DEFAULT 0,
     timestamp TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE IF EXISTS request_stats ADD COLUMN IF NOT EXISTS status INTEGER DEFAULT 0;
 CREATE INDEX IF NOT EXISTS ix_request_stats_request_id ON request_stats(request_id);
 CREATE INDEX IF NOT EXISTS ix_request_stats_trace_id ON request_stats(trace_id);
 CREATE INDEX IF NOT EXISTS ix_request_stats_provider ON request_stats(provider);

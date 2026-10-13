@@ -34,6 +34,7 @@ interface LogEntry {
   completionTokens: number
   totalTokens: number
   text: string
+  status: number
 }
 
 interface Filters {
@@ -453,7 +454,7 @@ export function DetailedLogs({ apiKey }: DetailedLogsProps) {
                     <TableHead className="w-[100px] text-right">处理耗时</TableHead>
                     <TableHead className="w-[100px] text-right">首字响应</TableHead>
                     <TableHead className="w-[220px] text-right">Tokens (输入/输出/总计)</TableHead>
-                    <TableHead className="w-[80px] text-center">内容</TableHead>
+                    <TableHead className="w-[80px] text-center">响应码</TableHead>
                   </TableRow>
                 </TableHeader>
                 {loading ? renderSkeleton(LOGS_PER_PAGE, false) : (
@@ -494,35 +495,8 @@ export function DetailedLogs({ apiKey }: DetailedLogsProps) {
                             </TooltipContent>
                           </Tooltip>
                         </TableCell>
-                        <TableCell className="text-center">
-                          <Popover>
-                            <PopoverTrigger asChild>
-                              <Button variant="ghost" size="sm" className="h-8 text-xs">
-                                <Eye className="w-3 h-3" />
-                              </Button>
-                            </PopoverTrigger>
-                            <PopoverContent className="w-96 max-h-[50vh] overflow-y-auto text-sm">
-                              <div className="space-y-2">
-                                <div className="flex items-center justify-between mb-2">
-                                  <h4 className="font-medium">完整内容</h4>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    onClick={() => copyToClipboard(log.text)}
-                                    className="h-6 w-6"
-                                    disabled={!log.text}
-                                    title="复制内容"
-                                  >
-                                    <Copy className="h-3 w-3" />
-                                  </Button>
-                                </div>
-                                <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:bg-muted prose-code:text-muted-foreground prose-code:before:content-none prose-code:after:content-none">
-                                  {/* Ensure ReactMarkdown handles potential null/undefined */}
-                                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{log.text || "*无内容*"}</ReactMarkdown>
-                                </div>
-                              </div>
-                            </PopoverContent>
-                          </Popover>
+                        <TableCell className="text-center font-mono text-xs">
+                          {log.status || "-"}
                         </TableCell>
                       </TableRow>
                     ))}
@@ -602,35 +576,11 @@ export function DetailedLogs({ apiKey }: DetailedLogsProps) {
                     </div>
                   </div>
                   <Separator />
-                  {/* Bottom: View Content Button */}
-                  <Popover>
-                    <PopoverTrigger asChild>
-                      <Button variant="outline" size="sm" className="w-full text-xs h-9">
-                        <Eye className="w-4 h-4 mr-2" />
-                        查看完整内容
-                      </Button>
-                    </PopoverTrigger>
-                    <PopoverContent className="w-[85vw] max-w-[400px] max-h-[60vh] overflow-y-auto text-sm">
-                      <div className="space-y-2">
-                        <div className="flex items-center justify-between mb-2">
-                          <h4 className="font-medium">完整内容</h4>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            onClick={() => copyToClipboard(log.text)}
-                            className="h-6 w-6"
-                            disabled={!log.text}
-                            title="复制内容"
-                          >
-                            <Copy className="h-3 w-3" />
-                          </Button>
-                        </div>
-                         <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:bg-muted prose-code:text-muted-foreground prose-code:before:content-none prose-code:after:content-none">
-                           <ReactMarkdown remarkPlugins={[remarkGfm]}>{log.text || "*无内容*"}</ReactMarkdown>
-                         </div>
-                      </div>
-                    </PopoverContent>
-                  </Popover>
+                  {/* Bottom: Response Code */}
+                  <div className="flex justify-between items-center text-xs">
+                    <span className="text-muted-foreground">响应码:</span>
+                    <span className="font-mono">{log.status || "-"}</span>
+                  </div>
                 </CardContent>
               </Card>
             ))

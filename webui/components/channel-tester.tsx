@@ -199,6 +199,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
   }, [providers, allModels, apiKey, uniApiBaseUrl])
 
   const isCustom = selectedBase === "__custom__"
+  const isModelsEndpoint = endpoint === "models"
   const selectedOption = baseUrlOptions.find((o) => o.key === selectedBase)
   const currentModels = isCustom ? customModels : selectedOption?.models || []
   const effectiveBaseUrl = isCustom ? customBaseUrl : selectedOption?.baseUrl || ""
@@ -276,14 +277,15 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
       toast({ title: "提示", description: "请先输入自定义 Base URL", variant: "destructive" })
       return
     }
-    if (selectedModels.length === 0) {
+    if (!isModelsEndpoint && selectedModels.length === 0) {
       toast({ title: "提示", description: "请先选择模型", variant: "destructive" })
       return
     }
     setTesting(true)
     setResults({})
     setOpenResults({})
-    for (const model of selectedModels) {
+    const targets = isModelsEndpoint ? ["__models__"] : selectedModels
+    for (const model of targets) {
       let result: TestResult
       try {
         const response = await fetch("/api/providers/test-real", {
@@ -293,7 +295,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
             apiKey,
             baseUrl: effectiveBaseUrl,
             api: effectiveApi,
-            model,
+            model: model === "__models__" ? "" : model,
             endpoint,
             engine: selectedOption?.engine || "",
           }),
@@ -410,10 +412,11 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
                     <SelectValue placeholder="选择端点" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="default" className="text-xs">default（使用 base url）</SelectItem>
+                    <SelectItem value="default" className="text-xs">use Base URL</SelectItem>
                     <SelectItem value="chat/completions" className="text-xs">chat/completions</SelectItem>
                     <SelectItem value="responses" className="text-xs">responses</SelectItem>
                     <SelectItem value="messages" className="text-xs">messages</SelectItem>
+                    <SelectItem value="models" className="text-xs">models</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -427,9 +430,11 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
                       variant="outline"
                       size="sm"
                       className="h-9 w-full max-w-full justify-start text-xs font-normal"
-                      disabled={testing || customLoading || currentModels.length === 0}
+                      disabled={testing || customLoading || currentModels.length === 0 || isModelsEndpoint}
                     >
-                      {selectedModels.length > 0 ? (
+                      {isModelsEndpoint ? (
+                        "models 端点无需选择模型"
+                      ) : selectedModels.length > 0 ? (
                         <span className="w-full truncate font-mono">
                           {selectedModels.join(", ")}
                         </span>
@@ -469,7 +474,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
               </div>
 
               {/* 测试按钮 */}
-              <Button onClick={testReal} disabled={testing || selectedModels.length === 0} size="sm" className="h-9">
+              <Button onClick={testReal} disabled={testing || (!isModelsEndpoint && selectedModels.length === 0)} size="sm" className="h-9">
                 {testing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
                 {testing ? "测试中..." : "测试"}
               </Button>
@@ -478,9 +483,10 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
             {/* 结果列表 */}
             {Object.keys(results).length > 0 && (
               <div className="space-y-2">
-                {selectedModels.map((model) => {
+                {Object.keys(results).map((model) => {
                   const r = results[model]
                   if (!r) return null
+                  const displayLabel = model === "__models__" ? "模型列表" : model
                   return (
                     <Collapsible
                       key={model}
@@ -491,7 +497,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
                       <CollapsibleTrigger asChild>
                         <button className="flex w-full items-center gap-2 flex-wrap text-sm px-3 py-2 rounded-md hover:bg-muted">
                           <ChevronDown className={`w-4 h-4 shrink-0 transition-transform ${openResults[model] ? "rotate-180" : ""}`} />
-                          <span className="font-mono text-xs">{model}</span>
+                          <span className="font-mono text-xs">{displayLabel}</span>
                           {r.success ? (
                             <Badge className="bg-green-100 text-green-700 border border-green-200 hover:bg-green-200">成功</Badge>
                           ) : (
