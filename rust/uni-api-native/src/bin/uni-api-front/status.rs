@@ -1002,14 +1002,23 @@ async fn provider_test_real(
         } else {
             "chat/completions".to_owned()
         };
-        (root.clone(), eff.clone(), "POST", build_chat_body(&eff, &model))
+        (
+            root.clone(),
+            eff.clone(),
+            "POST",
+            build_chat_body(&eff, &model),
+        )
     } else if endpoint == "models" {
         let url = if base_url.is_empty()
             || base_url.trim_end_matches('/') == public_url.trim_end_matches('/')
         {
             format!("{}/v1/models", state.internal_base)
         } else if base_url.starts_with('/') {
-            format!("{}{}/models", state.internal_base, normalize_base_root(&base_url))
+            format!(
+                "{}{}/models",
+                state.internal_base,
+                normalize_base_root(&base_url)
+            )
         } else {
             base_url_to_models_url(&base_url)
         };
