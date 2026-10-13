@@ -20,6 +20,14 @@ import {
 import { Checkbox } from "@/components/ui/checkbox"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Skeleton } from "@/components/ui/skeleton"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 import { Play, Loader2, ChevronDown } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import { formatTime } from "@/lib/utils"
@@ -318,6 +326,26 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
     }
   }
 
+  const parseModels = (body: string): Array<Record<string, unknown>> => {
+    try {
+      const parsed = JSON.parse(body)
+      if (Array.isArray(parsed)) return parsed
+      if (Array.isArray(parsed.data)) return parsed.data
+      if (Array.isArray(parsed.models)) return parsed.models
+    } catch {
+      // ignore parse errors
+    }
+    return []
+  }
+
+  const modelValue = (item: Record<string, unknown>, keys: string[]): string => {
+    for (const key of keys) {
+      const value = item[key]
+      if (value !== undefined && value !== null) return String(value)
+    }
+    return ""
+  }
+
   // --- Render ---
 
   return (
@@ -560,6 +588,50 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
                               )}
                             </div>
                           </div>
+
+                          {model === "__models__" && r.response?.body && (
+                            <div className="mt-4 space-y-2">
+                              <div className="text-xs font-medium">模型列表</div>
+                              {(() => {
+                                const models = parseModels(r.response.body)
+                                if (models.length === 0) {
+                                  return <div className="text-xs text-muted-foreground">未能从响应中解析出模型列表</div>
+                                }
+                                return (
+                                  <div className="rounded-md border overflow-auto max-h-96">
+                                    <Table>
+                                      <TableHeader>
+                                        <TableRow>
+                                          <TableHead className="text-xs">ID / Name</TableHead>
+                                          <TableHead className="text-xs">Object / Type</TableHead>
+                                          <TableHead className="text-xs">Created / Created At</TableHead>
+                                          <TableHead className="text-xs">Owned By / Display Name</TableHead>
+                                        </TableRow>
+                                      </TableHeader>
+                                      <TableBody>
+                                        {models.map((item, index) => (
+                                          <TableRow key={index}>
+                                            <TableCell className="text-xs font-mono">
+                                              {modelValue(item, ["id", "name", "model"])}
+                                            </TableCell>
+                                            <TableCell className="text-xs">
+                                              {modelValue(item, ["object", "type"])}
+                                            </TableCell>
+                                            <TableCell className="text-xs font-mono">
+                                              {modelValue(item, ["created", "created_at", "modified_at"])}
+                                            </TableCell>
+                                            <TableCell className="text-xs">
+                                              {modelValue(item, ["owned_by", "display_name"])}
+                                            </TableCell>
+                                          </TableRow>
+                                        ))}
+                                      </TableBody>
+                                    </Table>
+                                  </div>
+                                )
+                              })()}
+                            </div>
+                          )}
                         </div>
                       </CollapsibleContent>
                     </Collapsible>
