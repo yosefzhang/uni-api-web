@@ -1,35 +1,82 @@
+# ============================================================================
+# uni-api-web —— 源码与部署同目录
+# 原则：只提交源文件；凭据 / 运行时数据 / 构建产物 / 备份一律不进仓库
+# 注意：yaml 与 json 采用「默认不收 + 白名单放行」，新增要跟踪的 yaml/json
+#       必须在下面补 ! 放行行，否则会被静默忽略。
+# ============================================================================
+
+# --- 凭据（真密钥，绝对不要上传）---
 api.json
-*.yaml
+api.yaml
+*.env
 .env
-__pycache__
-.vscode
-node_modules
-.pnpm-store
-.wrangler
-.pytest_cache
-rust/**/target/
-uni_api/_uni_api_native*.so
-uni_api/_uni_api_native*.dylib
-*.jpg
-*.json
-!vercel.json
-!uni_api/api/codex_models_pro_0_144_0.json
-!webui/package.json
-!webui/pnpm-lock.yaml
-!webui/tsconfig.json
-# *.png
-*.db
-.aider*
-.idea
-docker-compose-*.yml
+.env.*
+!.env.example
+
+# --- 运行时数据（统计库 + 外置配置，体积大且可能含密钥）---
 data/
+*.db
 *.db-wal
 *.db-shm
+*.sqlite3
 postgres_data/
 uniapi_db/
 alembic/
 alembic.ini
 
-# 本地开发运行时产物
+# --- yaml / json 默认不收，只放行明确要跟踪的 ---
+*.yaml
+*.json
+!vercel.json
+!uni_api/api/codex_models_pro_*.json
+!test/fixtures/**/*.json
+!test/fixtures/**/*.yaml
+!test/json_str/**/*.json
+!webui/package.json
+!webui/pnpm-lock.yaml
+!webui/tsconfig.json
+
+# --- 构建产物与依赖 ---
+node_modules/
+rust/**/target/
+target/
+uni_api/_uni_api_native*.so
+uni_api/_uni_api_native*.dylib
+webui/.next/
+webui/out/
+dist/
+build/
+*.tsbuildinfo
+
+# --- 日志、缓存与临时文件 ---
+*.log
+logs/
 .run/
+.aider*
+__pycache__/
+*.pyc
+.pytest_cache/
+.pnpm-store/
+.wrangler/
+
+# --- 备份 / 补丁残留 ---
+*.bak
+*.bak.*
 *.rs.bak.*
+*.orig
+*.rej
+*.tmp
+
+# --- 编辑器与系统文件 ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- compose：基础文件 docker-compose.yml 照常跟踪；本地覆盖/变体不进仓库 ---
+docker-compose.override.y*ml
+docker-compose.*.y*ml
+
+# --- 本地个人笔记（要上传就删掉这行）---
+issue.md

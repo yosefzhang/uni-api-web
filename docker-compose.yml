@@ -1,13 +1,17 @@
 services:
-  uni-api-web:
+  uni-api:
     container_name: uni-api-web
     image: ghcr.io/yosefzhang/uni-api-web:latest
     network_mode: bridge
     restart: unless-stopped
+    # 环境相关的值（代理、限流水位等）全部放本地 .env，本文件与仓库保持一致
+    env_file:
+      - path: .env
+        required: false
     environment:
       - TZ=Asia/Shanghai
     ports:
-      - "9210:8000"
+      - "${UNI_API_BIND:-0.0.0.0}:${UNI_API_PORT:-9210}:8000"
     volumes:
       - ./api.yaml:/home/api.yaml
       - ./data:/home/data
