@@ -39,7 +39,20 @@ const nextConfig = {
   // Dev mode: API routes are handled by Next.js route handlers.
   // Production: static export served by the Rust `status` module inside the
   // uni-api process (see rust/uni-api-native/src/bin/uni-api-front/status.rs).
-  ...(process.env.NODE_ENV === 'production' ? { output: 'export' } : {}),
+  ...(process.env.NODE_ENV === 'production'
+    ? { output: 'export' }
+    : {
+        async rewrites() {
+          const port = process.env.PORT || '8000'
+          const base = process.env.API_BASE_URL || `http://127.0.0.1:${port}`
+          return [
+            {
+              source: '/api/:path*',
+              destination: `${base}/api/:path*`,
+            },
+          ]
+        },
+      }),
   trailingSlash: false,
   eslint: {
     ignoreDuringBuilds: true,

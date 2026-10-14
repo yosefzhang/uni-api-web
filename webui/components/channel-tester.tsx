@@ -125,6 +125,8 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
   const [customLoading, setCustomLoading] = useState(false)
   const [baseOpen, setBaseOpen] = useState(false)
   const [baseQuery, setBaseQuery] = useState("")
+  const [testedModels, setTestedModels] = useState<Array<Record<string, unknown>>>([])
+  const [modelCaps, setModelCaps] = useState<Record<string, any>>({})
   const { toast } = useToast()
 
   // --- Data Loading ---
@@ -166,6 +168,26 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
   useEffect(() => {
     loadProviders()
   }, [loadProviders])
+
+  const loadModelCaps = useCallback(async () => {
+    if (!apiKey) {
+      setModelCaps({})
+      return
+    }
+    try {
+      const res = await fetch(`/api/model-context/load?apiKey=${encodeURIComponent(apiKey)}`)
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+      setModelCaps(data.data || {})
+    } catch (error) {
+      console.error("加载模型能力配置失败:", error)
+      setModelCaps({})
+    }
+  }, [apiKey])
+
+  useEffect(() => {
+    loadModelCaps()
+  }, [loadModelCaps])
 
   // 所有展示模型名（uni-api 客户端侧模型名），去重并排序
   const allModels = useMemo(
@@ -292,6 +314,7 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
     setTesting(true)
     setResults({})
     setOpenResults({})
+    if (isModelsEndpoint) setTestedModels([])
     const targets = isModelsEndpoint ? ["__models__"] : selectedModels
     for (const model of targets) {
       let result: TestResult
@@ -313,6 +336,9 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
         result = { success: false, message: error.message || "测试请求失败" }
       }
       setResults((prev) => ({ ...prev, [model]: result }))
+      if (model === "__models__" && result.success && result.response?.body) {
+        setTestedModels(parseModels(result.response.body))
+      }
     }
     setTesting(false)
   }
@@ -344,6 +370,27 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
       if (value !== undefined && value !== null) return String(value)
     }
     return ""
+  }
+
+  const getTestedModelId = (item: Record<string, unknown>): string => {
+    return modelValue(item, ["id", "name", "model"])
+  }
+
+  const getModelCap = (modelId: string, key: string): string | null => {
+    const cap = modelCaps[modelId]
+    if (!cap || typeof cap !== "object") return null
+    const value = (cap as Record<string, unknown>)[key]
+    if (value === null || value === undefined || value === "") return null
+    return String(value)
+  }
+
+  const renderVisionBadge = (modelId: string) => {
+    const value = getModelCap(modelId, "supports_vision")
+    if (value === null) return <Badge variant="outline">未知</Badge>
+    if (value === "true" || value === "True" || value === "TRUE" || value === "1") {
+      return <Badge variant="default">支持</Badge>
+    }
+    return <Badge variant="secondary">不支持</Badge>
   }
 
   // --- Render ---
@@ -589,54 +636,46 @@ export function ChannelTester({ apiKey }: ChannelTesterProps) {
                             </div>
                           </div>
 
-                          {model === "__models__" && r.response?.body && (
-                            <div className="mt-4 space-y-2">
-                              <div className="text-xs font-medium">模型列表</div>
-                              {(() => {
-                                const models = parseModels(r.response.body)
-                                if (models.length === 0) {
-                                  return <div className="text-xs text-muted-foreground">未能从响应中解析出模型列表</div>
-                                }
-                                return (
-                                  <div className="rounded-md border overflow-auto max-h-96">
-                                    <Table>
-                                      <TableHeader>
-                                        <TableRow>
-                                          <TableHead className="text-xs">ID / Name</TableHead>
-                                          <TableHead className="text-xs">Object / Type</TableHead>
-                                          <TableHead className="text-xs">Created / Created At</TableHead>
-                                          <TableHead className="text-xs">Owned By / Display Name</TableHead>
-                                        </TableRow>
-                                      </TableHeader>
-                                      <TableBody>
-                                        {models.map((item, index) => (
-                                          <TableRow key={index}>
-                                            <TableCell className="text-xs font-mono">
-                                              {modelValue(item, ["id", "name", "model"])}
-                                            </TableCell>
-                                            <TableCell className="text-xs">
-                                              {modelValue(item, ["object", "type"])}
-                                            </TableCell>
-                                            <TableCell className="text-xs font-mono">
-                                              {modelValue(item, ["created", "created_at", "modified_at"])}
-                                            </TableCell>
-                                            <TableCell className="text-xs">
-                                              {modelValue(item, ["owned_by", "display_name"])}
-                                            </TableCell>
-                                          </TableRow>
-                                        ))}
-                                      </TableBody>
-                                    </Table>
-                                  </div>
-                                )
-                              })()}
-                            </div>
-                          )}
                         </div>
                       </CollapsibleContent>
                     </Collapsible>
                   )
                 })}
+              </div>
+            )}
+
+            {testedModels.length > 0 && (
+              <div className="mt-6 space-y-2">
+                <div className="text-sm font-medium">模型列表</div>
+                <div className="rounded-md border overflow-auto max-h-96">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="text-xs">模型</TableHead>
+                        <TableHead className="text-xs">上下文窗口</TableHead>
+                        <TableHead className="text-xs">输出窗口</TableHead>
+                        <TableHead className="text-xs">视觉支持情况</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {testedModels.map((item, index) => {
+                        const modelId = getTestedModelId(item)
+                        return (
+                          <TableRow key={index}>
+                            <TableCell className="text-xs font-mono">{modelId || "—"}</TableCell>
+                            <TableCell className="text-xs font-mono">
+                              {getModelCap(modelId, "context_window") || "—"}
+                            </TableCell>
+                            <TableCell className="text-xs font-mono">
+                              {getModelCap(modelId, "max_output_tokens") || "—"}
+                            </TableCell>
+                            <TableCell className="text-xs">{renderVisionBadge(modelId)}</TableCell>
+                          </TableRow>
+                        )
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>
               </div>
             )}
           </CardContent>

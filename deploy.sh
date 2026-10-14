@@ -144,7 +144,9 @@ start_frontend() {
   echo "启动前端 (端口 $FRONTEND_PORT) ..."
   cd "$WEBUI_DIR"
   # 直接调用 next，绕过 pnpm dev 在非 TTY 环境下的依赖重建检查
-  nohup ./node_modules/.bin/next dev -p "$FRONTEND_PORT" \
+  # dev 模式下将 /api/* 代理到后端，避免前端 404
+  local api_base="${API_BASE_URL:-http://127.0.0.1:$BACKEND_PORT}"
+  nohup env API_BASE_URL="$api_base" ./node_modules/.bin/next dev -p "$FRONTEND_PORT" \
     > "$PROJECT_ROOT/.run/frontend.log" 2>&1 &
   echo $! > "$FRONTEND_PIDFILE"
   echo "前端已启动 (PID $!)"

@@ -30,6 +30,7 @@ pub struct StatusState {
     pub stats_db: PathBuf,
     pub stats_enabled: bool,
     pub model_context_path: PathBuf,
+    pub disable_models_path: PathBuf,
 }
 
 /// Merge the status surface into the public router when enabled.  Enabled by
@@ -74,6 +75,10 @@ pub fn maybe_merge(app: Router) -> Router {
         std::env::var("UNI_API_MODEL_CONTEXT_PATH")
             .unwrap_or_else(|_| "data/model_extern_config.json".to_owned()),
     );
+    let disable_models_path = PathBuf::from(
+        std::env::var("UNI_API_DISABLE_MODELS_PATH")
+            .unwrap_or_else(|_| "data/disable_models.json".to_owned()),
+    );
     let state = StatusState {
         config_path: config_path.canonicalize().unwrap_or(config_path),
         ui_root: ui_root.canonicalize().unwrap_or(ui_root),
@@ -85,6 +90,7 @@ pub fn maybe_merge(app: Router) -> Router {
         stats_db,
         stats_enabled: stats_backend == "sqlite" && !database_disabled,
         model_context_path,
+        disable_models_path,
     };
     let status = router(state);
     app.merge(status)
@@ -98,6 +104,8 @@ fn router(state: StatusState) -> Router {
         .route("/api/config/save", post(save_config))
         .route("/api/model-context/load", get(load_model_context))
         .route("/api/model-context/save", post(save_model_context))
+        .route("/api/disable-models/load", get(load_disable_models))
+        .route("/api/disable-models/save", post(save_disable_models))
         .route("/api/filters", get(filters))
         .route("/api/logs", get(logs))
         .route("/api/stats/overview", get(stats_overview))
@@ -462,6 +470,61 @@ async fn save_model_context(State(state): State<StatusState>, Json(body): Json<V
     }
     if let Err(error) = std::fs::write(&state.model_context_path, pretty) {
         return internal_error("write model_extern_config.json", &error);
+    }
+    Json(json!({ "success": true })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// disable models config (data/disable_models.json)
+// ---------------------------------------------------------------------------
+
+async fn load_disable_models(
+    State(state): State<StatusState>,
+    Query(params): Query<Map<String, Value>>,
+) -> Response {
+    if let Err(response) = require_admin(&state, &params) {
+        return response;
+    }
+    let content = match std::fs::read_to_string(&state.disable_models_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let default = "{}";
+            if let Some(parent) = state.disable_models_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&state.disable_models_path, default);
+            default.to_owned()
+        }
+        Err(error) => return internal_error("read disable_models.json", &error),
+    };
+    let data = serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}));
+    Json(json!({ "data": data })).into_response()
+}
+
+async fn save_disable_models(State(state): State<StatusState>, Json(body): Json<Value>) -> Response {
+    let api_key = body_key(&body, "apiKey").map(str::to_owned);
+    let data = body.get("data").cloned().unwrap_or(Value::Null);
+    if api_key.is_none() || !data.is_object() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "API Key and a JSON object data are required" }),
+        );
+    }
+    let params = Map::from_iter([("apiKey".into(), json!(api_key.unwrap()))]);
+    if let Err(response) = require_admin(&state, &params) {
+        return response;
+    }
+    let pretty = match serde_json::to_string_pretty(&data) {
+        Ok(pretty) => format!("{pretty}\n"),
+        Err(error) => return internal_error("serialize disable_models.json", &error),
+    };
+    if let Some(parent) = state.disable_models_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return internal_error("create data dir for disable_models.json", &error);
+        }
+    }
+    if let Err(error) = std::fs::write(&state.disable_models_path, pretty) {
+        return internal_error("write disable_models.json", &error);
     }
     Json(json!({ "success": true })).into_response()
 }

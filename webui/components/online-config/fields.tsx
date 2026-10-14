@@ -12,7 +12,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Plus, Trash2, RefreshCw, Loader2, Wand2 } from "lucide-react"
+import { Plus, Trash2, RefreshCw, Loader2, Wand2, Ban, ListX } from "lucide-react"
 
 // 单行字段：标签（上）+ 控件（下），注释以小字放在标签旁
 export function FieldRow({
@@ -328,6 +328,9 @@ export function ModelListField({
   actionLabel,
   onAction,
   actionLoading,
+  onDisableModel,
+  onClearDisabled,
+  clearDisabledDisabled,
 }: {
   label: string
   description?: string
@@ -336,6 +339,9 @@ export function ModelListField({
   actionLabel?: string
   onAction?: () => void
   actionLoading?: boolean
+  onDisableModel?: (upstream: string) => void
+  onClearDisabled?: () => void
+  clearDisabledDisabled?: boolean
 }) {
   const items = values.length > 0 ? values : [{ upstream: "", alias: "" }]
   const [prefix, setPrefix] = useState("")
@@ -357,7 +363,7 @@ export function ModelListField({
         <div className="flex gap-1.5 px-1 text-xs text-muted-foreground">
           <span className="flex-1">渠道模型ID</span>
           <span className="flex-1">映射模型ID</span>
-          <span className="w-9" />
+          <span className="w-[4.5rem]" />
         </div>
         {items.map((m, i) => (
           <div key={i} className="flex gap-1.5">
@@ -381,6 +387,21 @@ export function ModelListField({
               placeholder="可选，重命名"
               className="flex-1 h-9 font-mono text-xs"
             />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-9 w-9 shrink-0 text-muted-foreground hover:text-foreground"
+              title="禁用该模型"
+              disabled={!m.upstream.trim() || !onDisableModel}
+              onClick={() => {
+                if (m.upstream.trim() && onDisableModel) {
+                  onDisableModel(m.upstream.trim())
+                }
+              }}
+            >
+              <Ban className="h-4 w-4" />
+            </Button>
             <Button
               type="button"
               variant="ghost"
@@ -422,6 +443,20 @@ export function ModelListField({
                 <RefreshCw className="h-3.5 w-3.5 mr-1" />
               )}
               {actionLabel}
+            </Button>
+          )}
+          {onClearDisabled && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="text-destructive hover:text-destructive"
+              onClick={onClearDisabled}
+              disabled={clearDisabledDisabled}
+              title="清空该渠道的禁用模型列表"
+            >
+              <ListX className="h-3.5 w-3.5 mr-1" />
+              清空禁用列表
             </Button>
           )}
           <Button

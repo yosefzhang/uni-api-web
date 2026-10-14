@@ -62,6 +62,7 @@ export function ProviderDialog({
   const [keepalivePairs, setKeepalivePairs] = useState<{ key: string; value: string }[]>([])
   const [headersPairs, setHeadersPairs] = useState<{ key: string; value: string }[]>([])
   const [fetchingModels, setFetchingModels] = useState(false)
+  const [allDisabledModels, setAllDisabledModels] = useState<Record<string, string[]>>({})
 
   useEffect(() => {
     if (!open) return
@@ -73,7 +74,20 @@ export function ProviderDialog({
     setKeepalivePairs(objectToPairs(prefs.keepalive_interval))
     setHeadersPairs(objectToPairs(prefs.headers))
     setFetchingModels(false)
-  }, [open, initial])
+    setAllDisabledModels({})
+    const loadDisabled = async () => {
+      try {
+        const res = await fetch(`/api/disable-models/load?apiKey=${encodeURIComponent(apiKey)}`)
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+        setAllDisabledModels(data.data || {})
+      } catch (e: any) {
+        // 加载禁用列表失败不阻断弹窗使用
+        console.error("load disable models failed:", e.message)
+      }
+    }
+    loadDisabled()
+  }, [open, initial, apiKey])
 
   const update = (patch: Partial<ProviderItem>) => {
     setItem((prev) => ({ ...prev, ...patch }))
@@ -119,12 +133,65 @@ export function ProviderDialog({
         toast({ title: "未获取到模型", description: "该渠道未返回任何模型列表" })
         return
       }
-      setModelList(models.map((m) => ({ upstream: m, alias: "" })))
-      toast({ title: "获取成功", description: `已填入 ${models.length} 个模型` })
+      const disabled = new Set(item.provider ? allDisabledModels[item.provider] || [] : [])
+      const filtered = models.filter((m) => !disabled.has(m))
+      setModelList(filtered.map((m) => ({ upstream: m, alias: "" })))
+      const skipped = models.length - filtered.length
+      toast({
+        title: "获取成功",
+        description: `已填入 ${filtered.length} 个模型${skipped > 0 ? `，已过滤 ${skipped} 个禁用模型` : ""}`,
+      })
     } catch (e: any) {
       toast({ title: "获取失败", description: e?.message || "未知错误", variant: "destructive" })
     } finally {
       setFetchingModels(false)
+    }
+  }
+
+  const handleDisableModel = async (model: string) => {
+    if (!item.provider) {
+      toast({ title: "无法禁用", description: "请先填写 provider", variant: "destructive" })
+      return
+    }
+    const next: Record<string, string[]> = { ...allDisabledModels }
+    const list = new Set(next[item.provider] || [])
+    list.add(model)
+    next[item.provider] = Array.from(list)
+    try {
+      const res = await fetch("/api/disable-models/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey, data: next }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+      setAllDisabledModels(next)
+      setModelList((prev) => prev.filter((m) => m.upstream !== model))
+      toast({ title: "已禁用", description: `${model} 已加入 ${item.provider} 的禁用列表` })
+    } catch (e: any) {
+      toast({ title: "禁用失败", description: e.message || "未知错误", variant: "destructive" })
+    }
+  }
+
+  const handleClearDisabledModels = async () => {
+    if (!item.provider) {
+      toast({ title: "无法清空", description: "请先填写 provider", variant: "destructive" })
+      return
+    }
+    const next: Record<string, string[]> = { ...allDisabledModels }
+    delete next[item.provider]
+    try {
+      const res = await fetch("/api/disable-models/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey, data: next }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+      setAllDisabledModels(next)
+      toast({ title: "已清空", description: `${item.provider} 的禁用模型列表已清空` })
+    } catch (e: any) {
+      toast({ title: "清空失败", description: e.message || "未知错误", variant: "destructive" })
     }
   }
 
@@ -217,6 +284,9 @@ export function ProviderDialog({
               actionLabel="获取渠道模型"
               onAction={fetchModels}
               actionLoading={fetchingModels}
+              onDisableModel={handleDisableModel}
+              onClearDisabled={handleClearDisabledModels}
+              clearDisabledDisabled={!item.provider || !(allDisabledModels[item.provider]?.length > 0)}
             />
             <SelectField
               id="tools"
