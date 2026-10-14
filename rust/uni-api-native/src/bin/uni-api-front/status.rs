@@ -501,7 +501,10 @@ async fn load_disable_models(
     Json(json!({ "data": data })).into_response()
 }
 
-async fn save_disable_models(State(state): State<StatusState>, Json(body): Json<Value>) -> Response {
+async fn save_disable_models(
+    State(state): State<StatusState>,
+    Json(body): Json<Value>,
+) -> Response {
     let api_key = body_key(&body, "apiKey").map(str::to_owned);
     let data = body.get("data").cloned().unwrap_or(Value::Null);
     if api_key.is_none() || !data.is_object() {
