@@ -21,7 +21,15 @@ RUN cargo build --release --locked && cp target/release/uni-api-front /tmp/uni-a
 
 # 前端面板（Next.js 静态导出），产物由 Rust 侧 status 模块托管
 FROM node:22-bookworm-slim AS status-builder
-RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
+# 可选换源：本地构建传 --build-arg APT_MIRROR=mirrors.ustc.edu.cn 走国内源；
+# CI（境外 runner）不传则保持官方源（对 runner 反而更快）。
+# 注意：与 HTTP_PROXY 同用时，必须把该镜像域名放进 NO_PROXY，否则会被代理绕到境外。
+ARG APT_MIRROR=
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    apt-get update && apt-get install -y --no-install-recommends python3 make g++ && \
+    rm -rf /var/lib/apt/lists/*
 RUN corepack enable && corepack prepare pnpm@10.15.0 --activate
 WORKDIR /build
 COPY webui/package.json webui/pnpm-lock.yaml ./
@@ -39,12 +47,17 @@ RUN pnpm install --offline --frozen-lockfile && \
 
 FROM debian:bookworm-slim
 ARG SOURCE_COMMIT=unknown
+# 同 status-builder：本地构建可传 APT_MIRROR 走国内源，CI 不传保持官方源
+ARG APT_MIRROR=
 ENV SOURCE_COMMIT=${SOURCE_COMMIT} \
     UNI_API_RUNTIME=rust \
     MALLOC_ARENA_MAX=2 \
     MALLOC_MMAP_THRESHOLD_=131072 \
     MALLOC_TRIM_THRESHOLD_=131072
-RUN apt-get update && \
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 EXPOSE 8000
