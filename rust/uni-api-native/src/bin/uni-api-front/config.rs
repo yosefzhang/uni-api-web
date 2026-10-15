@@ -10,6 +10,15 @@ use url::Url;
 
 const SNAPSHOT_SCHEMA_VERSION: u64 = 1;
 
+/// Result of probing a provider's /models catalog. Copilot entries also carry
+/// per-model `supported_endpoints`, kept in `model_endpoints` keyed by the
+/// upstream (catalog) model id.
+#[derive(Clone, Debug, Default)]
+struct ProviderDiscovery {
+    models: Vec<String>,
+    model_endpoints: BTreeMap<String, Vec<String>>,
+}
+
 #[derive(Clone, Debug)]
 pub enum RuntimeConfigSource {
     File(PathBuf),
@@ -84,7 +93,7 @@ pub struct RuntimeConfigPublisher {
     client: reqwest::Client,
     snapshot_path: Arc<PathBuf>,
     database_disabled: bool,
-    discovery_cache: Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
+    discovery_cache: Arc<tokio::sync::Mutex<HashMap<String, ProviderDiscovery>>>,
 }
 
 impl RuntimeConfigPublisher {
@@ -246,7 +255,7 @@ async fn compile_snapshot_with_discovery(
     raw: &[u8],
     database_disabled: bool,
     client: &reqwest::Client,
-    discovery_cache: &tokio::sync::Mutex<HashMap<String, Vec<String>>>,
+    discovery_cache: &tokio::sync::Mutex<HashMap<String, ProviderDiscovery>>,
 ) -> Result<Vec<u8>, String> {
     let yaml: serde_yaml::Value = serde_yaml::from_slice(raw)
         .map_err(|error| format!("decode uni-api YAML configuration: {error}"))?;
@@ -262,7 +271,7 @@ async fn compile_snapshot_with_discovery(
 async fn discover_missing_provider_models(
     config: &mut Value,
     client: &reqwest::Client,
-    discovery_cache: &tokio::sync::Mutex<HashMap<String, Vec<String>>>,
+    discovery_cache: &tokio::sync::Mutex<HashMap<String, ProviderDiscovery>>,
 ) {
     let Some(providers) = config.get_mut("providers").and_then(Value::as_array_mut) else {
         return;
@@ -270,23 +279,29 @@ async fn discover_missing_provider_models(
     let cached = discovery_cache.lock().await.clone();
     let mut pending = Vec::new();
     for (index, provider) in providers.iter_mut().enumerate() {
-        if provider
+        let needs_models = provider
             .get("model")
             .and_then(Value::as_array)
-            .is_some_and(|models| !models.is_empty())
-        {
+            .is_none_or(|models| models.is_empty());
+        // Copilot providers also probe the catalog's supported_endpoints so the
+        // data plane can pick /responses vs /chat/completions per model. A
+        // hand-written preferences.model_endpoints in api.yaml always wins.
+        let needs_endpoints = provider_engine(provider) == "copilot"
+            && provider
+                .get("preferences")
+                .and_then(|preferences| preferences.get("model_endpoints"))
+                .is_none();
+        if !needs_models && !needs_endpoints {
             continue;
         }
         let cache_key = discovery_cache_key(provider);
-        if let Some(models) = cached.get(&cache_key).filter(|models| !models.is_empty()) {
-            provider
-                .as_object_mut()
-                .expect("provider configuration object")
-                .insert(
-                    "model".into(),
-                    Value::Array(models.iter().cloned().map(Value::String).collect()),
-                );
-            continue;
+        if let Some(entry) = cached.get(&cache_key) {
+            let models_ready = !needs_models || !entry.models.is_empty();
+            let endpoints_ready = !needs_endpoints || !entry.model_endpoints.is_empty();
+            if models_ready && endpoints_ready {
+                apply_provider_discovery(provider, entry, needs_models, needs_endpoints);
+                continue;
+            }
         }
         pending.push({
             let provider = provider.clone();
@@ -295,23 +310,24 @@ async fn discover_missing_provider_models(
                 (
                     index,
                     cache_key,
-                    discover_provider_models(&client, &provider).await,
+                    needs_models,
+                    needs_endpoints,
+                    discover_provider_catalog(&client, &provider).await,
                 )
             }
         });
     }
     let mut discovered = Vec::new();
-    for (index, cache_key, result) in join_all(pending).await {
+    for (index, cache_key, needs_models, needs_endpoints, result) in join_all(pending).await {
         match result {
-            Ok(models) if !models.is_empty() => {
-                discovered.push((cache_key, models.clone()));
-                providers[index]
-                    .as_object_mut()
-                    .expect("provider configuration object")
-                    .insert(
-                        "model".into(),
-                        Value::Array(models.into_iter().map(Value::String).collect()),
-                    );
+            Ok(entry) if !entry.models.is_empty() || !entry.model_endpoints.is_empty() => {
+                discovered.push((cache_key, entry.clone()));
+                apply_provider_discovery(
+                    &mut providers[index],
+                    &entry,
+                    needs_models,
+                    needs_endpoints,
+                );
             }
             Ok(_) => {}
             Err(error) => eprintln!(
@@ -329,6 +345,56 @@ async fn discover_missing_provider_models(
     }
 }
 
+fn apply_provider_discovery(
+    provider: &mut Value,
+    entry: &ProviderDiscovery,
+    needs_models: bool,
+    needs_endpoints: bool,
+) {
+    let object = provider.as_object_mut().expect("provider configuration object");
+    if needs_models && !entry.models.is_empty() {
+        object.insert(
+            "model".into(),
+            Value::Array(entry.models.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    if needs_endpoints && !entry.model_endpoints.is_empty() {
+        let table = entry
+            .model_endpoints
+            .iter()
+            .map(|(model, endpoints)| {
+                (
+                    model.clone(),
+                    Value::Array(endpoints.iter().cloned().map(Value::String).collect()),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        object
+            .entry("preferences")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .expect("provider preferences object")
+            .insert("model_endpoints".into(), Value::Object(table));
+    }
+}
+
+/// Provider engine as configured, falling back to the base_url heuristic the
+/// compiler uses (mirrors compile_provider).
+fn provider_engine(provider: &Value) -> String {
+    provider
+        .get("engine")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| {
+            infer_engine(
+                provider
+                    .get("base_url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+        })
+}
+
 fn discovery_cache_key(provider: &Value) -> String {
     format!("{:x}", Sha256::digest(provider.to_string().as_bytes()))
 }
@@ -337,6 +403,13 @@ pub(crate) async fn discover_provider_models(
     client: &reqwest::Client,
     provider: &Value,
 ) -> Result<Vec<String>, String> {
+    Ok(discover_provider_catalog(client, provider).await?.models)
+}
+
+async fn discover_provider_catalog(
+    client: &reqwest::Client,
+    provider: &Value,
+) -> Result<ProviderDiscovery, String> {
     let base_url = provider
         .get("base_url")
         .and_then(Value::as_str)
@@ -346,18 +419,21 @@ pub(crate) async fn discover_provider_models(
         return Err("provider base_url is required for model discovery".into());
     }
     if base_url.contains("models.inference.ai.azure.com") {
-        return Ok([
-            "gpt-4o",
-            "gpt-4.1",
-            "gpt-4o-mini",
-            "o4-mini",
-            "o3",
-            "text-embedding-3-small",
-            "text-embedding-3-large",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect());
+        return Ok(ProviderDiscovery {
+            models: [
+                "gpt-4o",
+                "gpt-4.1",
+                "gpt-4o-mini",
+                "o4-mini",
+                "o3",
+                "text-embedding-3-small",
+                "text-embedding-3-large",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            ..ProviderDiscovery::default()
+        });
     }
     let api_key = first_provider_key(provider.get("api"));
     let engine = provider
@@ -423,9 +499,15 @@ pub(crate) async fn discover_provider_models(
         .await
         .map_err(|error| format!("decode model discovery response from {url}: {error}"))?;
     if engine == "copilot" {
-        return Ok(discovered_copilot_model_ids(&payload));
+        return Ok(ProviderDiscovery {
+            models: discovered_copilot_model_ids(&payload),
+            model_endpoints: discovered_copilot_model_endpoints(&payload),
+        });
     }
-    Ok(discovered_model_ids(&payload))
+    Ok(ProviderDiscovery {
+        models: discovered_model_ids(&payload),
+        ..ProviderDiscovery::default()
+    })
 }
 
 /// Copilot's /models is OpenAI-shaped but carries policy metadata: keep only
@@ -461,6 +543,52 @@ fn discovered_copilot_model_ids(payload: &Value) -> Vec<String> {
         }
     }
     seen.into_iter().collect()
+}
+
+/// Copilot's /models catalog also reports which wire endpoints each model is
+/// served on (`supported_endpoints`, e.g. ["/chat/completions"],
+/// ["/responses"], ["/v1/messages"]). The data plane uses this table to pick
+/// /responses vs /chat/completions for non-Claude models. Entries without the
+/// field carry no routing information and are omitted (callers keep their
+/// legacy behavior for them).
+fn discovered_copilot_model_endpoints(payload: &Value) -> BTreeMap<String, Vec<String>> {
+    let items = payload
+        .get("data")
+        .or_else(|| payload.get("models"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let mut table = BTreeMap::new();
+    for item in items {
+        if item.pointer("/capabilities/type").and_then(Value::as_str) != Some("chat") {
+            continue;
+        }
+        if item
+            .pointer("/policy/state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| state != "enabled")
+        {
+            continue;
+        }
+        let id = item
+            .get("id")
+            .or_else(|| item.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let endpoints = item
+            .get("supported_endpoints")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if !id.is_empty() && !endpoints.is_empty() {
+            table.insert(id.to_owned(), endpoints);
+        }
+    }
+    table
 }
 
 fn copilot_models_url(base_url: &str) -> Result<Url, String> {
@@ -1271,6 +1399,75 @@ mod tests {
         assert_eq!(
             discovered_copilot_model_ids(&payload),
             vec!["claude-opus-4.6".to_owned(), "gpt-5.2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn copilot_catalog_collects_supported_endpoints() {
+        let payload = json!({"data": [
+            {"id": "gpt-6.1", "capabilities": {"type": "chat"}, "policy": {"state": "enabled"},
+             "supported_endpoints": ["/responses", "ws:/responses"]},
+            {"id": "glm-5.2", "capabilities": {"type": "chat"}, "policy": {"state": "enabled"},
+             "supported_endpoints": ["/chat/completions"]},
+            {"id": "claude-opus-4.6", "capabilities": {"type": "chat"}, "policy": {"state": "enabled"},
+             "supported_endpoints": ["/chat/completions", "/v1/messages"]},
+            {"id": "claude-hidden", "capabilities": {"type": "chat"}, "policy": {"state": "disabled"},
+             "supported_endpoints": ["/responses"]},
+            {"id": "no-endpoints", "capabilities": {"type": "chat"}, "policy": {"state": "enabled"}}
+        ]});
+        let table = discovered_copilot_model_endpoints(&payload);
+        assert_eq!(
+            table.get("gpt-6.1"),
+            Some(&vec!["/responses".to_owned(), "ws:/responses".to_owned()])
+        );
+        assert_eq!(
+            table.get("glm-5.2"),
+            Some(&vec!["/chat/completions".to_owned()])
+        );
+        assert_eq!(
+            table.get("claude-opus-4.6"),
+            Some(&vec!["/chat/completions".to_owned(), "/v1/messages".to_owned()])
+        );
+        // Disabled or endpoint-less entries carry no routing information.
+        assert!(!table.contains_key("claude-hidden"));
+        assert!(!table.contains_key("no-endpoints"));
+    }
+
+    #[test]
+    fn provider_discovery_applies_models_and_endpoints() {
+        let mut provider = json!({
+            "provider": "copilot-a",
+            "base_url": "https://api.githubcopilot.com",
+            "engine": "copilot",
+            "api": "pat",
+            "model": ["gpt-6.1"]
+        });
+        let entry = ProviderDiscovery {
+            models: vec!["gpt-6.1".to_owned()],
+            model_endpoints: BTreeMap::from([(
+                "gpt-6.1".to_owned(),
+                vec!["/responses".to_owned()],
+            )]),
+        };
+        // A configured model list is kept; only the endpoint table is injected.
+        apply_provider_discovery(&mut provider, &entry, false, true);
+        assert_eq!(provider["model"][0], "gpt-6.1");
+        assert_eq!(
+            provider["preferences"]["model_endpoints"]["gpt-6.1"][0],
+            "/responses"
+        );
+        // Discovery fills an empty model list as before.
+        let mut provider = json!({
+            "provider": "copilot-a",
+            "base_url": "https://api.githubcopilot.com",
+            "engine": "copilot",
+            "api": "pat"
+        });
+        apply_provider_discovery(&mut provider, &entry, true, true);
+        assert_eq!(provider["model"][0], "gpt-6.1");
+        assert_eq!(
+            provider["preferences"]["model_endpoints"]["gpt-6.1"][0],
+            "/responses"
         );
     }
 

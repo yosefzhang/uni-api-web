@@ -2244,7 +2244,10 @@ fn build_attempt(
         return Err("Provider does not support this endpoint".into());
     }
     let native_responses_wire = matches!(path, "/v1/responses" | "/v1/responses/compact")
-        && provider_speaks_responses_natively(&engine, provider.base_url.as_ref());
+        && provider_speaks_responses_natively(&engine, provider.base_url.as_ref())
+        // Copilot models without /responses support (glm, deepseek, ...) fall
+        // back to the ResponsesCompat chat rewrite instead of a 400.
+        && !(engine == "copilot" && copilot_model_lacks_responses(provider, original_model));
     let downstream_protocol = if path == "/v1/responses" && !native_responses_wire {
         DownstreamProtocol::ResponsesCompat
     } else {
@@ -2542,6 +2545,15 @@ fn build_attempt(
                 (
                     copilot_messages_url(provider.base_url.as_ref())?,
                     ResponseAdapter::Passthrough,
+                    provider_stream,
+                )
+            } else if copilot_model_requires_responses(provider, original_model) {
+                // gpt-5+/gpt-6 models are only served on /responses; translate
+                // the Anthropic body instead of hitting /chat/completions.
+                payload = claude_to_responses(&payload, original_model, &engine)?;
+                (
+                    copilot_responses_url(provider.base_url.as_ref())?,
+                    ResponseAdapter::ResponsesToClaude,
                     provider_stream,
                 )
             } else {
@@ -6782,6 +6794,67 @@ fn is_copilot_claude_model(model: &str) -> bool {
     model.to_ascii_lowercase().contains("claude")
 }
 
+/// Endpoint capability table discovered from Copilot's /models catalog and
+/// injected into provider preferences as `model_endpoints` (upstream model id
+/// -> supported endpoint list). A missing table or model means "unknown":
+/// callers must keep the legacy routing in that case.
+fn copilot_model_endpoints<'a>(provider: &'a Provider, model: &str) -> Option<&'a [Value]> {
+    provider
+        .preferences
+        .get("model_endpoints")?
+        .get(model)?
+        .as_array()
+        .map(Vec::as_slice)
+}
+
+/// Catalog values may carry a transport prefix (e.g. "ws:/responses"); compare
+/// by the endpoint path alone.
+fn copilot_endpoints_include(endpoints: &[Value], path: &str) -> bool {
+    endpoints.iter().filter_map(Value::as_str).any(|entry| {
+        entry
+            .rsplit(':')
+            .next()
+            .unwrap_or(entry)
+            .eq_ignore_ascii_case(path)
+    })
+}
+
+/// Non-Claude models served only on /responses (gpt-5+/gpt-6 families) reject
+/// /chat/completions with `unsupported_api_for_model`, so /v1/messages traffic
+/// for them must be translated to the Responses wire instead of chat.
+fn copilot_model_requires_responses(provider: &Provider, model: &str) -> bool {
+    let Some(endpoints) = copilot_model_endpoints(provider, model) else {
+        return false;
+    };
+    copilot_endpoints_include(endpoints, "/responses")
+        && !copilot_endpoints_include(endpoints, "/chat/completions")
+}
+
+/// Models served only on /chat/completions (e.g. glm, deepseek) reject
+/// /responses; a client /v1/responses request for them falls back to the
+/// ResponsesCompat chat rewrite instead of the native passthrough.
+fn copilot_model_lacks_responses(provider: &Provider, model: &str) -> bool {
+    let Some(endpoints) = copilot_model_endpoints(provider, model) else {
+        return false;
+    };
+    !copilot_endpoints_include(endpoints, "/responses")
+        && copilot_endpoints_include(endpoints, "/chat/completions")
+}
+
+/// Copilot's Responses API lives directly under the host root (no `/v1`),
+/// tolerating a base_url that already carries a known endpoint suffix.
+fn copilot_responses_url(base: &str) -> Result<String, String> {
+    let base = base.trim().trim_end_matches('/');
+    let stripped = base
+        .strip_suffix("/responses")
+        .or_else(|| base.strip_suffix("/v1/messages"))
+        .or_else(|| base.strip_suffix("/messages"))
+        .or_else(|| base.strip_suffix("/chat/completions"))
+        .unwrap_or(base)
+        .trim_end_matches('/');
+    Ok(format!("{stripped}/responses"))
+}
+
 /// Copilot's chat/completions quirks (validated by 10router):
 /// - newer OpenAI models (gpt-5+, o1/o3/o4) require `max_completion_tokens`
 ///   instead of `max_tokens`;
@@ -8753,6 +8826,215 @@ mod tests {
             "claude",
             "https://example.com"
         ));
+    }
+
+    fn copilot_provider_with_endpoints(table: Value) -> Provider {
+        let mut provider = test_provider("copilot", "https://api.githubcopilot.com");
+        provider.preferences = std::sync::Arc::new(Map::from_iter([(
+            "model_endpoints".to_owned(),
+            table,
+        )]));
+        provider
+    }
+
+    fn messages_input() -> PreparedInput {
+        PreparedInput {
+            payload: Some(json!({
+                "model":"public-model",
+                "messages":[{"role":"user","content":"hi"}],
+                "max_tokens":32
+            })),
+            replay: None,
+            observation: SpoolObservation::default(),
+            default_model: String::new(),
+            content_type: "application/json".into(),
+        }
+    }
+
+    #[test]
+    fn copilot_messages_route_to_responses_for_responses_only_models() {
+        let provider = copilot_provider_with_endpoints(json!({
+            "gpt-6.1": ["/responses", "ws:/responses"],
+            "glm-5.2": ["/chat/completions"]
+        }));
+        let uri: Uri = "/v1/messages".parse().unwrap();
+        let prepared = build_attempt(
+            &provider,
+            "key",
+            "gpt-6.1-sol",
+            "gpt-6.1",
+            &Method::POST,
+            &uri,
+            "/v1/messages",
+            &HeaderMap::new(),
+            &messages_input(),
+            "request-a",
+        )
+        .unwrap();
+        assert_eq!(prepared.url, "https://api.githubcopilot.com/responses");
+        assert_eq!(prepared.adapter, ResponseAdapter::ResponsesToClaude);
+        let AttemptBody::Json(body) = prepared.body else {
+            panic!("responses-routed request must use JSON");
+        };
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["model"], "gpt-6.1");
+        assert!(body["input"].is_array());
+
+        // Chat-capable models keep the legacy chat conversion.
+        let prepared = build_attempt(
+            &provider,
+            "key",
+            "glm-5.2",
+            "glm-5.2",
+            &Method::POST,
+            &uri,
+            "/v1/messages",
+            &HeaderMap::new(),
+            &messages_input(),
+            "request-b",
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.url,
+            "https://api.githubcopilot.com/chat/completions"
+        );
+        assert_eq!(prepared.adapter, ResponseAdapter::ChatToClaude);
+
+        // Models missing from the table keep the legacy chat conversion.
+        let prepared = build_attempt(
+            &provider,
+            "key",
+            "deepseek-flash",
+            "deepseek-flash",
+            &Method::POST,
+            &uri,
+            "/v1/messages",
+            &HeaderMap::new(),
+            &messages_input(),
+            "request-c",
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.url,
+            "https://api.githubcopilot.com/chat/completions"
+        );
+        assert_eq!(prepared.adapter, ResponseAdapter::ChatToClaude);
+
+        // Claude models stay on the Anthropic-native shim even when the table
+        // lists other endpoints for them.
+        let provider = copilot_provider_with_endpoints(json!({
+            "claude-sonnet-4.6": ["/chat/completions", "/v1/messages"]
+        }));
+        let prepared = build_attempt(
+            &provider,
+            "key",
+            "claude-sonnet-4.6",
+            "claude-sonnet-4.6",
+            &Method::POST,
+            &uri,
+            "/v1/messages",
+            &HeaderMap::new(),
+            &messages_input(),
+            "request-d",
+        )
+        .unwrap();
+        assert_eq!(prepared.url, "https://api.githubcopilot.com/v1/messages");
+        assert_eq!(prepared.adapter, ResponseAdapter::Passthrough);
+    }
+
+    #[test]
+    fn copilot_responses_requests_fall_back_to_chat_for_chat_only_models() {
+        let provider = copilot_provider_with_endpoints(json!({
+            "glm-5.2": ["/chat/completions"],
+            "gpt-6.1": ["/responses"]
+        }));
+        let responses_input = || PreparedInput {
+            payload: Some(json!({
+                "model":"public-model",
+                "input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]
+            })),
+            replay: None,
+            observation: SpoolObservation::default(),
+            default_model: String::new(),
+            content_type: "application/json".into(),
+        };
+        let uri: Uri = "/v1/responses".parse().unwrap();
+        let prepared = build_attempt(
+            &provider,
+            "key",
+            "glm-5.2",
+            "glm-5.2",
+            &Method::POST,
+            &uri,
+            "/v1/responses",
+            &HeaderMap::new(),
+            &responses_input(),
+            "request-a",
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.downstream_protocol,
+            DownstreamProtocol::ResponsesCompat
+        );
+        assert_eq!(
+            prepared.url,
+            "https://api.githubcopilot.com/chat/completions"
+        );
+
+        // Responses-capable models keep the native passthrough.
+        let prepared = build_attempt(
+            &provider,
+            "key",
+            "gpt-6.1",
+            "gpt-6.1",
+            &Method::POST,
+            &uri,
+            "/v1/responses",
+            &HeaderMap::new(),
+            &responses_input(),
+            "request-b",
+        )
+        .unwrap();
+        assert_eq!(prepared.downstream_protocol, DownstreamProtocol::Native);
+        assert_eq!(prepared.url, "https://api.githubcopilot.com/responses");
+
+        // Without a table the native passthrough is preserved.
+        let provider = test_provider("copilot", "https://api.githubcopilot.com");
+        let prepared = build_attempt(
+            &provider,
+            "key",
+            "glm-5.2",
+            "glm-5.2",
+            &Method::POST,
+            &uri,
+            "/v1/responses",
+            &HeaderMap::new(),
+            &responses_input(),
+            "request-c",
+        )
+        .unwrap();
+        assert_eq!(prepared.downstream_protocol, DownstreamProtocol::Native);
+        assert_eq!(prepared.url, "https://api.githubcopilot.com/responses");
+    }
+
+    #[test]
+    fn copilot_responses_url_strips_known_suffixes() {
+        assert_eq!(
+            copilot_responses_url("https://api.githubcopilot.com").unwrap(),
+            "https://api.githubcopilot.com/responses"
+        );
+        assert_eq!(
+            copilot_responses_url("https://api.githubcopilot.com/responses").unwrap(),
+            "https://api.githubcopilot.com/responses"
+        );
+        assert_eq!(
+            copilot_responses_url("https://api.githubcopilot.com/chat/completions").unwrap(),
+            "https://api.githubcopilot.com/responses"
+        );
+        assert_eq!(
+            copilot_responses_url("https://api.githubcopilot.com/v1/messages").unwrap(),
+            "https://api.githubcopilot.com/responses"
+        );
     }
 
     #[test]
