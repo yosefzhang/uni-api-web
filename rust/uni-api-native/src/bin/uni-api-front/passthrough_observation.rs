@@ -199,10 +199,12 @@ impl Observer {
     }
     fn outcome(&self) -> StreamOutcome {
         let success = self.ended && self.terminal && !self.failed;
+        let input = self.usage.input.unwrap_or(0);
+        let output = self.usage.output.unwrap_or(0);
         StreamOutcome {
-            // Existing passthrough billing used no parsed usage. Only facts
-            // adopt these observations; keep billing behavior unchanged.
-            usage: (0, 0, 0),
+            // Observed usage feeds request stats so streamed passthrough
+            // requests record real token counts instead of zeros.
+            usage: (input, output, input.saturating_add(output)),
             fact_usage: self.usage.clone(),
             first_output_ms: self.first_output_ms,
             response_created_ms: self.response_created_ms,
@@ -276,6 +278,7 @@ mod tests {
         assert_eq!(&bytes[..], wire);
         let observed = outcome.await.unwrap();
         assert!(observed.success);
+        assert_eq!(observed.usage, (100, 2, 102));
         assert_eq!(
             (observed.fact_usage.input, observed.fact_usage.cache_read),
             (Some(100), Some(60))
@@ -292,7 +295,7 @@ mod tests {
         o.ended = true;
         let result = o.outcome();
         assert!(result.success && result.observational_only);
-        assert_eq!(result.usage, (0, 0, 0));
+        assert_eq!(result.usage, (16, 3, 19));
         assert_eq!(
             (result.fact_usage.input, result.fact_usage.output),
             (Some(16), Some(3))
