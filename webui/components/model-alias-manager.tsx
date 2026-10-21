@@ -86,6 +86,8 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
   const [config, setConfig] = useState<any>({})
   const [providersMeta, setProvidersMeta] = useState<ProviderMeta[]>([])
   const [rows, setRows] = useState<AliasRow[]>([])
+  // 解析不可靠的渠道（存在无法解析的 model 项），保存时原样保留、页面只读
+  const [unparsedProviders, setUnparsedProviders] = useState<Set<number>>(new Set())
   const [orderOverrides, setOrderOverrides] = useState<Record<string, string[]>>({})
   const [selectedKeyValue, setSelectedKeyValue] = useState<string>("")
   const nextIdRef = useRef(1)
@@ -117,34 +119,64 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
       setConfig(parsed)
       setProvidersMeta(providersData.providers || [])
       const expanded: AliasRow[] = []
+      const unparsed = new Set<number>()
       const providers = Array.isArray(parsed?.providers) ? parsed.providers : []
       providers.forEach((p: any, pi: number) => {
         const name = String(p?.provider ?? "")
-        const model = Array.isArray(p?.model) ? p.model : []
+        if (p?.model != null && !Array.isArray(p.model)) {
+          console.warn(`[model-alias] 渠道 ${name} 的 model 不是数组，已标记为只读`, p.model)
+          unparsed.add(pi)
+          return
+        }
+        const model: any[] = Array.isArray(p?.model) ? p.model : []
+        let failed = false
         model.forEach((item: any, mi: number) => {
           if (typeof item === "string") {
+            if (!item) {
+              failed = true
+              return
+            }
             expanded.push({ id: nextId(), alias: item, upstream: item, provider: name, providerIndex: pi, itemIndex: mi, isPlain: true })
-          } else if (item && typeof item === "object") {
-            const entry = Object.entries(item)[0]
-            if (!entry) return
-            expanded.push({
-              id: nextId(),
-              alias: entry[1] == null ? "" : String(entry[1]),
-              upstream: String(entry[0]),
-              provider: name,
-              providerIndex: pi,
-              itemIndex: mi,
-              isPlain: false,
-            })
+            return
           }
+          if (!item || typeof item !== "object" || Array.isArray(item)) {
+            console.warn(`[model-alias] 渠道 ${name} 第 ${mi + 1} 项格式无法识别，已标记为只读`, item)
+            failed = true
+            return
+          }
+          const keys = Object.keys(item)
+          if (keys.length !== 1) {
+            console.warn(`[model-alias] 渠道 ${name} 第 ${mi + 1} 项含多个键，已标记为只读`, item)
+            failed = true
+            return
+          }
+          const upstream = keys[0]
+          const aliasValue = item[upstream]
+          if (!upstream || (aliasValue != null && typeof aliasValue !== "string" && typeof aliasValue !== "number")) {
+            console.warn(`[model-alias] 渠道 ${name} 第 ${mi + 1} 项无法解析，已标记为只读`, item)
+            failed = true
+            return
+          }
+          expanded.push({
+            id: nextId(),
+            alias: aliasValue == null ? "" : String(aliasValue),
+            upstream,
+            provider: name,
+            providerIndex: pi,
+            itemIndex: mi,
+            isPlain: false,
+          })
         })
+        if (failed) unparsed.add(pi)
       })
       setRows(expanded)
+      setUnparsedProviders(unparsed)
       setOrderOverrides({})
     } catch (e: any) {
       toast({ title: "加载失败", description: e.message || "无法加载配置", variant: "destructive" })
       setConfig({})
       setRows([])
+      setUnparsedProviders(new Set())
     } finally {
       setLoading(false)
     }
@@ -369,11 +401,13 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
         }
       }
       for (let pi = 0; pi < (copy.providers?.length || 0); pi++) {
+        // 解析不可靠的渠道原样保留，避免把 model 写成空数组清空模型列表
+        if (unparsedProviders.has(pi)) continue
         const list = (byProvider.get(pi) || []).slice().sort((a, b) => a.itemIndex - b.itemIndex)
         copy.providers[pi].model = rowsToModel(list.map((r) => ({ upstream: r.upstream, alias: r.isPlain ? "" : r.alias })))
       }
       // 更新目标 key 的 model 规则（仅可编辑 key）
-      if (keyEditable && selectedKeyIndex >= 0) {
+      if (keyEditable && selectedKeyIndex >= 0 && copy.api_keys?.[selectedKeyIndex]) {
         const rules: string[] = []
         for (const alias of sortedAliases) {
           const groupRows = groups.get(alias) || []
@@ -478,6 +512,11 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
               该 Key 含自定义路由规则（通配/子 Key/权重），优先级列为只读，请改用 YAML 编辑。
             </p>
           )}
+          {unparsedProviders.size > 0 && (
+            <p className="text-sm text-muted-foreground">
+              有 {unparsedProviders.size} 个渠道的模型配置无法解析，已标记为只读，保存时原样保留。
+            </p>
+          )}
           {duplicateKeys.size > 0 && (
             <p className="text-sm text-red-600 dark:text-red-400">
               存在 {duplicateKeys.size} 组同渠道同别名重复（运行时后写覆盖前者），已禁止保存，请先修正标红行。
@@ -503,6 +542,7 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
                 {sortedAliases.map((alias) => {
                   const groupRows = sortGroup(alias, groups.get(alias) || [])
                   const groupDup = groupRows.some(isDuplicate)
+                  const groupHasUnparsed = groupRows.some((r) => unparsedProviders.has(r.providerIndex))
                   return (
                     <TableRow key={alias} className={groupDup ? "bg-red-50 dark:bg-red-900/20" : undefined}>
                       <TableCell
@@ -522,6 +562,9 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
                               {providers[row.providerIndex]?.enabled === false && (
                                 <Badge variant="outline">已停用</Badge>
                               )}
+                              {unparsedProviders.has(row.providerIndex) && (
+                                <Badge variant="outline">只读</Badge>
+                              )}
                               <span className="text-muted-foreground">/</span>
                               <span className="font-mono text-sm">{row.upstream}</span>
                               {row.isPlain && <span className="text-xs text-muted-foreground">(同名直通)</span>}
@@ -534,7 +577,7 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
                         <div className="flex flex-col items-end">
                           {groupRows.map((row, index) => (
                             <div key={row.id} className="flex h-9 items-center justify-end gap-1">
-                              {keyEditable && groupRows.length > 1 && (
+                              {keyEditable && groupRows.length > 1 && !groupHasUnparsed && (
                                 <>
                                   <Button variant="ghost" size="icon" className="h-6 w-6" disabled={index === 0} onClick={() => handleMove(alias, index, -1)}>
                                     <ArrowUp className="h-3.5 w-3.5" />
@@ -544,10 +587,16 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
                                   </Button>
                                 </>
                               )}
-                              <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => openEdit(row)}>
+                              <Button variant="ghost" size="icon" className="h-7 w-7" disabled={groupHasUnparsed} onClick={() => openEdit(row)}>
                                 <Pencil className="h-3.5 w-3.5" />
                               </Button>
-                              <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => handleDelete(row)}>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7"
+                                disabled={unparsedProviders.has(row.providerIndex)}
+                                onClick={() => handleDelete(row)}
+                              >
                                 <Trash2 className="h-3.5 w-3.5 text-red-500" />
                               </Button>
                             </div>
@@ -623,12 +672,15 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
                           <SelectValue placeholder="选择供应商" />
                         </SelectTrigger>
                         <SelectContent>
-                          {providers.map((p, i) => (
-                            <SelectItem key={i} value={String(p?.provider ?? "")} disabled={p?.enabled === false}>
-                              {String(p?.provider ?? "")}
-                              {p?.enabled === false ? "（已停用）" : ""}
-                            </SelectItem>
-                          ))}
+                          {providers.map((p, i) => {
+                            const readonly = unparsedProviders.has(i)
+                            return (
+                              <SelectItem key={i} value={String(p?.provider ?? "")} disabled={p?.enabled === false || readonly}>
+                                {String(p?.provider ?? "")}
+                                {p?.enabled === false ? "（已停用）" : readonly ? "（只读）" : ""}
+                              </SelectItem>
+                            )
+                          })}
                         </SelectContent>
                       </Select>
                       <Select
