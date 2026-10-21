@@ -7,7 +7,7 @@ import { useState, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { Settings, BarChart3, FileEdit, Menu, Zap, SlidersHorizontal, Database, ScrollText } from "lucide-react"
+import { Settings, BarChart3, FileEdit, Menu, Zap, SlidersHorizontal, Database, ScrollText, Layers } from "lucide-react"
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet"
 import { ApiKeyModal } from "@/components/api-key-modal"
 import { ConfigEditor } from "@/components/config-editor"
@@ -19,9 +19,10 @@ import { useToast } from "@/hooks/use-toast"
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card"
 import { Separator } from "@/components/ui/separator"
 import { ChannelTester } from "@/components/channel-tester"
+import { ModelAliasManager } from "@/components/model-alias-manager"
 
 export default function HomePage() {
-  const [currentPage, setCurrentPage] = useState<"stats" | "logs" | "config" | "online-config" | "model-context" | "test">("stats")
+  const [currentPage, setCurrentPage] = useState<"stats" | "logs" | "config" | "online-config" | "model-context" | "model-alias" | "test">("stats")
   const [showApiKeyModal, setShowApiKeyModal] = useState(false)
   const [apiKey, setApiKey] = useState<string>("")
   const [userRole, setUserRole] = useState<string>("")
@@ -293,6 +294,18 @@ export default function HomePage() {
                 </Button>
               )}
 
+              {/* Model Alias Manager Button (Admin Only) */}
+              {canAccessConfig && (
+                <Button
+                  variant={currentPage === "model-alias" ? "secondary" : "ghost"}
+                  onClick={() => setCurrentPage("model-alias")}
+                  size="sm"
+                >
+                  <Layers className="w-4 h-4 mr-2" />
+                  模型别名
+                </Button>
+              )}
+
               {/* Model Context Config Button (Admin Only) */}
               {canAccessConfig && (
                 <Button
@@ -383,6 +396,16 @@ export default function HomePage() {
                         )}
                         {canAccessConfig && (
                           <Button
+                            variant={currentPage === "model-alias" ? "secondary" : "ghost"}
+                            onClick={() => { setCurrentPage("model-alias"); setMobileMenuOpen(false); }}
+                            className="w-full justify-start"
+                          >
+                            <Layers className="w-4 h-4 mr-2" />
+                            模型别名
+                          </Button>
+                        )}
+                        {canAccessConfig && (
+                          <Button
                             variant={currentPage === "model-context" ? "secondary" : "ghost"}
                             onClick={() => { setCurrentPage("model-context"); setMobileMenuOpen(false); }}
                             className="w-full justify-start"
@@ -436,6 +459,16 @@ export default function HomePage() {
               <Zap className="mx-auto h-10 w-10 text-yellow-500 mb-3"/>
               <p className="font-medium text-yellow-700 dark:text-yellow-400">访问受限</p>
               <p className="text-sm text-muted-foreground mt-1">您需要管理员权限才能访问此在线配置功能。</p>
+            </CardContent>
+          </Card>
+        )}
+        {currentPage === "model-alias" && canAccessConfig && <ModelAliasManager apiKey={apiKey} />}
+        {currentPage === "model-alias" && !canAccessConfig && (
+          <Card className="border-dashed border-yellow-500 bg-yellow-50 dark:bg-yellow-900/20">
+            <CardContent className="p-6 text-center">
+              <Zap className="mx-auto h-10 w-10 text-yellow-500 mb-3"/>
+              <p className="font-medium text-yellow-700 dark:text-yellow-400">访问受限</p>
+              <p className="text-sm text-muted-foreground mt-1">您需要管理员权限才能访问此模型别名管理功能。</p>
             </CardContent>
           </Card>
         )}
