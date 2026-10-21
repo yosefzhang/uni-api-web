@@ -4994,6 +4994,12 @@ fn chat_to_claude(input: &Value, original_model: &str) -> Result<Value, String> 
             };
             output.insert("service_tier".into(), Value::String(tier.into()));
         }
+        // Anthropic effort/structured-output controls ride in output_config
+        // (e.g. {"effort":"medium"}); forward the object form like the native
+        // /v1/messages passthrough so upstream can honor or reject it.
+        if let Some(output_config) = root.get("output_config").filter(|value| value.is_object()) {
+            output.insert("output_config".into(), output_config.clone());
+        }
     }
     Ok(output)
 }
@@ -8432,6 +8438,25 @@ mod tests {
             decode_gemini_thought_signature(call_id).as_deref(),
             Some("tool-signature")
         );
+    }
+
+    #[test]
+    fn claude_output_config_is_forwarded_in_object_form_only() {
+        let input = json!({
+            "messages":[{"role":"user","content":"hi"}],
+            "output_config":{"effort":"max"}
+        });
+        let claude = chat_to_claude(&input, "claude-haiku-5.5").unwrap();
+        assert_eq!(claude["output_config"]["effort"], "max");
+
+        // Non-object output_config is dropped instead of forwarding a payload
+        // the upstream would reject with a type error.
+        let input = json!({
+            "messages":[{"role":"user","content":"hi"}],
+            "output_config":"not-an-object"
+        });
+        let claude = chat_to_claude(&input, "claude-haiku-5.5").unwrap();
+        assert!(claude.get("output_config").is_none());
     }
 
     #[test]
