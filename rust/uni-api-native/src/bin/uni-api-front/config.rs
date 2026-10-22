@@ -351,7 +351,9 @@ fn apply_provider_discovery(
     needs_models: bool,
     needs_endpoints: bool,
 ) {
-    let object = provider.as_object_mut().expect("provider configuration object");
+    let object = provider
+        .as_object_mut()
+        .expect("provider configuration object");
     if needs_models && !entry.models.is_empty() {
         object.insert(
             "model".into(),
@@ -1426,7 +1428,10 @@ mod tests {
         );
         assert_eq!(
             table.get("claude-opus-4.6"),
-            Some(&vec!["/chat/completions".to_owned(), "/v1/messages".to_owned()])
+            Some(&vec![
+                "/chat/completions".to_owned(),
+                "/v1/messages".to_owned()
+            ])
         );
         // Disabled or endpoint-less entries carry no routing information.
         assert!(!table.contains_key("claude-hidden"));
