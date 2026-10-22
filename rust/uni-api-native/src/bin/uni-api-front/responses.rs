@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::pin::Pin;
@@ -28,6 +28,7 @@ use crate::idempotency;
 use crate::proxy::{filtered_response_headers, json_error, AppState};
 use crate::responses_item_ids::{event_item_id_needs_normalization, ResponsesItemIdNormalizer};
 use crate::responses_native::NativeRoute;
+use crate::responses_sse_filter::EmptyReasoningItemFilter;
 
 const CONTROL_HEADER: &str = "x-uni-api-rust-control-token";
 const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
@@ -2566,45 +2567,7 @@ struct ProcessedEvent {
 
 /// 丢弃 summary 为空的 reasoning item 事件。
 ///
-/// Copilot 的 `/responses` 会返回只承载加密 blob、summary 为空的 reasoning
-/// item，客户端无法使用这类 item。命中 `output_item.added` 时跳过该事件并
-/// 记录 `output_index`，同 index 后续的 `output_item.done` 也一并丢弃。
-#[derive(Default)]
-struct EmptyReasoningItemFilter {
-    dropped_output_indexes: HashSet<u64>,
-}
-
-impl EmptyReasoningItemFilter {
-    fn should_drop(&mut self, event_type: &str, payload: &Value) -> bool {
-        match event_type {
-            "response.output_item.added" => {
-                let Some(item) = payload.get("item") else {
-                    return false;
-                };
-                if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-                    return false;
-                }
-                let summary_empty = item
-                    .get("summary")
-                    .is_none_or(|summary| summary.as_array().is_some_and(Vec::is_empty));
-                if !summary_empty {
-                    return false;
-                }
-                let Some(output_index) = payload.get("output_index").and_then(Value::as_u64) else {
-                    return false;
-                };
-                self.dropped_output_indexes.insert(output_index);
-                true
-            }
-            "response.output_item.done" => payload
-                .get("output_index")
-                .and_then(Value::as_u64)
-                .is_some_and(|index| self.dropped_output_indexes.remove(&index)),
-            _ => false,
-        }
-    }
-}
-
+/// 实现在 `responses_sse_filter`，透传路径与本模块共用。
 struct ResponsesProcessor {
     commit_policy: String,
     normalizer: Option<ResponsesItemIdNormalizer>,

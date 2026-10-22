@@ -2,6 +2,7 @@
 use crate::fact_usage::FactUsage;
 use crate::provider_stream::{StreamOutcome, Translation};
 use axum::{body::Body, http::Response};
+use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::io;
@@ -16,6 +17,33 @@ pub(crate) fn observe(
     control_routing: bool,
     idle: Option<Duration>,
 ) -> Translation {
+    observe_with(response, started, control_routing, idle, None)
+}
+
+/// `observe` plus an incremental SSE rewriter, used for raw Responses
+/// passthrough to providers whose wire format needs fixing up (Copilot).
+pub(crate) fn observe_filtered(
+    response: reqwest::Response,
+    started: Instant,
+    control_routing: bool,
+    idle: Option<Duration>,
+) -> Translation {
+    observe_with(
+        response,
+        started,
+        control_routing,
+        idle,
+        Some(crate::responses_sse_filter::SseRewriter::new()),
+    )
+}
+
+fn observe_with(
+    response: reqwest::Response,
+    started: Instant,
+    control_routing: bool,
+    idle: Option<Duration>,
+    rewriter: Option<crate::responses_sse_filter::SseRewriter>,
+) -> Translation {
     let status = response.status();
     let headers = crate::proxy::filtered_response_headers(response.headers());
     let (tx, rx) = oneshot::channel();
@@ -24,36 +52,55 @@ pub(crate) fn observe(
     observer.observational_only = !control_routing;
     observer.sender = Some(tx);
     let body = futures_util::stream::unfold(
-        (response.bytes_stream(), observer),
-        move |(mut upstream, mut observer)| async move {
-            let next = if let Some(idle) = idle {
-                match tokio::time::timeout(idle, upstream.next()).await {
-                    Ok(next) => next.map(|chunk| chunk.map_err(io::Error::other)),
-                    Err(_) => Some(Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "upstream stream idle timeout exceeded",
-                    ))),
-                }
-            } else {
-                upstream
-                    .next()
-                    .await
-                    .map(|chunk| chunk.map_err(io::Error::other))
-            };
-            match next {
-                Some(result) => {
-                    match &result {
-                        Ok(bytes) => observer.feed(bytes),
-                        Err(_) => {
-                            observer.failed = true;
-                            observer.ended = true;
+        (response.bytes_stream(), observer, rewriter),
+        move |(mut upstream, mut observer, mut rewriter)| async move {
+            loop {
+                let next = if let Some(idle) = idle {
+                    match tokio::time::timeout(idle, upstream.next()).await {
+                        Ok(next) => next.map(|chunk| chunk.map_err(io::Error::other)),
+                        Err(_) => Some(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "upstream stream idle timeout exceeded",
+                        ))),
+                    }
+                } else {
+                    upstream
+                        .next()
+                        .await
+                        .map(|chunk| chunk.map_err(io::Error::other))
+                };
+                match next {
+                    Some(Ok(bytes)) => {
+                        // Observation always sees the raw upstream bytes.
+                        observer.feed(&bytes);
+                        match rewriter.as_mut().map(|rewriter| rewriter.push(&bytes)) {
+                            None => return Some((Ok(bytes), (upstream, observer, rewriter))),
+                            Some(rewritten) if rewritten.is_empty() => continue,
+                            Some(rewritten) => {
+                                return Some((
+                                    Ok(Bytes::from(rewritten)),
+                                    (upstream, observer, rewriter),
+                                ))
+                            }
                         }
                     }
-                    Some((result, (upstream, observer)))
-                }
-                None => {
-                    observer.ended = true;
-                    None
+                    Some(Err(error)) => {
+                        observer.failed = true;
+                        observer.ended = true;
+                        return Some((Err(error), (upstream, observer, rewriter)));
+                    }
+                    None => {
+                        observer.ended = true;
+                        let tail = rewriter
+                            .as_mut()
+                            .map(|rewriter| rewriter.finish())
+                            .unwrap_or_default();
+                        rewriter = None;
+                        if tail.is_empty() {
+                            return None;
+                        }
+                        return Some((Ok(Bytes::from(tail)), (upstream, observer, rewriter)));
+                    }
                 }
             }
         },

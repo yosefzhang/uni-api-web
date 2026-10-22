@@ -27,6 +27,7 @@ mod responses;
 mod responses_heartbeat;
 mod responses_item_ids;
 mod responses_native;
+mod responses_sse_filter;
 mod status;
 mod telemetry;
 

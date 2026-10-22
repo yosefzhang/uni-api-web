@@ -3201,6 +3201,11 @@ async fn send_attempt(
     hedge_trigger: Option<&HedgeTrigger<usize>>,
 ) -> Result<AttemptSuccess, AttemptFailure> {
     let debug_enabled = upstream_debug_enabled(incoming_headers);
+    // Copilot is the only engine whose raw Responses wire needs fixing up.
+    // `/v1/responses/compact` is excluded: its output carries the encrypted
+    // reasoning payload clients feed back, so nothing may be dropped there.
+    let copilot_responses =
+        endpoint == "/v1/responses" && provider.engine.trim().eq_ignore_ascii_case("copilot");
     let upstream_request_debug =
         debug_enabled.then(|| BASE64.encode(upstream_request_debug_value(&prepared).to_string()));
     let proxy = provider.preferences.get("proxy").and_then(Value::as_str);
@@ -3466,12 +3471,23 @@ async fn send_attempt(
                     .reset_route_failure(provider, &prepared.original_model)
                     .await;
             }
-            let mut translation = crate::passthrough_observation::observe(
-                response,
-                send_started,
-                guarded_chat,
-                positive_duration(timeouts.idle),
-            );
+            let mut translation = if copilot_responses {
+                // Copilot's Responses wire needs empty reasoning items dropped
+                // and blob item ids rewritten before clients see them.
+                crate::passthrough_observation::observe_filtered(
+                    response,
+                    send_started,
+                    guarded_chat,
+                    positive_duration(timeouts.idle),
+                )
+            } else {
+                crate::passthrough_observation::observe(
+                    response,
+                    send_started,
+                    guarded_chat,
+                    positive_duration(timeouts.idle),
+                )
+            };
             if guarded_chat {
                 translation = crate::chat_stream::preflight(
                     translation,
@@ -3625,7 +3641,7 @@ async fn send_attempt(
                 upstream_url: prepared.url.clone(),
                 response: None,
             })?;
-        let parsed = serde_json::from_slice::<Value>(&body).ok();
+        let mut parsed = serde_json::from_slice::<Value>(&body).ok();
         let fact_usage =
             crate::fact_usage::FactUsage::from_usage(parsed.as_ref().and_then(|v| v.get("usage")));
         let usage = parsed.as_ref().map(usage).unwrap_or((0, 0, 0));
@@ -3639,6 +3655,16 @@ async fn send_attempt(
                 .to_string(),
             )
         });
+        let body = match parsed.as_mut() {
+            Some(payload) if copilot_responses => {
+                if crate::responses_sse_filter::rewrite_response_payload(payload) {
+                    serde_json::to_vec(payload).map(Bytes::from).unwrap_or(body)
+                } else {
+                    body
+                }
+            }
+            _ => body,
+        };
         let mut output = Response::new(Body::from(body));
         *output.status_mut() = status;
         *output.headers_mut() = headers;
@@ -8855,10 +8881,8 @@ mod tests {
 
     fn copilot_provider_with_endpoints(table: Value) -> Provider {
         let mut provider = test_provider("copilot", "https://api.githubcopilot.com");
-        provider.preferences = std::sync::Arc::new(Map::from_iter([(
-            "model_endpoints".to_owned(),
-            table,
-        )]));
+        provider.preferences =
+            std::sync::Arc::new(Map::from_iter([("model_endpoints".to_owned(), table)]));
         provider
     }
 
