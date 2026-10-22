@@ -14,7 +14,8 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
-import { RefreshCw, Plus, Server, KeyRound, SlidersHorizontal, Pencil, Trash2 } from "lucide-react"
+import { RefreshCw, Plus, Server, KeyRound, SlidersHorizontal, Pencil, Trash2, ArrowUp, ArrowDown } from "lucide-react"
+import { Input } from "@/components/ui/input"
 import {
   Table,
   TableBody,
@@ -40,16 +41,18 @@ interface OnlineConfigProps {
 }
 
 const MODEL_COLLAPSE_LIMIT = 3
+// 模型列表在渠道行内以多行多列展示，每行 4 个映射
+const MODEL_COLUMNS = 4
 
 interface ModelListCellProps {
   model?: any[]
   expanded: boolean
 }
 
-// model 列表单元格：两列无标题表格，每格展示 "渠道模型ID --> 映射模型ID"
+// model 列表单元格：多行多列表格，每格展示 "渠道模型ID --> 映射模型ID"
 function ModelListCell({ model, expanded }: ModelListCellProps) {
   const rows = modelToRows(model)
-  const COLUMNS = 2
+  const COLUMNS = MODEL_COLUMNS
   const maxCells = MODEL_COLLAPSE_LIMIT * COLUMNS
   const hasRows = rows.length > 0
   const showAll = expanded || rows.length <= maxCells
@@ -59,32 +62,63 @@ function ModelListCell({ model, expanded }: ModelListCellProps) {
     groups.push(visible.slice(i, i + COLUMNS))
   }
   if (!hasRows) {
-    return (
-      <div className="min-h-[88px]">
-        <span className="text-xs text-muted-foreground">（自动获取全部模型）</span>
-      </div>
-    )
+    return <span className="text-xs text-muted-foreground">（自动获取全部模型）</span>
   }
   return (
-    <div className="min-h-[88px]">
-      <Table>
-        <TableBody>
-          {groups.map((group, rowIdx) => (
-            <TableRow key={rowIdx} className="hover:bg-transparent">
-              {group.map((r, colIdx) => (
+    <Table className="w-full table-fixed">
+      <TableBody>
+        {groups.map((group, rowIdx) => (
+          <TableRow key={rowIdx} className="hover:bg-transparent">
+            {Array.from({ length: COLUMNS }).map((_, colIdx) => {
+              const r = group[colIdx]
+              return (
                 <TableCell
                   key={colIdx}
                   className="px-3 py-1.5 text-xs whitespace-nowrap overflow-hidden text-ellipsis align-top"
-                  title={r.alias ? `${r.upstream} --> ${r.alias}` : r.upstream}
+                  title={r ? (r.alias ? `${r.upstream} --> ${r.alias}` : r.upstream) : undefined}
                 >
-                  {r.alias ? `${r.upstream} --> ${r.alias}` : r.upstream}
+                  {r ? (r.alias ? `${r.upstream} --> ${r.alias}` : r.upstream) : ""}
                 </TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </div>
+              )
+            })}
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  )
+}
+
+// 渠道序号输入框：序号即数组位置，回车/失焦后提交
+function PositionInput({ value, max, onCommit }: { value: number; max: number; onCommit: (pos: number) => void }) {
+  const [draft, setDraft] = useState(String(value))
+  useEffect(() => setDraft(String(value)), [value])
+  const commit = () => {
+    const parsed = Number.parseInt(draft, 10)
+    if (!Number.isFinite(parsed)) {
+      setDraft(String(value))
+      return
+    }
+    const clamped = Math.min(Math.max(parsed, 1), max)
+    setDraft(String(clamped))
+    if (clamped !== value) onCommit(clamped)
+  }
+  return (
+    <Input
+      type="number"
+      min={1}
+      max={max}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault()
+          commit()
+        }
+      }}
+      className="h-7 w-14 px-1 text-center text-xs"
+      aria-label="渠道序号"
+    />
   )
 }
 
@@ -170,6 +204,16 @@ export function OnlineConfig({ apiKey }: OnlineConfigProps) {
   }
   const handleProviderDelete = (index: number) => {
     const list = providers.filter((_, i) => i !== index)
+    const next = { ...(config || {}), providers: list }
+    setConfig(next)
+    void persist(next)
+  }
+  // 渠道序号 = providers 数组下标 + 1，移动后重排数组并保存（默认优先级随数组顺序生效）
+  const moveProvider = (from: number, to: number) => {
+    if (from === to || to < 0 || to >= providers.length) return
+    const list = providers.slice()
+    const [item] = list.splice(from, 1)
+    list.splice(to, 0, item)
     const next = { ...(config || {}), providers: list }
     setConfig(next)
     void persist(next)
@@ -368,7 +412,10 @@ export function OnlineConfig({ apiKey }: OnlineConfigProps) {
           </div>
 
           {/* ---------- Providers Tab ---------- */}
-          <TabsContent value="providers" className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-2 items-start">
+          <TabsContent value="providers" className="space-y-3">
+            <p className="-mb-1 text-xs text-muted-foreground">
+              序号即渠道默认优先级（越小越优先），修改后自动保存并热重载；若 API Key 使用「渠道/模型」规则，则以规则顺序为准。
+            </p>
             {providers.length === 0 ? (
               <Card className="border-dashed">
                 <CardContent className="p-8 text-center text-muted-foreground">
@@ -376,58 +423,109 @@ export function OnlineConfig({ apiKey }: OnlineConfigProps) {
                 </CardContent>
               </Card>
             ) : (
-              providers.map((p, i) => {
-                const providerRows = modelToRows(p.model)
-                const providerMaxCells = MODEL_COLLAPSE_LIMIT * 2
-                const providerExpanded = !!expandedProviders[i]
-                const providerCanExpand = providerRows.length > providerMaxCells
-                return (
-                  <Card key={i} className={`border ${p.enabled === false ? "opacity-60" : ""}`}>
-                    <CardContent className="p-0">
-                      <div className="flex items-center justify-between gap-3 px-4 py-3 border-b">
-                        <div className="flex items-center gap-2 flex-wrap min-w-0">
-                          <Badge variant="outline">#{i + 1}</Badge>
-                          <span className="font-medium">{p.provider || "未命名"}</span>
-                          {p.engine && <Badge variant="secondary">{p.engine}</Badge>}
-                          {p.enabled === false && <Badge variant="destructive">已禁用</Badge>}
-                        </div>
-                        <div className="flex gap-1 shrink-0 items-center">
-                          {providerCanExpand && (
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="sm"
-                              className="h-8 px-2 text-xs text-muted-foreground"
-                              onClick={() => setExpandedProviders((prev) => ({ ...prev, [i]: !prev[i] }))}
-                            >
-                              {providerExpanded ? `收起（共 ${providerRows.length} 项）` : `展开（共 ${providerRows.length} 项）`}
-                            </Button>
-                          )}
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => openEditProvider(p, i)}>
-                                <Pencil className="h-4 w-4" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent>编辑</TooltipContent>
-                          </Tooltip>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button variant="ghost" size="icon" className="h-8 w-8 text-destructive hover:text-destructive" onClick={() => handleProviderDelete(i)}>
-                                <Trash2 className="h-4 w-4" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent>删除</TooltipContent>
-                          </Tooltip>
-                        </div>
-                      </div>
-                      <div className="px-4 py-3">
-                        <ModelListCell model={p.model} expanded={providerExpanded} />
-                      </div>
-                    </CardContent>
-                  </Card>
-                )
-              })
+              <Card className="border">
+                <CardContent className="p-0">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="w-[96px] whitespace-nowrap">序号</TableHead>
+                        <TableHead className="whitespace-nowrap">渠道名</TableHead>
+                        <TableHead className="w-full whitespace-nowrap">模型列表</TableHead>
+                        <TableHead className="w-[200px] text-right whitespace-nowrap">操作</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {providers.map((p, i) => {
+                        const providerRows = modelToRows(p.model)
+                        const providerMaxCells = MODEL_COLLAPSE_LIMIT * MODEL_COLUMNS
+                        const providerExpanded = !!expandedProviders[i]
+                        const providerCanExpand = providerRows.length > providerMaxCells
+                        return (
+                          <TableRow key={i} className={p.enabled === false ? "opacity-60" : undefined}>
+                            <TableCell className="align-top">
+                              <div className="flex items-center gap-0.5">
+                                <PositionInput
+                                  value={i + 1}
+                                  max={providers.length}
+                                  onCommit={(pos) => moveProvider(i, pos - 1)}
+                                />
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      className="h-7 w-6"
+                                      disabled={i === 0}
+                                      onClick={() => moveProvider(i, i - 1)}
+                                    >
+                                      <ArrowUp className="h-3.5 w-3.5" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>上移</TooltipContent>
+                                </Tooltip>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      className="h-7 w-6"
+                                      disabled={i === providers.length - 1}
+                                      onClick={() => moveProvider(i, i + 1)}
+                                    >
+                                      <ArrowDown className="h-3.5 w-3.5" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>下移</TooltipContent>
+                                </Tooltip>
+                              </div>
+                            </TableCell>
+                            <TableCell className="align-top">
+                              <div className="flex items-center gap-1.5 whitespace-nowrap pt-1">
+                                <span className="font-medium whitespace-nowrap">{p.provider || "未命名"}</span>
+                                {p.enabled === false && <Badge variant="destructive">已禁用</Badge>}
+                              </div>
+                            </TableCell>
+                            <TableCell className="align-top">
+                              <ModelListCell model={p.model} expanded={providerExpanded} />
+                            </TableCell>
+                            <TableCell className="align-top">
+                              <div className="flex items-center justify-end gap-1">
+                                {providerCanExpand && (
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-8 px-2 text-xs text-muted-foreground"
+                                    onClick={() => setExpandedProviders((prev) => ({ ...prev, [i]: !prev[i] }))}
+                                  >
+                                    {providerExpanded ? `收起（共 ${providerRows.length} 项）` : `展开（共 ${providerRows.length} 项）`}
+                                  </Button>
+                                )}
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => openEditProvider(p, i)}>
+                                      <Pencil className="h-4 w-4" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>编辑</TooltipContent>
+                                </Tooltip>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button variant="ghost" size="icon" className="h-8 w-8 text-destructive hover:text-destructive" onClick={() => handleProviderDelete(i)}>
+                                      <Trash2 className="h-4 w-4" />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>删除</TooltipContent>
+                                </Tooltip>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                        )
+                      })}
+                    </TableBody>
+                  </Table>
+                </CardContent>
+              </Card>
             )}
           </TabsContent>
 

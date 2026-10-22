@@ -1,5 +1,5 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::pin::Pin;
@@ -1706,7 +1706,10 @@ async fn run_raw_committed(
             Ok(Some(Ok(chunk))) => {
                 active.stats.observe_upstream(&chunk);
                 let inspection = match active.decoder.feed(&chunk) {
-                    Ok(frames) => raw_terminal_prefix(frames, &mut active.stats),
+                    Ok(frames) => raw_terminal_prefix(
+                        drop_empty_reasoning_frames(frames, &mut active.processor),
+                        &mut active.stats,
+                    ),
                     Err(error) => Err(error),
                 };
                 match inspection {
@@ -1748,7 +1751,10 @@ async fn run_raw_committed(
             }
             Ok(None) => {
                 let inspection = match active.decoder.finish() {
-                    Ok(frames) => raw_terminal_prefix(frames, &mut active.stats),
+                    Ok(frames) => raw_terminal_prefix(
+                        drop_empty_reasoning_frames(frames, &mut active.processor),
+                        &mut active.stats,
+                    ),
                     Err(error) => Err(error),
                 };
                 match inspection {
@@ -1826,6 +1832,17 @@ async fn run_raw_committed(
             }
         }
     }
+}
+
+/// 原始透传路径在转发前丢弃空 summary 的 reasoning item 事件。
+fn drop_empty_reasoning_frames(
+    frames: Vec<SseFrame>,
+    processor: &mut ResponsesProcessor,
+) -> Vec<SseFrame> {
+    frames
+        .into_iter()
+        .filter(|frame| !processor.should_drop_raw_frame(frame))
+        .collect()
 }
 
 /// Return only the safe wire prefix before the first terminal event.
@@ -2547,9 +2564,51 @@ struct ProcessedEvent {
     terminal: Option<Terminal>,
 }
 
+/// 丢弃 summary 为空的 reasoning item 事件。
+///
+/// Copilot 的 `/responses` 会返回只承载加密 blob、summary 为空的 reasoning
+/// item，客户端无法使用这类 item。命中 `output_item.added` 时跳过该事件并
+/// 记录 `output_index`，同 index 后续的 `output_item.done` 也一并丢弃。
+#[derive(Default)]
+struct EmptyReasoningItemFilter {
+    dropped_output_indexes: HashSet<u64>,
+}
+
+impl EmptyReasoningItemFilter {
+    fn should_drop(&mut self, event_type: &str, payload: &Value) -> bool {
+        match event_type {
+            "response.output_item.added" => {
+                let Some(item) = payload.get("item") else {
+                    return false;
+                };
+                if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+                    return false;
+                }
+                let summary_empty = item
+                    .get("summary")
+                    .is_none_or(|summary| summary.as_array().is_some_and(Vec::is_empty));
+                if !summary_empty {
+                    return false;
+                }
+                let Some(output_index) = payload.get("output_index").and_then(Value::as_u64) else {
+                    return false;
+                };
+                self.dropped_output_indexes.insert(output_index);
+                true
+            }
+            "response.output_item.done" => payload
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .is_some_and(|index| self.dropped_output_indexes.remove(&index)),
+            _ => false,
+        }
+    }
+}
+
 struct ResponsesProcessor {
     commit_policy: String,
     normalizer: Option<ResponsesItemIdNormalizer>,
+    empty_reasoning_items: EmptyReasoningItemFilter,
 }
 
 impl ResponsesProcessor {
@@ -2561,7 +2620,39 @@ impl ResponsesProcessor {
         Self {
             commit_policy,
             normalizer: normalize_ids.then(ResponsesItemIdNormalizer::default),
+            empty_reasoning_items: EmptyReasoningItemFilter::default(),
         }
+    }
+
+    /// 原始透传路径的过滤入口：只解析 output_item 事件，其余帧零开销放行。
+    fn should_drop_raw_frame(&mut self, frame: &SseFrame) -> bool {
+        let raw = frame.raw();
+        if memmem::find(raw, b"output_item.added").is_none()
+            && memmem::find(raw, b"output_item.done").is_none()
+        {
+            return false;
+        }
+        let Ok(parsed) = parse_sse_frame(frame) else {
+            return false;
+        };
+        let Some(data) = parsed.data else {
+            return false;
+        };
+        let Ok(payload) = serde_json::from_str::<Value>(&data) else {
+            return false;
+        };
+        let event_type = payload
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if parsed
+            .declared_event
+            .as_deref()
+            .is_some_and(|declared| declared != event_type)
+        {
+            return false;
+        }
+        self.empty_reasoning_items.should_drop(event_type, &payload)
     }
 
     fn process(
@@ -2621,6 +2712,19 @@ impl ResponsesProcessor {
             }
         }
         validate_terminal(&event_type, &payload)?;
+
+        if self
+            .empty_reasoning_items
+            .should_drop(&event_type, &payload)
+        {
+            return Ok(ProcessedEvent {
+                wire: None,
+                event_type: Some(event_type),
+                commits: false,
+                canonical_keepalive: false,
+                terminal: None,
+            });
+        }
 
         let normalized = if let Some(normalizer) = self.normalizer.as_mut() {
             normalizer.normalize(&mut payload)?
@@ -3634,6 +3738,72 @@ mod tests {
             .unwrap();
         let second = processor.process(delta, &mut stats).unwrap().wire.unwrap();
         assert!(String::from_utf8_lossy(&second).contains("ctc_abc"));
+    }
+
+    #[test]
+    fn empty_summary_reasoning_item_events_are_dropped() {
+        let mut processor = ResponsesProcessor::new("real_output".into(), false);
+        let mut stats = StreamStats::default();
+        let mut decoder = SseDecoder::new(4096);
+        let added = decoder
+            .feed(b"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"blob\"}}\n\n")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let processed = processor.process(added, &mut stats).unwrap();
+        assert!(processed.wire.is_none());
+        assert!(!processed.commits);
+
+        let done = decoder
+            .feed(b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"encrypted_content\":\"blob\"}}\n\n")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(processor.process(done, &mut stats).unwrap().wire.is_none());
+
+        let other_done = decoder
+            .feed(b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n\n")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(processor
+            .process(other_done, &mut stats)
+            .unwrap()
+            .wire
+            .is_some());
+    }
+
+    #[test]
+    fn non_empty_reasoning_summary_item_events_are_kept() {
+        let mut processor = ResponsesProcessor::new("real_output".into(), false);
+        let mut stats = StreamStats::default();
+        let mut decoder = SseDecoder::new(4096);
+        let body = b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"thinking\"}]}}\n\n";
+        let frame = decoder.feed(body).unwrap().pop().unwrap();
+        let processed = processor.process(frame, &mut stats).unwrap();
+        assert_eq!(processed.wire.unwrap().as_ref(), body);
+    }
+
+    #[test]
+    fn raw_relay_drops_empty_reasoning_item_frames() {
+        let mut processor = ResponsesProcessor::new("real_output".into(), false);
+        let mut decoder = SseDecoder::new(4096);
+        let frames = decoder
+            .feed(
+                b"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n\
+                  event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n\
+                  event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_2\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"thinking\"}]}}\n\n\
+                  event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            )
+            .unwrap();
+        let kept = drop_empty_reasoning_frames(frames, &mut processor);
+        assert_eq!(kept.len(), 2);
+        assert!(kept[0]
+            .raw()
+            .starts_with(b"event: response.output_item.done"));
+        assert!(kept[1]
+            .raw()
+            .starts_with(b"event: response.output_text.delta"));
     }
 
     #[test]

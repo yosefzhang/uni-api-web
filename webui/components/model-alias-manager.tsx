@@ -27,12 +27,14 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
-import { ArrowDown, ArrowUp, Layers, Pencil, Plus, RefreshCw, Save, Trash2, X } from "lucide-react"
+import { ArrowDown, ArrowUp, ChevronDown, ChevronUp, Layers, Pencil, Plus, RefreshCw, Save, Trash2, X } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import { rowsToModel } from "@/components/online-config/fields"
 
 interface ModelAliasManagerProps {
   apiKey: string
+  /** 默认选中的 API Key（通常为统计页面正在查看的 key） */
+  defaultKey?: string
 }
 
 type AliasRow = {
@@ -59,6 +61,8 @@ type MappingForm = {
 }
 
 // 解析 api key 的 model 规则：
+// 与 uni-api 一致，按第一个 / 切分出渠道名，剩余部分（可再含 /）即别名，
+// 例如 OpenCode-Responses/oc/gpt-6-luna = 渠道 OpenCode-Responses + 别名 oc/gpt-6-luna
 // editable = 空/["all"] 或全部规则均为 Provider/alias 精确形式（可由页面重建）
 // 否则（通配、子 key 引用、权重对象等）只读，避免破坏原语义
 function analyzeKeyRules(rules: unknown): { editable: boolean; overrides: Record<string, string[]> } {
@@ -71,15 +75,23 @@ function analyzeKeyRules(rules: unknown): { editable: boolean; overrides: Record
   const overrides: Record<string, string[]> = {}
   for (const rule of list) {
     if (rule === "all") continue
-    const match = /^([^/]+)\/([^/*]+)$/.exec(rule)
+    const match = /^([^/]+)\/(.+)$/.exec(rule)
     if (!match) return { editable: false, overrides: {} }
     const [, provider, alias] = match
+    // 通配规则（Provider/* 等）无法由页面精确还原
+    if (alias.includes("*")) return { editable: false, overrides: {} }
     ;(overrides[alias] ||= []).push(provider)
   }
   return { editable: true, overrides }
 }
 
-export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
+// 带前缀的别名：形如「前缀/模型名」，前缀是配置别名时由「自动填充前缀」加上去的
+function hasAliasPrefix(alias: string): boolean {
+  const idx = alias.indexOf("/")
+  return idx > 0 && idx < alias.length - 1
+}
+
+export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps) {
   const { toast } = useToast()
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -90,6 +102,8 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
   const [unparsedProviders, setUnparsedProviders] = useState<Set<number>>(new Set())
   const [orderOverrides, setOrderOverrides] = useState<Record<string, string[]>>({})
   const [selectedKeyValue, setSelectedKeyValue] = useState<string>("")
+  // 带前缀（前缀/模型名）的别名默认收起
+  const [showPrefixed, setShowPrefixed] = useState(false)
   const nextIdRef = useRef(1)
 
   // 行编辑弹窗（按别名分组编辑）
@@ -190,10 +204,16 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
   const providers: any[] = Array.isArray(config?.providers) ? config.providers : []
   const apiKeys: any[] = Array.isArray(config?.api_keys) ? config.api_keys : []
 
-  // 默认选中当前登录 key，否则第一个 key
+  // 默认选中统计页正在查看的 key，否则当前登录 key，最后回退第一个 key
   const effectiveKeyValue =
     selectedKeyValue ||
-    (apiKeys.find((k) => String(k?.api) === apiKey) ? String(apiKeys.find((k) => String(k?.api) === apiKey)?.api) : apiKeys.length > 0 ? String(apiKeys[0]?.api) : "")
+    (defaultKey && apiKeys.some((k) => String(k?.api) === defaultKey)
+      ? defaultKey
+      : apiKeys.find((k) => String(k?.api) === apiKey)
+        ? String(apiKeys.find((k) => String(k?.api) === apiKey)?.api)
+        : apiKeys.length > 0
+          ? String(apiKeys[0]?.api)
+          : "")
   const selectedKeyIndex = apiKeys.findIndex((k) => String(k?.api) === effectiveKeyValue)
   const keyAnalysis = useMemo(
     () => analyzeKeyRules(selectedKeyIndex >= 0 ? apiKeys[selectedKeyIndex]?.model : undefined),
@@ -231,6 +251,16 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
   }, [orderOverrides])
 
   const sortedAliases = useMemo(() => Array.from(groups.keys()).sort((a, b) => a.localeCompare(b)), [groups])
+
+  // 带前缀的别名默认收起，可手动展开
+  const prefixedCount = useMemo(
+    () => sortedAliases.filter(hasAliasPrefix).length,
+    [sortedAliases],
+  )
+  const visibleAliases = useMemo(
+    () => (showPrefixed ? sortedAliases : sortedAliases.filter((alias) => !hasAliasPrefix(alias))),
+    [showPrefixed, sortedAliases],
+  )
 
   // ----- 重复检测：同渠道同别名 -----
   const duplicateKeys = useMemo(() => {
@@ -494,6 +524,12 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
               </Select>
             </div>
             <div className="flex-1" />
+            {prefixedCount > 0 && (
+              <Button variant="outline" size="sm" onClick={() => setShowPrefixed((v) => !v)}>
+                {showPrefixed ? <ChevronUp className="w-4 h-4 mr-2" /> : <ChevronDown className="w-4 h-4 mr-2" />}
+                {showPrefixed ? "收起前缀条目" : `展开前缀条目（${prefixedCount}）`}
+              </Button>
+            )}
             <Button variant="outline" size="sm" onClick={() => load()}>
               <RefreshCw className="w-4 h-4 mr-2" />
               重新加载
@@ -529,6 +565,10 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
         <CardContent className="p-0">
           {rows.length === 0 ? (
             <p className="p-6 text-center text-sm text-muted-foreground">暂无别名映射，点击「新增映射」创建。</p>
+          ) : visibleAliases.length === 0 ? (
+            <p className="p-6 text-center text-sm text-muted-foreground">
+              已收起 {prefixedCount} 个带前缀的模型别名，点击上方「展开前缀条目」查看。
+            </p>
           ) : (
             <Table>
               <TableHeader>
@@ -539,7 +579,7 @@ export function ModelAliasManager({ apiKey }: ModelAliasManagerProps) {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {sortedAliases.map((alias) => {
+                {visibleAliases.map((alias) => {
                   const groupRows = sortGroup(alias, groups.get(alias) || [])
                   const groupDup = groupRows.some(isDuplicate)
                   const groupHasUnparsed = groupRows.some((r) => unparsedProviders.has(r.providerIndex))

@@ -462,7 +462,7 @@ export default function HomePage() {
             </CardContent>
           </Card>
         )}
-        {currentPage === "model-alias" && canAccessConfig && <ModelAliasManager apiKey={apiKey} />}
+        {currentPage === "model-alias" && canAccessConfig && <ModelAliasManager apiKey={apiKey} defaultKey={viewingKey} />}
         {currentPage === "model-alias" && !canAccessConfig && (
           <Card className="border-dashed border-yellow-500 bg-yellow-50 dark:bg-yellow-900/20">
             <CardContent className="p-6 text-center">
