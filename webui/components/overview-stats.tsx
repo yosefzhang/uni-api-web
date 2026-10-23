@@ -4,6 +4,7 @@
 import { useState, useEffect, useMemo } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton" // Import Skeleton
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Activity, Zap, MessageSquare, Clock, Timer, BarChart3 } from "lucide-react"
 // Import helper functions from utils.ts
 import { formatNumber, formatNumberCompact, formatTime } from "@/lib/utils"
@@ -23,12 +24,22 @@ interface OverviewData {
   avgFirstResponseTime: number // Assuming this is in seconds
 }
 
+type OverviewRange = "today" | "7d" | "30d" | "all"
+
+const RANGE_OPTIONS: { value: OverviewRange; label: string }[] = [
+  { value: "today", label: "今日" },
+  { value: "7d", label: "近7天" },
+  { value: "30d", label: "近30天" },
+  { value: "all", label: "全部" },
+]
+
 // --- Component Definition ---
 
 export function OverviewStats({ apiKey }: OverviewStatsProps) {
   const [data, setData] = useState<OverviewData | null>(null)
   const [loading, setLoading] = useState(true)
   const [isMobile, setIsMobile] = useState(false)
+  const [range, setRange] = useState<OverviewRange>("all")
 
   // Effect for detecting mobile device based on window width
   useEffect(() => {
@@ -58,7 +69,7 @@ export function OverviewStats({ apiKey }: OverviewStatsProps) {
       setLoading(true) // Set loading true when fetch starts
       setData(null) // Clear previous data
       try {
-        const response = await fetch(`/api/stats/overview?apiKey=${encodeURIComponent(apiKey)}`)
+        const response = await fetch(`/api/stats/overview?apiKey=${encodeURIComponent(apiKey)}&range=${range}`)
         if (response.ok) {
           const result: OverviewData = await response.json()
           setData(result)
@@ -75,7 +86,7 @@ export function OverviewStats({ apiKey }: OverviewStatsProps) {
     }
 
     fetchOverviewStats()
-  }, [apiKey]) // Re-run effect if apiKey changes
+  }, [apiKey, range]) // Re-run effect if apiKey or range changes
 
   // Memoized calculation of stats array based on data and device type
   const stats = useMemo(() => {
@@ -150,7 +161,26 @@ export function OverviewStats({ apiKey }: OverviewStatsProps) {
   // --- Render ---
   return (
     <div className="space-y-4">
-      <h2 className="text-xl font-semibold tracking-tight">概览统计</h2>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-xl font-semibold tracking-tight">概览统计</h2>
+        <ToggleGroup
+          type="single"
+          variant="outline"
+          size="sm"
+          value={range}
+          onValueChange={(value) => {
+            if (value) setRange(value as OverviewRange)
+          }}
+          aria-label="时间范围"
+          className="justify-start"
+        >
+          {RANGE_OPTIONS.map((option) => (
+            <ToggleGroupItem key={option.value} value={option.value}>
+              {option.label}
+            </ToggleGroupItem>
+          ))}
+        </ToggleGroup>
+      </div>
       <div className="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4"> {/* Adjusted grid columns for responsiveness */}
         {stats.map((stat, index) => (
           <Card key={index} className="w-full overflow-hidden"> {/* Added overflow-hidden */}

@@ -548,20 +548,8 @@ async fn stats_overview(
             .to_owned(),
         Err(response) => return response,
     };
-    let rows = match run_sqlite(
-        &state,
-        "SELECT COUNT(*) as requests, \
-         COALESCE(SUM(total_tokens), 0) as totalTokens, \
-         COALESCE(SUM(prompt_tokens), 0) as promptTokens, \
-         COALESCE(SUM(completion_tokens), 0) as completionTokens, \
-         COALESCE(AVG(process_time), 0) as avgProcessTime, \
-         COALESCE(AVG(first_response_time), 0) as avgFirstResponseTime \
-         FROM request_stats WHERE api_key = $1"
-            .to_owned(),
-        vec![text_arg(&api_key)],
-    )
-    .await
-    {
+    let range = params.get("range").and_then(Value::as_str);
+    let rows = match run_sqlite(&state, overview_sql(range), vec![text_arg(&api_key)]).await {
         Ok(rows) => rows,
         Err(response) => return response,
     };
@@ -576,6 +564,33 @@ async fn stats_overview(
         ])
     });
     Json(Value::Object(stats)).into_response()
+}
+
+/// `today` / `7d` / `30d` are calendar windows in the host's local time zone
+/// (the container sets TZ); `timestamp` itself is stored as UTC text, hence the
+/// `localtime` conversion on the column side.
+fn overview_sql(range: Option<&str>) -> String {
+    let window = match range {
+        Some("today") => {
+            " AND datetime(timestamp, 'localtime') >= datetime('now', 'localtime', 'start of day')"
+        }
+        Some("7d") => {
+            " AND datetime(timestamp, 'localtime') >= datetime('now', 'localtime', 'start of day', '-6 days')"
+        }
+        Some("30d") => {
+            " AND datetime(timestamp, 'localtime') >= datetime('now', 'localtime', 'start of day', '-29 days')"
+        }
+        _ => "",
+    };
+    format!(
+        "SELECT COUNT(*) as requests, \
+         COALESCE(SUM(total_tokens), 0) as totalTokens, \
+         COALESCE(SUM(prompt_tokens), 0) as promptTokens, \
+         COALESCE(SUM(completion_tokens), 0) as completionTokens, \
+         COALESCE(AVG(process_time), 0) as avgProcessTime, \
+         COALESCE(AVG(first_response_time), 0) as avgFirstResponseTime \
+         FROM request_stats WHERE api_key = $1{window}"
+    )
 }
 
 const RANKING_SQL: &str = "SELECT r.{group} as {group}, \
@@ -1365,4 +1380,50 @@ async fn serve_next_asset(
     UrlPath(asset): UrlPath<String>,
 ) -> Response {
     serve_file(&state.ui_root.join("_next"), &asset, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn requests_for(db: &std::path::Path, range: Option<&str>) -> i64 {
+        let rows = query_rows_blocking(db.to_path_buf(), overview_sql(range), vec![text_arg("k")])
+            .expect("stats query");
+        rows.into_iter()
+            .next()
+            .and_then(|row| row.get("requests").and_then(Value::as_i64))
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn overview_windows_select_only_rows_inside_the_calendar_range() {
+        let path = std::env::temp_dir().join(format!(
+            "uni-api-overview-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE request_stats (api_key TEXT, total_tokens INTEGER, \
+                     prompt_tokens INTEGER, completion_tokens INTEGER, process_time REAL, \
+                     first_response_time REAL, timestamp DATETIME);
+                     INSERT INTO request_stats VALUES
+                       ('k', 1, 1, 0, 0.1, 0.1, datetime('now')),
+                       ('k', 2, 2, 0, 0.2, 0.2, datetime('now', '-2 days')),
+                       ('k', 3, 3, 0, 0.3, 0.3, datetime('now', '-10 days')),
+                       ('k', 4, 4, 0, 0.4, 0.4, datetime('now', '-100 days')),
+                       ('other', 9, 9, 0, 0.9, 0.9, datetime('now'));",
+                )
+                .unwrap();
+        }
+        assert_eq!(requests_for(&path, Some("today")), 1);
+        assert_eq!(requests_for(&path, Some("7d")), 2);
+        assert_eq!(requests_for(&path, Some("30d")), 3);
+        assert_eq!(requests_for(&path, Some("all")), 4);
+        assert_eq!(requests_for(&path, None), 4);
+        std::fs::remove_file(&path).unwrap();
+    }
 }
