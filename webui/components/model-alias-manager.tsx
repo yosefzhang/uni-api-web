@@ -27,7 +27,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
-import { ArrowDown, ArrowUp, ChevronDown, ChevronUp, Layers, Pencil, Plus, RefreshCw, Save, Trash2, X } from "lucide-react"
+import { ArrowDown, ArrowUp, ChevronDown, ChevronUp, Layers, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import { rowsToModel } from "@/components/online-config/fields"
 
@@ -412,12 +412,14 @@ export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps
     setRows(nextRows)
     setOrderOverrides(nextOverrides)
     setDialogOpen(false)
-    // 「添加/保存修改」直接落盘，不再依赖页面顶部的「保存」按钮
+    // 「添加/保存修改」直接落盘（页面不再有手动「保存」按钮）
     void persist({ rows: nextRows, orderOverrides: nextOverrides })
   }
 
   const handleDelete = (row: AliasRow) => {
-    setRows((prev) => prev.filter((r) => r.id !== row.id))
+    const nextRows = rows.filter((r) => r.id !== row.id)
+    setRows(nextRows)
+    void persist({ rows: nextRows, orderOverrides })
   }
 
   const handleMove = (alias: string, index: number, dir: -1 | 1) => {
@@ -426,16 +428,26 @@ export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps
     if (target < 0 || target >= groupRows.length) return
     const swapped = groupRows.slice()
     ;[swapped[index], swapped[target]] = [swapped[target], swapped[index]]
-    setOrderOverrides((prev) => ({ ...prev, [alias]: swapped.map((r) => r.provider) }))
+    const nextOverrides = { ...orderOverrides, [alias]: swapped.map((r) => r.provider) }
+    setOrderOverrides(nextOverrides)
+    void persist({ rows, orderOverrides: nextOverrides })
   }
 
   // ----- 保存 -----
-  const persist = async (snapshot?: { rows: AliasRow[]; orderOverrides: Record<string, string[]> }) => {
+  // 所有写入串行执行：快速连点时，避免后到的旧快照覆盖新状态
+  const saveChain = useRef<Promise<unknown>>(Promise.resolve())
+
+  const persist = (snapshot: { rows: AliasRow[]; orderOverrides: Record<string, string[]> }) => {
+    const run = saveChain.current.then(() => writeConfig(snapshot))
+    saveChain.current = run.catch(() => {})
+    return run
+  }
+
+  const writeConfig = async (snapshot: { rows: AliasRow[]; orderOverrides: Record<string, string[]> }) => {
     setSaving(true)
     try {
-      // 弹窗里的 setRows 是异步的，直接调用时用调用方传入的快照保存
-      const savedRows = snapshot?.rows ?? rows
-      const savedOverrides = snapshot?.orderOverrides ?? orderOverrides
+      const savedRows = snapshot.rows
+      const savedOverrides = snapshot.orderOverrides
       const savedGroups = buildGroups(savedRows)
       const savedAliases = Array.from(savedGroups.keys()).sort((a, b) => a.localeCompare(b))
       const copy = structuredClone(config || {})
@@ -485,7 +497,6 @@ export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps
       const data = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
       toast({ title: "保存成功", description: "api.yaml 已保存，约 2 秒内热重载生效。" })
-      await load()
     } catch (e: any) {
       toast({ title: "保存失败", description: e.message || "未知错误", variant: "destructive" })
     } finally {
@@ -513,6 +524,7 @@ export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps
           <CardDescription>
             集中管理各渠道的模型别名映射。同一别名可挂多个渠道实现聚合与故障转移；
             优先级通过所选 API Key 的 model 规则顺序实现（Provider/别名 + all 兜底），权限语义不变。
+            新增、编辑、删除、调序等改动均即时写入 api.yaml 并热重载，无需手动保存。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -548,17 +560,14 @@ export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps
                 {showPrefixed ? "收起前缀条目" : `展开前缀条目（${prefixedCount}）`}
               </Button>
             )}
-            <Button variant="outline" size="sm" onClick={() => load()}>
+            {saving && <span className="text-xs text-muted-foreground">保存中…</span>}
+            <Button variant="outline" size="sm" onClick={() => load()} disabled={saving}>
               <RefreshCw className="w-4 h-4 mr-2" />
               重新加载
             </Button>
             <Button variant="outline" size="sm" onClick={openAdd}>
               <Plus className="w-4 h-4 mr-2" />
               新增映射
-            </Button>
-            <Button variant="outline" size="sm" onClick={() => persist()} disabled={saving || duplicateKeys.size > 0}>
-              <Save className="w-4 h-4 mr-2" />
-              {saving ? "保存中..." : "保存"}
             </Button>
           </div>
           {!keyEditable && (
