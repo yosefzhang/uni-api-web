@@ -85,6 +85,18 @@ function analyzeKeyRules(rules: unknown): { editable: boolean; overrides: Record
   return { editable: true, overrides }
 }
 
+function buildGroups(rows: AliasRow[]): Map<string, AliasRow[]> {
+  const byAlias = new Map<string, AliasRow[]>()
+  for (const row of rows) {
+    const alias = row.alias.trim() || row.upstream.trim()
+    if (!alias) continue
+    const list = byAlias.get(alias)
+    if (list) list.push(row)
+    else byAlias.set(alias, [row])
+  }
+  return byAlias
+}
+
 // 带前缀的别名：形如「前缀/模型名」，前缀是配置别名时由「自动填充前缀」加上去的
 function hasAliasPrefix(alias: string): boolean {
   const idx = alias.indexOf("/")
@@ -228,21 +240,11 @@ export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps
   }, [effectiveKeyValue])
 
   // ----- 分组与排序 -----
-  const groups = useMemo(() => {
-    const byAlias = new Map<string, AliasRow[]>()
-    for (const row of rows) {
-      const alias = row.alias.trim() || row.upstream.trim()
-      if (!alias) continue
-      const list = byAlias.get(alias)
-      if (list) list.push(row)
-      else byAlias.set(alias, [row])
-    }
-    return byAlias
-  }, [rows])
+  const groups = useMemo(() => buildGroups(rows), [rows])
 
   // 组内有效顺序：override 中列出的渠道在前，其余按渠道在 yaml 中的顺序
-  const sortGroup = useCallback((alias: string, groupRows: AliasRow[]): AliasRow[] => {
-    const override = orderOverrides[alias] || []
+  const sortGroup = useCallback((alias: string, groupRows: AliasRow[], overrides: Record<string, string[]> = orderOverrides): AliasRow[] => {
+    const override = overrides[alias] || []
     const rank = (r: AliasRow) => {
       const i = override.indexOf(r.provider)
       return i === -1 ? override.length + r.providerIndex : i
@@ -388,19 +390,30 @@ export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps
       }
     })
 
-    setRows((prev) => [
-      ...(editingAlias ? prev.filter((r) => (r.alias.trim() || r.upstream.trim()) !== editingAlias) : prev),
-      ...newRows,
-    ])
-    if (keyEditable) {
-      setOrderOverrides((prev) => {
-        const next = { ...prev }
-        if (editingAlias) delete next[editingAlias]
-        next[alias] = newRows.map((r) => r.provider)
-        return next
+    // 与页面顶部「保存」按钮保持同一道闸：有重复映射时不允许落盘
+    if (duplicateKeys.size > 0) {
+      toast({
+        title: "存在重复映射",
+        description: "请先修正标红的同渠道同别名重复项，再保存",
+        variant: "destructive",
       })
+      return
     }
+    const nextRows = [
+      ...(editingAlias ? rows.filter((r) => (r.alias.trim() || r.upstream.trim()) !== editingAlias) : rows),
+      ...newRows,
+    ]
+    let nextOverrides = orderOverrides
+    if (keyEditable) {
+      nextOverrides = { ...orderOverrides }
+      if (editingAlias) delete nextOverrides[editingAlias]
+      nextOverrides[alias] = newRows.map((r) => r.provider)
+    }
+    setRows(nextRows)
+    setOrderOverrides(nextOverrides)
     setDialogOpen(false)
+    // 「添加/保存修改」直接落盘，不再依赖页面顶部的「保存」按钮
+    void persist({ rows: nextRows, orderOverrides: nextOverrides })
   }
 
   const handleDelete = (row: AliasRow) => {
@@ -417,13 +430,18 @@ export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps
   }
 
   // ----- 保存 -----
-  const persist = async () => {
+  const persist = async (snapshot?: { rows: AliasRow[]; orderOverrides: Record<string, string[]> }) => {
     setSaving(true)
     try {
+      // 弹窗里的 setRows 是异步的，直接调用时用调用方传入的快照保存
+      const savedRows = snapshot?.rows ?? rows
+      const savedOverrides = snapshot?.orderOverrides ?? orderOverrides
+      const savedGroups = buildGroups(savedRows)
+      const savedAliases = Array.from(savedGroups.keys()).sort((a, b) => a.localeCompare(b))
       const copy = structuredClone(config || {})
       // 按 providerIndex + itemIndex 原序重建各渠道的 model 数组（严禁全局排序）
       const byProvider = new Map<number, AliasRow[]>()
-      for (const row of rows) {
+      for (const row of savedRows) {
         if (row.alias.trim() || row.upstream.trim()) {
           const list = byProvider.get(row.providerIndex)
           if (list) list.push(row)
@@ -439,10 +457,10 @@ export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps
       // 更新目标 key 的 model 规则（仅可编辑 key）
       if (keyEditable && selectedKeyIndex >= 0 && copy.api_keys?.[selectedKeyIndex]) {
         const rules: string[] = []
-        for (const alias of sortedAliases) {
-          const groupRows = groups.get(alias) || []
+        for (const alias of savedAliases) {
+          const groupRows = savedGroups.get(alias) || []
           if (groupRows.length < 2) continue
-          const effective = sortGroup(alias, groupRows).map((r) => r.provider)
+          const effective = sortGroup(alias, groupRows, savedOverrides).map((r) => r.provider)
           const def = groupRows.slice().sort((a, b) => a.providerIndex - b.providerIndex || a.itemIndex - b.itemIndex).map((r) => r.provider)
           if (effective.join("\u0000") !== def.join("\u0000")) {
             for (const p of effective) rules.push(`${p}/${alias}`)
@@ -538,7 +556,7 @@ export function ModelAliasManager({ apiKey, defaultKey }: ModelAliasManagerProps
               <Plus className="w-4 h-4 mr-2" />
               新增映射
             </Button>
-            <Button variant="outline" size="sm" onClick={persist} disabled={saving || duplicateKeys.size > 0}>
+            <Button variant="outline" size="sm" onClick={() => persist()} disabled={saving || duplicateKeys.size > 0}>
               <Save className="w-4 h-4 mr-2" />
               {saving ? "保存中..." : "保存"}
             </Button>
